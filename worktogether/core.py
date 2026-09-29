@@ -46,9 +46,13 @@ def plan_validate(data):
     require(isinstance(steps, list) and 0 < len(steps) <= 100, "Plan needs 1–100 steps", "INVALID_PLAN")
     by_id = {}
     for step in steps:
-        exact(step, ["id", "title", "acceptance", "depends_on"])
+        require(isinstance(step, dict) and set(step).issubset({"id", "title", "acceptance", "depends_on", "assignee"})
+                and {"id", "title", "acceptance", "depends_on"}.issubset(set(step)),
+                "Invalid step fields", "INVALID_PLAN")
         require(string(step["id"]) and string(step["title"]) and strings(step["acceptance"], True)
                 and strings(step["depends_on"]), "Invalid step fields", "INVALID_PLAN")
+        if "assignee" in step:
+            require(string(step["assignee"]), "Invalid assignee", "INVALID_PLAN")
         require(step["id"] not in by_id and len(set(step["acceptance"])) == len(step["acceptance"])
                 and len(set(step["depends_on"])) == len(step["depends_on"]), "Duplicate step or criterion", "INVALID_PLAN")
         by_id[step["id"]] = step
@@ -87,6 +91,8 @@ class Engine:
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(id), body TEXT NOT NULL,
                     PRIMARY KEY(task_id,id));
+                CREATE TABLE IF NOT EXISTS agents (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, body TEXT NOT NULL);
             """)
 
     @contextmanager
@@ -201,9 +207,12 @@ class Engine:
             return [json.loads(r[0]) for r in db.execute("SELECT body FROM messages WHERE task_id=? ORDER BY rowid", (task_id,))]
 
     def message_add(self, task_id, message_id, recipient, content):
-        require(string(message_id) and len(message_id) <= 128 and recipient in
-                ("codex", "antigravity", "both") and string(content) and len(content) <= 20000,
+        require(string(message_id) and len(message_id) <= 128 and string(recipient)
+                and string(content) and len(content) <= 20000,
                 "Invalid message", "INVALID_INPUT")
+        from .agents import AgentRegistry
+        registry = AgentRegistry(self)
+        available = [a["id"] for a in registry.list(enabled_only=True) if a["ready"]]
         with self.transaction() as db:
             t = self._task(db, task_id)
             row = db.execute("SELECT body FROM messages WHERE task_id=? AND id=?", (task_id, message_id)).fetchone()
@@ -211,8 +220,18 @@ class Engine:
                 old = json.loads(row[0])
                 require(old["recipient"] == recipient and old["content"] == content, "Message ID conflict", "CONFLICT")
                 return old
+            if recipient == "all":
+                participants = available
+            elif recipient == "both":
+                participants = [a for a in ("codex", "antigravity") if a in available]
+                require(len(participants) == 2, "Both built-in agents must be enabled", "UNSUPPORTED_PROVIDER")
+            else:
+                require(recipient in available, "Agent is unknown, disabled or not configured", "UNSUPPORTED_PROVIDER")
+                participants = [recipient]
+            require(bool(participants) and len(participants) <= 12, "No ready agents or too many participants", "INVALID_INPUT")
             m = {"id": message_id, "task_id": task_id, "recipient": recipient, "content": content,
-                 "revision": t.get("revision", 1), "status": "QUEUED", "replies": [], "created_at": time.time()}
+                 "participants": participants, "revision": t.get("revision", 1),
+                 "status": "QUEUED", "replies": [], "created_at": time.time()}
             db.execute("INSERT INTO messages VALUES(?,?,?)", (message_id, task_id, encode(m)))
             self._save(db, t, "MESSAGE_SAVED", {"message_id": message_id, "recipient": recipient})
             return m
@@ -236,14 +255,19 @@ class Engine:
                 m["status"] = "NEEDS_REVIEW"
                 db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
                 return None
-            roles = ["codex", "antigravity"] if m["recipient"] == "both" else [m["recipient"]]
+            roles = m.get("participants") or (["codex", "antigravity"] if m["recipient"] in ("both", "all") else [m["recipient"]])
+            if len(m["replies"]) >= len(roles):
+                m["status"] = "DELIVERED"
+                db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
+                return None
             role = roles[len(m["replies"])]
             if self._busy(db, t, role):
                 return None
-            d = self._issue(t, "CHAT")
-            d["role"] = role
-            d["payload"].update(message_id=m["id"], message=m["content"], peer_replies=m["replies"],
-                recent_messages=[{"content": x["content"], "replies": x["replies"]} for x in messages if x["status"] == "DELIVERED"][-6:])
+            d = self._issue(t, "CHAT", role=role)
+            brief = lambda replies: [{"role": r["role"], "content": r["content"][:2000]} for r in replies]
+            d["payload"].update(message_id=m["id"], message=m["content"], peer_replies=brief(m["replies"]),
+                recent_messages=[{"content": x["content"], "replies": brief(x["replies"])}
+                                 for x in messages if x["status"] == "DELIVERED"][-3:])
             m["status"] = "RUNNING"
             db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
             self._save(db, t, "MESSAGE_DISPATCHED", {"message_id": m["id"], "dispatch_id": d["id"], "role": role})
@@ -297,9 +321,13 @@ class Engine:
                     return True
         return False
 
-    def _issue(self, task, kind, step=None, attempt=1):
+    def _issue(self, task, kind, step=None, attempt=1, role=None):
         now = time.time()
-        role = "antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex"
+        if role is None:
+            if step and step.get("assignee"):
+                role = step["assignee"]
+            else:
+                role = "antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex"
         payload = {"requirement": task["requirement"], "draft_plan": task["draft_plan"],
                    "requirement_revision": task.get("revision", 1),
                    "plan_review": task["plan_review"], "step": step}
@@ -333,15 +361,23 @@ class Engine:
                     elif s["status"] == "PENDING" and set(s["depends_on"]) <= complete:
                         candidates.append(("CODE", s))
             for kind, step in candidates:
-                role = "antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex"
+                role = (step.get("assignee") if step else None) or ("antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex")
                 if self._busy(db, t, role):
                     continue
                 if step and kind == "CODE":
                     step["status"] = "CODING"
-                d = self._issue(t, kind, step)
+                d = self._issue(t, kind, step, role=role)
                 self._save(db, t, "DISPATCHED", {"dispatch_id": d["id"], "kind": kind})
                 return {"dispatch": d}
             return {"dispatch": None}
+
+    def agents_list(self, enabled_only=False):
+        from .agents import AgentRegistry
+        return AgentRegistry(self).list(enabled_only=enabled_only)
+
+    def agent_add(self, agent_data):
+        from .agents import AgentRegistry
+        return AgentRegistry(self).register(agent_data)
 
     def _validate(self, t, d, report):
         exact(report, ["schema_version", "task_id", "dispatch_id", "role", "attempt", "status", "summary", "basis", "suggestions", "next_action", "data"])
@@ -419,8 +455,11 @@ class Engine:
                 row = db.execute("SELECT body FROM messages WHERE task_id=? AND id=?", (task, d["payload"]["message_id"])).fetchone()
                 m = json.loads(row[0])
                 m["replies"].append({"role": d["role"], "content": report["summary"], "report": report})
+                target_count = len(m.get("participants") or
+                                   (["codex", "antigravity"] if m["recipient"] in ("both", "all") else [m["recipient"]]))
+
                 m["status"] = "BLOCKED" if report["status"] == "BLOCKED" else (
-                    "DELIVERED" if m["recipient"] != "both" or len(m["replies"]) == 2 else "QUEUED")
+                    "DELIVERED" if len(m["replies"]) >= target_count else "QUEUED")
                 db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task, m["id"]))
             if report["status"] == "BLOCKED":
                 d["status"] = "BLOCKED"
@@ -434,6 +473,8 @@ class Engine:
                 t["plan_review"] = report
                 t["phase"] = "PLAN_FINALIZE"
             elif d["kind"] == "PLAN_FINALIZE":
+                require(all(s.get("assignee", "codex") == "codex" for s in data["steps"]),
+                        "Only Codex can own implementation steps in this version", "INVALID_PLAN")
                 t["draft_plan"] = data
                 t["steps"] = [dict(s, status="PENDING", repair_count=0, version=None, handoff=None, verification=None) for s in data["steps"]]
                 t["phase"] = "EXECUTING"

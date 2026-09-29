@@ -51,7 +51,13 @@ def _execute(engine, task_id, codex, antigravity, *, max_calls, timeout):
             return stop("NO_DISPATCH")
         require(dispatch["kind"] in ("CODE", "VERIFY", "FIX"),
                 "Execution cannot run planning or chat", "INVALID_STATE")
-        provider = codex if dispatch["role"] == "codex" else antigravity
+        if dispatch["role"] == "codex":
+            provider = codex
+        elif dispatch["role"] == "antigravity":
+            provider = antigravity
+        else:
+            from .agents import AgentRegistry
+            provider = AgentRegistry(engine).get_runtime(dispatch["role"])
         result = provider.run(task_id, dispatch["id"], timeout)
         runs.append(result)
         if result["status"] != "COMPLETED":

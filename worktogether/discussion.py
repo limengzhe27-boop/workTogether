@@ -17,7 +17,13 @@ def discuss(engine, task_id, codex, antigravity, timeout=300):
         require(dispatch is not None and dispatch["kind"] in
                 ("PLAN", "PLAN_REVIEW", "PLAN_FINALIZE"),
                 "No planning item available", "INVALID_STATE")
-        runtime = codex if dispatch["role"] == "codex" else antigravity
+        if dispatch["role"] == "codex":
+            runtime = codex
+        elif dispatch["role"] == "antigravity":
+            runtime = antigravity
+        else:
+            from .agents import AgentRegistry
+            runtime = AgentRegistry(engine).get_runtime(dispatch["role"])
         result = runtime.run(task_id, dispatch["id"], timeout)
         runs.append(result)
         if result["status"] != "COMPLETED":

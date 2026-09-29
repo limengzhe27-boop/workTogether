@@ -115,6 +115,10 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
             # 1. Health check
             if path == "/api/health":
                 return self._send_json(HTTPStatus.OK, {"status": "ok", "version": "v1.0"})
+            if path == "/api/agents":
+                from .agents import AgentRegistry
+                reg = getattr(self.server, "registry", None) or AgentRegistry(self.engine)
+                return self._send_json(HTTPStatus.OK, {"agents": reg.list()})
             m_messages = re.fullmatch(r"/api/tasks/([^/]+)/messages", path)
             if m_messages:
                 return self._send_json(200, {"messages": self.engine.messages(m_messages.group(1))})
@@ -238,6 +242,11 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
 
         try:
             body = self._read_json()
+            if path == "/api/agents":
+                from .agents import AgentRegistry
+                reg = getattr(self.server, "registry", None) or AgentRegistry(self.engine)
+                created = reg.register(body)
+                return self._send_json(HTTPStatus.CREATED, created)
             m_messages = re.fullmatch(r"/api/tasks/([^/]+)/messages", path)
             if m_messages:
                 if set(body) != {"message_id", "recipient", "content"}:
@@ -453,10 +462,13 @@ def create_server(db_path, host="127.0.0.1", port=8765, static_dir=None, executa
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise CollabError("INVALID_INPUT", "Only loopback binding is supported")
     engine = Engine(db_path)
+    from .agents import AgentRegistry
+    registry = AgentRegistry(engine)
     runtime = Runtime(engine, executable=executable)
     runtime.require_approval = True
     server = ThreadingHTTPServer((host, port), WorkTogetherHandler)
     server.engine = engine
+    server.registry = registry
     server.runtime = runtime
     server.antigravity_runtime = AntigravityRuntime(engine, antigravity_executable, antigravity_model)
     server.planning_jobs = PlanningJobs(engine, runtime, server.antigravity_runtime)

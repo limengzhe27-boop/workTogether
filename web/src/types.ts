@@ -7,8 +7,25 @@ export type TaskPhase = 'PLANNING' | 'PLAN_REVIEW' | 'PLAN_FINALIZE' | 'EXECUTIN
 export type StepStatus = 'PENDING' | 'CODING' | 'VERIFYING' | 'FIXING' | 'COMPLETED' | 'BLOCKED';
 export type DispatchKind = 'PLAN' | 'PLAN_REVIEW' | 'PLAN_FINALIZE' | 'CODE' | 'VERIFY' | 'FIX' | 'CHAT';
 export type DispatchStatus = 'ACTIVE' | 'DONE' | 'BLOCKED' | 'SUPERSEDED';
-export type AgentRole = 'codex' | 'antigravity';
+export type AgentRole = string;
 export type RunStatus = 'PREPARED' | 'RUNNING' | 'EXITED' | 'COMPLETED' | 'FAILED';
+
+export interface AgentInfo {
+  id: string;
+  name: string;
+  type: string;
+  executable?: string;
+  endpoint?: string;
+  model?: string;
+  api_key_env?: string;
+  roles: string[];
+  color: string;
+  avatar: string;
+  description: string;
+  enabled: boolean;
+  ready?: boolean;
+  has_key?: boolean;
+}
 
 export interface Project {
   id: string;
@@ -36,6 +53,7 @@ export interface PlanStep {
   title: string;
   acceptance: string[];
   depends_on: string[];
+  assignee?: string;
   status?: StepStatus;
   repair_count?: number;
   repair_exhausted?: boolean;

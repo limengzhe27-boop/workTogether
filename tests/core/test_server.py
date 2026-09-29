@@ -253,6 +253,37 @@ class ServerApiTests(unittest.TestCase):
         status, res = execute_request(self.server, "GET", "/api/runs/r1/artifacts/malicious.sh")
         self.assertEqual(status, 403)
 
+    def test_agents_api(self):
+        # 1. GET /api/agents returns default agents
+        status, res = execute_request(self.server, "GET", "/api/agents")
+        self.assertEqual(status, 200)
+        self.assertIn("agents", res)
+        agent_ids = [a["id"] for a in res["agents"]]
+        self.assertIn("codex", agent_ids)
+        self.assertIn("antigravity", agent_ids)
+        self.assertIn("deepseek-hermes", agent_ids)
+
+        # 2. POST /api/agents creates new custom agent
+        new_agent = {
+            "id": "qwen-coder",
+            "name": "Qwen Coder",
+            "type": "openai_compat",
+            "endpoint": "http://localhost:11434/v1",
+            "model": "qwen2.5-coder:32b",
+            "roles": ["code", "chat"],
+            "color": "#8b5cf6",
+            "avatar": "🚀"
+        }
+        status, res = execute_request(self.server, "POST", "/api/agents", new_agent)
+        self.assertEqual(status, 201)
+        self.assertEqual(res["id"], "qwen-coder")
+
+        # 3. Verify it appears in GET /api/agents
+        status, res = execute_request(self.server, "GET", "/api/agents")
+        self.assertEqual(status, 200)
+        agent_ids = [a["id"] for a in res["agents"]]
+        self.assertIn("qwen-coder", agent_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

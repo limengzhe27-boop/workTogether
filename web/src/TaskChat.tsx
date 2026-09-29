@@ -1,42 +1,270 @@
 import React, { useEffect, useState } from 'react';
 import { request } from './api';
-type Message = { id: string; content: string; recipient: string; status: string; error?: string; replies: { role: string; content: string }[] };
-const status: Record<string, string> = { QUEUED: '已保存，等待空闲后回复', RUNNING: '已派发，请查看执行详情确认运行状态', DELIVERED: '已回复', BLOCKED: '回复失败，需处理', NEEDS_REVIEW: '需求已变更，请重新确认后发送' };
-export function TaskChat({ taskId, completed, onPending }: { taskId: string; completed: boolean; onPending: (pending: boolean) => void }) {
+import { AgentInfo } from './types';
+
+type Message = {
+  id: string;
+  content: string;
+  recipient: string;
+  status: string;
+  error?: string;
+  replies: { role: string; content: string }[];
+};
+
+const statusLabels: Record<string, string> = {
+  QUEUED: '⏳ 排队中 (等待就绪后派发)',
+  RUNNING: '⚡ 正在响应 (请查看执行详情)',
+  DELIVERED: '✓ 已回复',
+  BLOCKED: '⚠ 回复中断，需处理',
+  NEEDS_REVIEW: '📝 需求已变更，需重新确认',
+};
+
+const PROMPT_SUGGESTIONS = [
+  '请各位 Agent 共同评估当前需求方案，讨论最佳架构与分工。',
+  '请 DeepSeek Hermes 深入分析当前方案的潜在缺陷与边界条件。',
+  '请 Codex 拆解具体实施步骤，预估实现难度与依赖。',
+  '请 Antigravity 列出该需求的核心验收标准与黑盒测试场景。',
+];
+
+export function TaskChat({
+  taskId,
+  agents,
+  completed,
+  onPending,
+}: {
+  taskId: string;
+  agents: AgentInfo[];
+  completed: boolean;
+  onPending: (pending: boolean) => void;
+}) {
   const [messages, setMessages] = useState<Message[]>([]);
-  const [text, setText] = useState(() => { try { return localStorage.getItem('wt:chat:' + taskId) || ''; } catch { return ''; } });
-  const [recipient, setRecipient] = useState('antigravity');
+  const [text, setText] = useState(() => {
+    try {
+      return localStorage.getItem('wt:chat:' + taskId) || '';
+    } catch {
+      return '';
+    }
+  });
+  const [recipient, setRecipient] = useState('all');
   const [id, setId] = useState(() => crypto.randomUUID());
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
   const [tick, setTick] = useState(0);
+
+  const agentMap = React.useMemo(() => {
+    const map: Record<string, AgentInfo> = {};
+    for (const a of agents) {
+      map[a.id] = a;
+    }
+    return map;
+  }, [agents]);
+
+  // Poll messages
   useEffect(() => {
-    let alive = true; let timer: ReturnType<typeof setTimeout>;
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout>;
     async function load() {
       try {
         const data = await request<{ messages: Message[] }>(`/tasks/${taskId}/messages`);
-        if (alive) { setMessages(data.messages); onPending(data.messages.some(m => ['QUEUED', 'RUNNING'].includes(m.status))); }
-      } catch (e) { if (alive) setError((e as Error).message); }
-      finally { if (alive) timer = setTimeout(load, 2000); }
+        if (alive) {
+          setMessages(data.messages);
+          onPending(data.messages.some(m => ['QUEUED', 'RUNNING'].includes(m.status)));
+        }
+      } catch (e) {
+        if (alive) setError((e as Error).message);
+      } finally {
+        if (alive) timer = setTimeout(load, 2000);
+      }
     }
-    load(); return () => { alive = false; clearTimeout(timer); };
+    load();
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+    };
   }, [taskId, tick, onPending]);
+
   async function send(e: React.FormEvent) {
-    e.preventDefault(); if (sending || !text.trim()) return;
-    setSending(true); setError('');
+    e.preventDefault();
+    if (sending || !text.trim()) return;
+    setSending(true);
+    setError('');
     try {
-      await request(`/tasks/${taskId}/messages`, { method: 'POST', body: JSON.stringify({ message_id: id, recipient, content: text.trim() }) });
-      setText(''); setId(crypto.randomUUID()); onPending(true); setTick(n => n + 1);
-      try { localStorage.removeItem('wt:chat:' + taskId); } catch { /* Optional storage */ }
-    } catch (e) { setError((e as Error).message); }
-    finally { setSending(false); }
+      await request(`/tasks/${taskId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ message_id: id, recipient, content: text.trim() }),
+      });
+      setText('');
+      setId(crypto.randomUUID());
+      onPending(true);
+      setTick(n => n + 1);
+      try {
+        localStorage.removeItem('wt:chat:' + taskId);
+      } catch {
+        /* Optional storage */
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSending(false);
+    }
   }
-  return <section className="card" aria-label="任务内对话"><h2>任务内对话</h2>
-    {messages.map(m => <div className="message" key={m.id}><strong>你 → {m.recipient === 'both' ? '双方' : m.recipient}</strong><p className="prose">{m.content}</p><p className="small">{status[m.status] || m.status}{m.error && '：' + m.error}</p>{m.replies.map((r, i) => <div key={i} className="suggestion"><strong>{r.role === 'codex' ? 'Codex' : 'Antigravity'}</strong><p className="prose">{r.content}</p></div>)}</div>)}
-    <form onSubmit={send} className="stack"><label>发给<select value={recipient} disabled={sending} onChange={e => { setRecipient(e.target.value); setId(crypto.randomUUID()); }}><option value="antigravity">Antigravity</option><option value="codex">Codex</option><option value="both">双方（各回复一次）</option></select></label>
-      <textarea aria-label="对话消息" disabled={sending} placeholder="询问方案、提出疑问或让双方讨论一个具体问题…" value={text} onChange={e => { setText(e.target.value); setId(crypto.randomUUID()); try { localStorage.setItem('wt:chat:' + taskId, e.target.value); } catch { /* Optional storage */ } }} />
-      <p className="small">发送会使用所选 Agent 的额度；暂停时只排队。消息不会自动修改需求、批准方案或启动开发。默认 Antigravity，减少 Codex 用量。</p>
-      {completed && <p className="notice">任务已完成，仍可讨论；继续开发需另行修改需求。</p>}
-      {error && <p role="alert" className="error">{error}</p>}<button className="primary" disabled={sending || !text.trim()}>{sending ? '正在保存…' : '发送消息'}</button>
-    </form></section>;
+
+  function getRecipientLabel(rec: string) {
+    if (rec === 'all') return '📢 全部 Agent (多方群聊)';
+    if (rec === 'both') return '🤝 Codex & Antigravity (双向评审)';
+    const a = agentMap[rec];
+    if (a) return `${a.avatar} ${a.name}`;
+    return rec;
+  }
+
+  return (
+    <section className="card" aria-label="多Agent协作与讨论">
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+        <h2>多 Agent 协同讨论</h2>
+        <div className="agents-strip">
+          {agents.map(a => (
+            <span
+              key={a.id}
+              className={`agent-pill ${a.enabled ? 'active' : ''}`}
+              style={{ color: a.color }}
+              title={a.description}
+            >
+              <span className="agent-avatar">{a.avatar}</span>
+              <span>{a.name}</span>
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {messages.length === 0 ? (
+        <div className="empty" style={{ padding: '24px 16px' }}>
+          暂无对话。发一条消息，让各位 Agent 围绕方案展开多方讨论与分工协作。
+        </div>
+      ) : (
+        messages.map(m => (
+          <div className="message" key={m.id}>
+            <div className="message-heading" style={{ justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span className="avatar">👤</span>
+                <strong>你 → {getRecipientLabel(m.recipient)}</strong>
+              </div>
+              <span className="badge">{statusLabels[m.status] || m.status}</span>
+            </div>
+            <p className="prose" style={{ marginTop: 8 }}>{m.content}</p>
+            {m.error && <p className="error small" style={{ marginTop: 6 }}>{m.error}</p>}
+
+            {/* Agent Replies Stream */}
+            {m.replies.map((r, i) => {
+              const a = agentMap[r.role];
+              const name = a?.name || r.role;
+              const avatar = a?.avatar || '🤖';
+              const color = a?.color || '#6366f1';
+              return (
+                <div key={i} className="reply-item" style={{ borderLeftColor: color }}>
+                  <div className="reply-header">
+                    <div className="reply-header-info">
+                      <span className="agent-avatar">{avatar}</span>
+                      <strong style={{ color }}>{name}</strong>
+                      <span className="agent-tag" style={{ background: color + '1a', color }}>
+                        {a?.description ? a.description.slice(0, 18) : '协作者'}
+                      </span>
+                    </div>
+                    <span className="small muted">发言 #{i + 1}</span>
+                  </div>
+                  <p className="prose" style={{ margin: 0, fontSize: 14 }}>{r.content}</p>
+                </div>
+              );
+            })}
+          </div>
+        ))
+      )}
+
+      {/* Message Composer */}
+      <form onSubmit={send} className="stack" style={{ marginTop: 20 }}>
+        <p className="small muted">每位参与者只回应一次；后发言者会看到前面的简要回复。自定义云端 Agent 会收到本任务需求、消息和必要的对话上下文。</p>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <label style={{ flexShrink: 0, fontWeight: 500 }}>发给</label>
+          <select
+            className="chat-recipient-select"
+            value={recipient}
+            disabled={sending}
+            onChange={e => {
+              setRecipient(e.target.value);
+              setId(crypto.randomUUID());
+            }}
+          >
+            <option value="all">📢 @全部 Agent (多方群聊与接力协作)</option>
+            <option value="both">🤝 @Codex + @Antigravity (主力双向审查)</option>
+            {agents
+              .filter(a => a.enabled && a.ready)
+              .map(a => (
+                <option key={a.id} value={a.id}>
+                  {a.avatar} @{a.name} ({a.description ? a.description.slice(0, 16) : a.id})
+                </option>
+              ))}
+          </select>
+        </div>
+
+        {/* Quick Suggestion Chips */}
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', margin: '4px 0' }}>
+          {PROMPT_SUGGESTIONS.map((s, idx) => (
+            <button
+              key={idx}
+              type="button"
+              className="small"
+              style={{
+                padding: '3px 8px',
+                minHeight: 'auto',
+                fontSize: 12,
+                borderRadius: 6,
+                background: 'var(--surface-alt)',
+                border: '1px solid var(--border)',
+                cursor: 'pointer',
+              }}
+              onClick={() => {
+                setText(s);
+                setId(crypto.randomUUID());
+              }}
+            >
+              💡 {s.slice(0, 22)}...
+            </button>
+          ))}
+        </div>
+
+        <textarea
+          aria-label="对话消息"
+          disabled={sending}
+          placeholder="提出疑问、让各方讨论技术方案，或让 DeepSeek / Codex / Antigravity 分工探索…"
+          value={text}
+          onChange={e => {
+            setText(e.target.value);
+            setId(crypto.randomUUID());
+            try {
+              localStorage.setItem('wt:chat:' + taskId, e.target.value);
+            } catch {
+              /* Optional storage */
+            }
+          }}
+        />
+
+        <p className="small muted">
+          支持广播多方讨论或指定 Agent 单独交流。消息用于沟通共识，不自动修改已定稿方案或直接触发代码变更。
+        </p>
+
+        {completed && (
+          <p className="notice">任务已完成，仍可讨论；继续开发需另行修改需求并重新生成方案。</p>
+        )}
+
+        {error && (
+          <p role="alert" className="error">
+            {error}
+          </p>
+        )}
+
+        <button className="primary" disabled={sending || !text.trim()}>
+          {sending ? '正在发送…' : '发送消息'}
+        </button>
+      </form>
+    </section>
+  );
 }

@@ -8,6 +8,13 @@ class ChatQueue:
         self.providers = {"codex": codex, "antigravity": antigravity}
         self.stopped = threading.Event()
 
+    def get_provider(self, role):
+        if role in self.providers:
+            return self.providers[role]
+        from .agents import AgentRegistry
+        # Custom configuration may change between messages; never keep a stale adapter.
+        return AgentRegistry(self.engine).get_runtime(role)
+
     def once(self):
         with self.engine.transaction() as db:
             tasks = [r[0] for r in db.execute("SELECT DISTINCT task_id FROM messages")]
@@ -16,7 +23,8 @@ class ChatQueue:
                 return
             d = self.engine.chat_dispatch(task)
             if d:
-                self.providers[d["role"]].run(task, d["id"], 300)
+                provider = self.get_provider(d["role"])
+                provider.run(task, d["id"], 300)
 
     def start(self):
         def loop():

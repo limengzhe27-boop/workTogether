@@ -10,6 +10,7 @@ import {
   ReportEnvelope,
   RunRecord,
   HandoffBundle,
+  AgentInfo,
 } from './types';
 
 const BASE_URL = '/api';
@@ -41,6 +42,14 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
 export const api = {
   // Health
   getHealth: () => request<{ status: string; version: string }>('/health'),
+
+  // Agents
+  getAgents: () => request<{ agents: AgentInfo[] }>('/agents'),
+  addAgent: (agent: Partial<AgentInfo>) =>
+    request<AgentInfo>('/agents', {
+      method: 'POST',
+      body: JSON.stringify(agent),
+    }),
 
   // Projects
   getProjects: () => request<{ projects: Project[] }>('/projects'),
