@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worktogether"
+version = "0.1.0"
+description = "Local task orchestration for Codex and Antigravity"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+worktogether = "worktogether.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["worktogether*"]

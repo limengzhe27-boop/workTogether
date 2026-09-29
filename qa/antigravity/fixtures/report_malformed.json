@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK_ID_PLACEHOLDER",
+  "dispatch_id": "DISPATCH_ID_PLACEHOLDER",
+  "role": "antigravity",
+  "attempt": 1,
+  "status": "PASS",
+  "summary": "Malformed report test",
+  "basis": ["Valid basis string"],
+  "suggestions": [],
+  "next_action": "Invalid because of unknown field and missing data",
+  "unknown_extra_field": "disallowed_by_schema"
+}

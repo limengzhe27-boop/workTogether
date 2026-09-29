@@ -1,0 +1,1 @@
+"""WorkTogether local collaboration core."""

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK_ID_PLACEHOLDER",
+  "dispatch_id": "DISPATCH_ID_PLACEHOLDER",
+  "role": "antigravity",
+  "attempt": 1,
+  "status": "PASS",
+  "summary": "Verification passed: local storage progress restoration functions correctly on refresh.",
+  "basis": [
+    "Executed automated test suite tests/e2e/test_progress_restore.py",
+    "Verified local storage key persistence and integrity"
+  ],
+  "suggestions": [],
+  "next_action": "Proceed to next step or complete task",
+  "data": {
+    "version": "commit_sha_v1",
+    "checks": [
+      {
+        "criterion": "page reload restores progress from local storage",
+        "status": "PASS",
+        "evidence": [
+          "test_progress_restore.py passed exit_code=0",
+          "storage dump shows timestamp=42.5s"
+        ]
+      }
+    ],
+    "findings": []
+  }
+}

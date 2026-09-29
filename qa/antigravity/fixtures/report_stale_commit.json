@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK_ID_PLACEHOLDER",
+  "dispatch_id": "DISPATCH_ID_PLACEHOLDER",
+  "role": "antigravity",
+  "attempt": 1,
+  "status": "PASS",
+  "summary": "Stale version verification report: version does not match dispatch.",
+  "basis": [
+    "Executed verification on an obsolete commit"
+  ],
+  "suggestions": [],
+  "next_action": "Reject report due to version mismatch",
+  "data": {
+    "version": "stale_unmatched_commit_sha_99999",
+    "checks": [
+      {
+        "criterion": "page reload restores progress from local storage",
+        "status": "PASS",
+        "evidence": [
+          "test on old commit passed"
+        ]
+      }
+    ],
+    "findings": []
+  }
+}

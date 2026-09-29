@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK_ID_PLACEHOLDER",
+  "dispatch_id": "DISPATCH_ID_PLACEHOLDER",
+  "role": "antigravity",
+  "attempt": 1,
+  "status": "BLOCKED",
+  "summary": "Verification blocked due to missing environment service.",
+  "basis": [
+    "Connection to mock media server on port 8080 refused"
+  ],
+  "suggestions": [
+    "Start mock server container before running E2E suite"
+  ],
+  "next_action": "Require operator intervention to start mock service",
+  "data": {
+    "reason": "Port 8080 Connection refused, mock server unavailable"
+  }
+}
