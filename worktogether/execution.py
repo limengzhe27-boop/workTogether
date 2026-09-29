@@ -49,7 +49,7 @@ def _execute(engine, task_id, codex, antigravity, *, max_calls, timeout):
         dispatch = engine.dispatch(task_id)["dispatch"]
         if dispatch is None:
             return stop("NO_DISPATCH")
-        require(dispatch["kind"] in ("CODE", "VERIFY", "FIX"),
+        require(dispatch["kind"] in ("CODE", "ANALYZE", "VERIFY", "FIX"),
                 "Execution cannot run planning or chat", "INVALID_STATE")
         if dispatch["role"] == "codex":
             provider = codex

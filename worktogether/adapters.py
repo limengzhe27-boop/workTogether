@@ -26,6 +26,8 @@ class MockAdapter:
                                           "acceptance": ["Simulated behavior"], "depends_on": []}]}
         elif kind in ("CODE", "FIX"):
             report["data"] = {"version": "simulated-" + dispatch["id"], "changes": ["SIMULATED change"], "known_limits": ["No code was executed"]}
+        elif kind == "ANALYZE":
+            report["data"] = {"deliverable": "SIMULATED analysis", "evidence": ["SIMULATED observation only"]}
         elif kind == "VERIFY":
             report.update(status="PASS", data={"version": dispatch["version"], "checks": [
                 {"criterion": c, "status": "PASS", "evidence": ["SIMULATED evidence, not a real verification"]}

@@ -41,7 +41,7 @@ class OpenAIRuntimeTests(unittest.TestCase):
         class Response:
             def __enter__(self): return self
             def __exit__(self, *_): return False
-            def read(self): return json.dumps({"choices": [{"message": {"content": json.dumps(report)}}],
+            def read(self, *_): return json.dumps({"choices": [{"message": {"content": json.dumps(report)}}],
                                                "usage": {"total_tokens": 9}}).encode()
         with patch("urllib.request.urlopen", return_value=Response()) as send:
             run = self.runtime.run(self.task["id"], d["id"], timeout=30)
@@ -61,6 +61,32 @@ class OpenAIRuntimeTests(unittest.TestCase):
         with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}):
             with self.assertRaises(CollabError):
                 self.engine.message_add(self.task["id"], "remote", "deepseek-hermes", "hello")
+
+    def test_api_agent_executes_read_only_analysis(self):
+        with self.engine.transaction() as db:
+            task = self.engine._task(db, self.task["id"])
+            task["phase"] = "EXECUTING"
+            task["steps"] = [{"id": "s1", "title": "Analyze", "work_kind": "analysis",
+                              "assignee": "local-model", "acceptance": ["Identify contract"],
+                              "depends_on": [], "status": "PENDING", "version": None,
+                              "repair_count": 0, "handoff": None, "verification": None}]
+            self.engine._save(db, task, "TEST_PLAN", {})
+        d = self.engine.dispatch(self.task["id"])["dispatch"]
+        self.assertEqual(d["kind"], "ANALYZE")
+        report = {"schema_version": 1, "task_id": self.task["id"], "dispatch_id": d["id"],
+                  "role": "local-model", "attempt": 1, "status": "DONE", "summary": "API v2",
+                  "basis": ["Local fixture"], "suggestions": [], "next_action": "Review",
+                  "data": {"deliverable": "Use v2", "evidence": ["Observed contract"]}}
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, *_): return json.dumps({"choices": [{"message": {"content": json.dumps(report)}}]}).encode()
+        with patch("urllib.request.urlopen", return_value=Response()) as send:
+            run = self.runtime.run(self.task["id"], d["id"], timeout=30)
+        self.assertEqual(run["status"], "COMPLETED")
+        sent = send.call_args.args[0]
+        self.assertNotIn("Authorization", sent.headers)
+        self.assertEqual(self.engine.show(self.task["id"])["steps"][0]["status"], "VERIFYING")
 
 
 if __name__ == "__main__":

@@ -17,11 +17,11 @@ DEFAULT_AGENTS = [
      "roles": ["code", "plan", "chat"], "color": "#6366f1", "avatar": "🤖",
      "description": "主力开发与规划", "enabled": True},
     {"id": "antigravity", "name": "Antigravity", "type": "cli", "executable": "agy",
-     "roles": ["review", "verify", "chat"], "color": "#10b981", "avatar": "🦅",
+     "roles": ["review", "verify", "chat", "analysis"], "color": "#10b981", "avatar": "🦅",
      "description": "方案挑战与独立验收", "enabled": True},
     {"id": "deepseek-hermes", "name": "DeepSeek（API 模板）", "type": "openai_compat",
      "endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat",
-     "api_key_env": "DEEPSEEK_API_KEY", "roles": ["chat"], "color": "#f59e0b",
+     "api_key_env": "DEEPSEEK_API_KEY", "roles": ["chat", "analysis"], "color": "#f59e0b",
      "avatar": "🧠", "description": "配置密钥后可参与任务讨论；不是本地 Harness", "enabled": True},
 ]
 
@@ -59,7 +59,9 @@ class AgentConfig:
         self.endpoint = data.get("endpoint", "")
         self.model = data.get("model", "")
         self.api_key_env = data.get("api_key_env", "")
-        self.roles = data.get("roles", ["chat"]) if self.type == "cli" else ["chat"]
+        self.roles = data.get("roles", ["chat"]) if self.type == "cli" else ["chat", "analysis"]
+        if self.id == "antigravity" and "analysis" not in self.roles:
+            self.roles = [*self.roles, "analysis"]
         self.color = data.get("color", "#6366f1")
         self.avatar = data.get("avatar", "🤖")
         self.description = data.get("description", "")
@@ -117,6 +119,12 @@ class AgentRegistry:
             message = json.loads(row[0])
             if message["status"] in ("QUEUED", "RUNNING") and agent_id in message.get("participants", []):
                 raise CollabError("INVALID_STATE", "Agent has an unfinished conversation")
+        for row in db.execute("SELECT body FROM tasks"):
+            task = json.loads(row[0])
+            if task["phase"] == "EXECUTING" and any(
+                    step.get("assignee") == agent_id and step["status"] != "COMPLETED"
+                    for step in task["steps"]):
+                raise CollabError("INVALID_STATE", "Agent owns unfinished work")
 
     def register(self, data):
         require(isinstance(data, dict), "Agent object required", "INVALID_INPUT")
@@ -138,7 +146,7 @@ class AgentRegistry:
                     "Invalid display field", "INVALID_INPUT")
         clean = {"id": agent_id, "name": data["name"].strip(), "type": "openai_compat",
                  "endpoint": data["endpoint"].rstrip("/"), "model": data["model"].strip(),
-                 "api_key_env": env, "roles": ["chat"], "enabled": data.get("enabled", True),
+                 "api_key_env": env, "roles": ["chat", "analysis"], "enabled": data.get("enabled", True),
                  "color": data.get("color") or "#6366f1", "avatar": data.get("avatar") or "🤖",
                  "description": data.get("description") or ""}
         with self.engine.transaction() as db:

@@ -8,11 +8,17 @@
 
 ### 多 Agent 对话（当前边界）
 
+每位 Agent 可在任务对话里提出最多三条结构化分工建议。建议会进入后续规划上下文，但不是执行命令；平台仍需校验负责人能力、任务依赖与用户批准。
+
 进入一个任务后，可选择单个 Agent、Codex + Antigravity，或“全部已就绪 Agent”。发送时会固定本条消息的参与者，Agent 按序各回复一次，后发言者可看到前面的简短回复；不会无限自行辩论，也不会因为聊天自动修改代码或批准方案。不同任务的消息和会话相互隔离。选用第三方云端 Agent 时，本任务需求、消息和必要的对话上下文会发往其配置的接口，请勿在任务中放入不宜共享的敏感信息。
 
-除内置的 Codex/Antigravity CLI 外，自定义 Agent 目前只支持 **OpenAI 兼容的 `/chat/completions` 接口参与对话**。它们不能执行项目代码或独立验收；任意 CLI 并不存在统一调用协议，所以暂不支持。DeepSeek 是预置 API 配置模板，**不是 DeepSeek Harness 的本地接入**。公网接口需在启动服务的环境中设置对应 API Key，例如 `DEEPSEEK_API_KEY`；本机 Ollama 等回环地址可无密钥。密钥不会由注册接口写入数据库。未就绪的 Agent 不会加入“全部”消息，直接指定会得到错误，绝不会伪造模拟回复。历史数据库若在旧版直接存过 API Key，应视为可能仍有密钥残留，建议轮换密钥。
+除内置的 Codex/Antigravity CLI 外，自定义 Agent 支持 **OpenAI 兼容的 `/chat/completions` 接口**，可参与对话并接受已批准计划中的只读分析工作（`work_kind: "analysis"`）。规划阶段会收到本任务已完成讨论的精简结论和可用 Agent 清单；最终计划可把分析步骤交给自定义 Agent，分析产物经 Antigravity 验收后才解锁依赖步骤。API Agent 的分析依据限于传给它的任务、讨论、计划和依赖产物，不会自动读取整个代码仓库；配置显示“就绪”也不代表接口已实际连通。编码步骤仍由 Codex 负责；自定义 API Agent 不能修改项目代码或独立验收。任意 CLI 没有统一调用协议，暂不支持。DeepSeek 是预置 API 配置模板，**不是 DeepSeek Harness 的本地接入**。公网接口需在启动服务的环境中设置对应 API Key，例如 `DEEPSEEK_API_KEY`；本机 Ollama 等回环地址可无密钥。密钥不会由注册接口写入数据库。未就绪的 Agent 不会加入“全部”消息，直接指定会得到错误，绝不会伪造模拟回复。历史数据库若在旧版直接存过 API Key，应视为可能仍有密钥残留，建议轮换密钥。
 
-这部分通过模拟 CLI 和协议形状的 HTTP 测试验证；尚未用真实 DeepSeek/Ollama 服务完成端到端试运行。Antigravity 无人值守验收的权限限制依然存在。
+分工格式例子：`{"id":"research","title":"梳理接口边界","work_kind":"analysis","assignee":"deepseek-hermes","acceptance":["列出可核查的接口约束"],"depends_on":[]}`。后续编码步骤用 `"work_kind":"code"`、`"assignee":"codex"`，并在 `depends_on` 引用 `research`。Agent 可以提出分工，但平台会校验能力、依赖和就绪状态；你批准最终计划后才会运行工作项。一次自动执行仍有调用次数上限，且不会替你批准模型工具权限。
+
+设计来源、完整流转与尚未支持的边界见 [多 Agent 分工说明](docs/multi-agent-delegation.md)。
+
+这部分通过模拟 CLI 和协议形状的 HTTP 测试验证；尚未用真实 DeepSeek/Ollama 服务完成端到端试运行。Antigravity 无人值守验收的权限限制依然存在。并行修改代码、Claude Code/ZCode 编码适配器及隔离 worktree 尚未实现。
 
 ## 快速启动 Web 工作台
 

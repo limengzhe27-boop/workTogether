@@ -4,8 +4,8 @@
 
 export type TaskStatus = 'ACTIVE' | 'PAUSED' | 'BLOCKED' | 'COMPLETED';
 export type TaskPhase = 'PLANNING' | 'PLAN_REVIEW' | 'PLAN_FINALIZE' | 'EXECUTING' | 'COMPLETED';
-export type StepStatus = 'PENDING' | 'CODING' | 'VERIFYING' | 'FIXING' | 'COMPLETED' | 'BLOCKED';
-export type DispatchKind = 'PLAN' | 'PLAN_REVIEW' | 'PLAN_FINALIZE' | 'CODE' | 'VERIFY' | 'FIX' | 'CHAT';
+export type StepStatus = 'PENDING' | 'CODING' | 'ANALYZING' | 'VERIFYING' | 'FIXING' | 'COMPLETED' | 'BLOCKED';
+export type DispatchKind = 'PLAN' | 'PLAN_REVIEW' | 'PLAN_FINALIZE' | 'CODE' | 'ANALYZE' | 'VERIFY' | 'FIX' | 'CHAT';
 export type DispatchStatus = 'ACTIVE' | 'DONE' | 'BLOCKED' | 'SUPERSEDED';
 export type AgentRole = string;
 export type RunStatus = 'PREPARED' | 'RUNNING' | 'EXITED' | 'COMPLETED' | 'FAILED';
@@ -51,6 +51,7 @@ export interface DoctorReport {
 export interface PlanStep {
   id: string;
   title: string;
+  work_kind?: 'code' | 'analysis';
   acceptance: string[];
   depends_on: string[];
   assignee?: string;

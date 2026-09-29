@@ -1,6 +1,7 @@
 """OpenAI-compatible HTTP API adapter for WorkTogether.
 
-Connects chat-capable OpenAI-compatible endpoints. No fabricated fallback results.
+Connects OpenAI-compatible endpoints for conversation and read-only analysis.
+No fabricated fallback results or code-writing claims.
 """
 import json
 import os
@@ -32,8 +33,8 @@ class OpenAICompatibleRuntime(Runtime):
         return ["http-post", f"{self.endpoint}/chat/completions", "--model", self.model]
 
     def execute_reserved(self, run, d):
-        if d["kind"] != "CHAT":
-            run.update(status="FAILED", error="API agents currently support conversation only")
+        if d["kind"] not in ("CHAT", "ANALYZE"):
+            run.update(status="FAILED", error="API agents support conversation and read-only analysis only")
             self._fail(run)
             return run
         task, dispatch_id = run["task_id"], run["dispatch_id"]
@@ -90,7 +91,9 @@ class OpenAICompatibleRuntime(Runtime):
 
             try:
                 with urllib.request.urlopen(req, timeout=run.get("timeout", 120)) as resp:
-                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    raw = resp.read(2_000_001)
+                    require(len(raw) <= 2_000_000, "Provider response exceeds 2 MB", "PROVIDER_FAILED")
+                    resp_data = json.loads(raw.decode("utf-8"))
                     choice = resp_data.get("choices", [{}])[0]
                     content = choice.get("message", {}).get("content", "").strip()
                     usage = resp_data.get("usage", {})
@@ -103,7 +106,7 @@ class OpenAICompatibleRuntime(Runtime):
                             lines = lines[:-1]
                         content = "\n".join(lines).strip()
                     report = json.loads(content)
-            except (urllib.error.URLError, ValueError, KeyError, IndexError, TimeoutError) as exc:
+            except (urllib.error.URLError, ValueError, KeyError, IndexError, TimeoutError, CollabError) as exc:
                 err_msg = f"{type(exc).__name__}: {exc}"
                 (root / "stderr.log").write_text(err_msg, encoding="utf-8")
                 run["status"] = "FAILED"

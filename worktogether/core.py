@@ -1,5 +1,6 @@
 """Transactional, provider-independent task state machine. See docs/contracts/v1.md."""
 import json
+import hashlib
 import shutil
 import sqlite3
 import subprocess
@@ -46,13 +47,14 @@ def plan_validate(data):
     require(isinstance(steps, list) and 0 < len(steps) <= 100, "Plan needs 1–100 steps", "INVALID_PLAN")
     by_id = {}
     for step in steps:
-        require(isinstance(step, dict) and set(step).issubset({"id", "title", "acceptance", "depends_on", "assignee"})
+        require(isinstance(step, dict) and set(step).issubset({"id", "title", "acceptance", "depends_on", "assignee", "work_kind"})
                 and {"id", "title", "acceptance", "depends_on"}.issubset(set(step)),
                 "Invalid step fields", "INVALID_PLAN")
         require(string(step["id"]) and string(step["title"]) and strings(step["acceptance"], True)
                 and strings(step["depends_on"]), "Invalid step fields", "INVALID_PLAN")
         if "assignee" in step:
             require(string(step["assignee"]), "Invalid assignee", "INVALID_PLAN")
+        require(step.get("work_kind", "code") in ("code", "analysis"), "Unknown work kind", "INVALID_PLAN")
         require(step["id"] not in by_id and len(set(step["acceptance"])) == len(step["acceptance"])
                 and len(set(step["depends_on"])) == len(step["depends_on"]), "Duplicate step or criterion", "INVALID_PLAN")
         by_id[step["id"]] = step
@@ -324,13 +326,20 @@ class Engine:
     def _issue(self, task, kind, step=None, attempt=1, role=None):
         now = time.time()
         if role is None:
-            if step and step.get("assignee"):
+            if kind in ("CODE", "FIX", "ANALYZE") and step and step.get("assignee"):
                 role = step["assignee"]
             else:
                 role = "antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex"
         payload = {"requirement": task["requirement"], "draft_plan": task["draft_plan"],
                    "requirement_revision": task.get("revision", 1),
                    "plan_review": task["plan_review"], "step": step}
+        if step:
+            by_id = {item["id"]: item for item in task["steps"]}
+            payload["dependency_outputs"] = [
+                {"step_id": dep, "work_kind": by_id[dep].get("work_kind", "code"),
+                 "summary": by_id[dep]["handoff"]["summary"][:2000],
+                 "deliverable": by_id[dep]["handoff"]["data"].get("deliverable", "")[:4000]}
+                for dep in step["depends_on"] if dep in by_id and by_id[dep].get("handoff")]
         # Copy payload: later state updates must not mutate a dispatched contract.
         d = {"id": uid(), "task_id": task["id"], "step_id": step["id"] if step else None,
              "kind": kind, "role": role, "attempt": attempt, "status": "ACTIVE",
@@ -359,14 +368,32 @@ class Engine:
                     elif s["status"] == "FIXING":
                         candidates.append(("FIX", s))
                     elif s["status"] == "PENDING" and set(s["depends_on"]) <= complete:
-                        candidates.append(("CODE", s))
+                        candidates.append(("ANALYZE" if s.get("work_kind", "code") == "analysis" else "CODE", s))
             for kind, step in candidates:
-                role = (step.get("assignee") if step else None) or ("antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex")
+                role = (step.get("assignee") if step and kind in ("CODE", "FIX", "ANALYZE") else None) or ("antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex")
                 if self._busy(db, t, role):
                     continue
                 if step and kind == "CODE":
                     step["status"] = "CODING"
+                elif step and kind == "ANALYZE":
+                    step["status"] = "ANALYZING"
                 d = self._issue(t, kind, step, role=role)
+                if kind in ("PLAN", "PLAN_FINALIZE"):
+                    from .agents import AgentConfig
+                    messages = [json.loads(r[0]) for r in db.execute(
+                        "SELECT body FROM messages WHERE task_id=? ORDER BY rowid DESC LIMIT 5", (task,))]
+                    d["payload"]["team_discussion"] = [
+                        {"question": m["content"][:2000],
+                         "replies": [{"agent": r["role"], "opinion": r["content"][:1200]}
+                                     | ({"proposals": r["report"]["data"]["proposals"]}
+                                        if r["report"]["data"].get("proposals") else {})
+                                     for r in m["replies"]]}
+                        for m in reversed(messages) if m["status"] == "DELIVERED"
+                        and m["revision"] == t.get("revision", 1)]
+                    d["payload"]["available_agents"] = [
+                        {"id": a.id, "roles": a.roles}
+                        for a in (AgentConfig(json.loads(r[0])) for r in db.execute("SELECT body FROM agents ORDER BY rowid"))
+                        if a.ready]
                 self._save(db, t, "DISPATCHED", {"dispatch_id": d["id"], "kind": kind})
                 return {"dispatch": d}
             return {"dispatch": None}
@@ -415,9 +442,30 @@ class Engine:
             require(status == "DONE", "Dispatch must be DONE or BLOCKED")
             if kind in ("PLAN", "PLAN_FINALIZE"):
                 plan_validate(data)
-            elif kind in ("PLAN_REVIEW", "CHAT"):
+            elif kind == "PLAN_REVIEW":
                 exact(data, [])
                 require(len(report["suggestions"]) <= 3, "Review allows at most 3 suggestions")
+            elif kind == "CHAT":
+                require(data == {} or (isinstance(data, dict) and set(data) == {"proposals"}),
+                        "Chat data must be empty or contain proposals")
+                if data:
+                    proposals = data["proposals"]
+                    require(isinstance(proposals, list) and len(proposals) <= 3,
+                            "At most three work proposals per reply")
+                    for proposal in proposals:
+                        exact(proposal, ["title", "work_kind", "assignee", "reason"])
+                        require(string(proposal["title"]) and len(proposal["title"]) <= 200
+                                and proposal["work_kind"] in ("code", "analysis")
+                                and string(proposal["assignee"]) and len(proposal["assignee"]) <= 64
+                                and string(proposal["reason"]) and len(proposal["reason"]) <= 1000,
+                                "Invalid work proposal")
+                require(len(report["suggestions"]) <= 3, "Chat allows at most 3 suggestions")
+            elif kind == "ANALYZE":
+                exact(data, ["deliverable", "evidence"])
+                require(string(data["deliverable"]) and len(data["deliverable"]) <= 50000
+                        and strings(data["evidence"], True) and len(data["evidence"]) <= 30
+                        and all(len(item) <= 2000 for item in data["evidence"]),
+                        "Analysis needs a deliverable and evidence")
             else:
                 exact(data, ["version", "changes", "known_limits"])
                 require(string(data["version"]) and strings(data["changes"], True) and strings(data["known_limits"]), "Invalid handoff")
@@ -473,20 +521,33 @@ class Engine:
                 t["plan_review"] = report
                 t["phase"] = "PLAN_FINALIZE"
             elif d["kind"] == "PLAN_FINALIZE":
-                require(all(s.get("assignee", "codex") == "codex" for s in data["steps"]),
-                        "Only Codex can own implementation steps in this version", "INVALID_PLAN")
+                from .agents import AgentConfig
+                agents = {a.id: a for a in (AgentConfig(json.loads(r[0]))
+                         for r in db.execute("SELECT body FROM agents"))}
+                for planned in data["steps"]:
+                    kind = planned.get("work_kind", "code")
+                    assignee = planned.get("assignee", "codex")
+                    require(kind != "code" or assignee == "codex",
+                            "Only Codex can own code steps in this version", "INVALID_PLAN")
+                    if kind == "analysis" and assignee != "codex":
+                        agent = agents.get(assignee)
+                        require(agent is not None and agent.ready and "analysis" in agent.roles,
+                                "Analysis assignee is not ready or capable", "INVALID_PLAN")
                 t["draft_plan"] = data
                 t["steps"] = [dict(s, status="PENDING", repair_count=0, version=None, handoff=None, verification=None) for s in data["steps"]]
                 t["phase"] = "EXECUTING"
             elif d["kind"] in ("CODE", "FIX"):
                 step.update(status="VERIFYING", version=data["version"], handoff=report)
+            elif d["kind"] == "ANALYZE":
+                version = hashlib.sha256(encode(data).encode("utf-8")).hexdigest()
+                step.update(status="VERIFYING", version=version, handoff=report)
             elif d["kind"] == "VERIFY":
                 step["verification"] = report
                 if report["status"] == "PASS":
                     step["status"] = "COMPLETED"
                 elif step["repair_count"] < t["config"]["max_repairs"]:
                     step["repair_count"] += 1
-                    step["status"] = "FIXING"
+                    step["status"] = "PENDING" if step.get("work_kind", "code") == "analysis" else "FIXING"
                 else:
                     step["status"] = "BLOCKED"
                     step["repair_exhausted"] = True
@@ -524,7 +585,7 @@ class Engine:
             require(not self._busy(db, t, d["role"]), "Another dispatch occupies this role", "INVALID_STATE")
             step = next((s for s in t["steps"] if s["id"] == d["step_id"]), None)
             if step:
-                step["status"] = {"CODE": "CODING", "FIX": "FIXING", "VERIFY": "VERIFYING"}[d["kind"]]
+                step["status"] = {"CODE": "CODING", "ANALYZE": "ANALYZING", "FIX": "FIXING", "VERIFY": "VERIFYING"}[d["kind"]]
             new = self._issue(t, d["kind"], step, d["attempt"] + 1)
             if d["kind"] == "CHAT":
                 new["role"], new["payload"] = d["role"], json.loads(encode(d["payload"]))
@@ -574,6 +635,8 @@ class Engine:
                 data = t["draft_plan"] or {"steps": [{"id": "s1", "title": "REPLACE", "acceptance": ["REPLACE"], "depends_on": []}]}
             elif d["kind"] in ("CODE", "FIX"):
                 data = {"version": "REPLACE_WITH_IMMUTABLE_VERSION", "changes": ["REPLACE"], "known_limits": []}
+            elif d["kind"] == "ANALYZE":
+                data = {"deliverable": "REPLACE", "evidence": ["REPLACE_WITH_CHECKABLE_REFERENCE"]}
             elif d["kind"] == "VERIFY":
                 # A template must never look like a completed successful verification.
                 status, data = "BLOCKED", {"reason": "Not yet executed; replace with checks and evidence"}

@@ -8,7 +8,9 @@ type Message = {
   recipient: string;
   status: string;
   error?: string;
-  replies: { role: string; content: string }[];
+  replies: { role: string; content: string; report?: { data?: { proposals?: {
+    title: string; work_kind: 'code' | 'analysis'; assignee: string; reason: string;
+  }[] } } }[];
 };
 
 const statusLabels: Record<string, string> = {
@@ -172,6 +174,14 @@ export function TaskChat({
                     <span className="small muted">发言 #{i + 1}</span>
                   </div>
                   <p className="prose" style={{ margin: 0, fontSize: 14 }}>{r.content}</p>
+                  {!!r.report?.data?.proposals?.length && (
+                    <ul className="small">
+                      {r.report.data.proposals.map((proposal, index) => (
+                        <li key={index}>{proposal.title} · {proposal.work_kind === 'analysis' ? '分析' : '开发'}
+                          {' → '}{agentMap[proposal.assignee]?.name || proposal.assignee}：{proposal.reason}</li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               );
             })}

@@ -354,7 +354,16 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                     raise CollabError("INVALID_INPUT", "Unknown execution options")
                 task = self.engine.show(task_id)
                 dispatch = self.engine._get_dispatch(task, dispatch_id)
-                runtime = self.runtime if dispatch["role"] == "codex" else self.server.antigravity_runtime
+                if dispatch["kind"] in ("CODE", "ANALYZE", "FIX", "VERIFY") and not self.runtime.approval(task_id)["approved"]:
+                    raise CollabError("APPROVAL_REQUIRED", "Approve the current plan before execution")
+                if dispatch["role"] == "codex":
+                    runtime = self.runtime
+                elif dispatch["role"] == "antigravity":
+                    runtime = self.server.antigravity_runtime
+                else:
+                    from .agents import AgentRegistry
+                    registry = getattr(self.server, "registry", None) or AgentRegistry(self.engine)
+                    runtime = registry.get_runtime(dispatch["role"])
                 reserved, dispatch = runtime._reserve(task_id, dispatch_id, timeout)
 
                 # Background thread execution

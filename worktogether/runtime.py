@@ -71,7 +71,7 @@ class Runtime:
             d = self.engine._get_dispatch(t, dispatch_id)
             require((t["status"] == "ACTIVE" or (t["status"] == "COMPLETED" and d["kind"] == "CHAT")) and d["status"] == "ACTIVE", "Task/dispatch is not active", "INVALID_STATE")
             require(d["role"] == self.role, "Dispatch role does not match provider", "UNSUPPORTED_PROVIDER")
-            if self.require_approval and d["kind"] in ("CODE", "FIX"):
+            if self.require_approval and d["kind"] in ("CODE", "ANALYZE", "FIX"):
                 approved = db.execute("SELECT digest FROM approvals WHERE task_id=?", (task,)).fetchone()
                 require(approved is not None and approved[0] == self.plan_digest(t),
                         "Approve the current plan before development", "APPROVAL_REQUIRED")
@@ -110,7 +110,18 @@ class Runtime:
                     "if a change is requested, explain what needs explicit revision/approval. "
                     "Return ONLY JSON with schema_version:1, task_id, dispatch_id (dispatch.id), role, attempt, "
                     "status:DONE, summary:your reply, basis:[nonempty strings], suggestions:[] (max 3), "
-                    "next_action:string, data:{}. If unable, status:BLOCKED and data:{reason:string}.\nDISPATCH:\n" + encode(dispatch))
+                    "next_action:string. data is {} or {proposals:[{title,work_kind:code|analysis,assignee,reason}]} "
+                    "with at most 3 concrete task proposals. A proposal is advice, not permission to run work; "
+                    "only an approved plan can dispatch tasks. If unable, status:BLOCKED and "
+                    "data:{reason:string}.\nDISPATCH:\n" + encode(dispatch))
+        if dispatch["kind"] == "ANALYZE":
+            return ("Complete this assigned read-only analysis. Do not modify files or launch other agents. "
+                    "Use prior step handoffs and review findings in the dispatch; distinguish observation from inference. "
+                    "Return ONLY JSON with schema_version:1, task_id, dispatch_id, role, attempt, "
+                    "status:DONE, summary:string, basis:[nonempty strings], suggestions:[], "
+                    "next_action:string, data:{deliverable:string,evidence:[nonempty strings]}. "
+                    "If unable, status:BLOCKED and data:{reason:string}. Never invent evidence.\nDISPATCH:\n"
+                    + encode(dispatch))
         contract = Path(__file__).resolve().parent.parent / "docs/contracts/v1.md"
         return ("Execute only this dispatched work item. Do not launch other agents, modify orchestration state, "
                 "or continue to the next step. "

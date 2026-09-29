@@ -16,6 +16,7 @@ const labels: Record<string, string> = {
   PAUSED: '已暂停',
   BLOCKED: '需要处理',
   RUNNING: '执行中',
+  ANALYZING: '分析中',
   PREPARED: '等待启动确认',
   QUEUED: '已登记',
   FAILED: '失败',
@@ -301,9 +302,9 @@ export function Workspace() {
 
             {!taskId ? (
               <section className="home">
-                <p className="eyebrow">多模型智能协作 · 自动分工与闭环验收</p>
+                <p className="eyebrow">多 Agent 讨论 · 受控分工与验收</p>
                 <h1>这个项目，你想完成什么？</h1>
-                <p className="muted">说明目标和验收标准。保存需求后，可让已就绪的 Agent 依次讨论；开发仍由 Codex 承担。</p>
+                <p className="muted">说明目标和验收标准。已就绪的 Agent 可讨论方案并承担分析工作；编码仍由 Codex 承担，执行前需你批准。</p>
 
                 <form className="composer" onSubmit={e => {
                   e.preventDefault();
@@ -346,7 +347,7 @@ export function Workspace() {
                     </div>
                   ))}
                 </div>
-                <p className="small">点击右上角“管理 Agent”可接入 DeepSeek API 或其他 OpenAI 兼容聊天接口。</p>
+                <p className="small">点击右上角“管理 Agent”可接入 DeepSeek API 或其他 OpenAI 兼容接口，参与对话与只读分析。</p>
               </section>
             ) : !task ? (
               <p role="status">正在加载任务…</p>
@@ -379,7 +380,7 @@ export function Workspace() {
                   {activeDispatch && (
                     <button
                       className="primary"
-                      disabled={locked || task.status !== 'ACTIVE' || (['CODE', 'FIX'].includes(activeDispatch.kind) && !approval?.approved)}
+                      disabled={locked || task.status !== 'ACTIVE' || (['CODE', 'ANALYZE', 'FIX', 'VERIFY'].includes(activeDispatch.kind) && !approval?.approved)}
                       onClick={() => act(() => api.triggerRun(taskId, activeDispatch.id))}
                     >
                       执行当前项 · {agentMap[activeDispatch.role]?.name || activeDispatch.role}
@@ -511,7 +512,7 @@ export function Workspace() {
                           return (
                             <div key={s.id} className="plan-step">
                               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                <strong>{s.title}</strong>
+                        <strong>{s.title} {s.work_kind === 'analysis' ? '· 分析' : '· 开发'}</strong>
                                 {assignee && (
                                   <span className="agent-tag" style={{ background: assignee.color + '1a', color: assignee.color }}>
                                     {assignee.avatar} {assignee.name}
@@ -651,7 +652,7 @@ export function Workspace() {
               <h2>已接入的协作 Agent</h2>
               <button style={{ minHeight: 28, padding: '2px 8px' }} onClick={() => setManagingAgents(false)}>✕ 关闭</button>
             </div>
-            <p className="small muted">自定义 Agent 目前通过 OpenAI 兼容接口参与任务对话；不能执行项目代码或独立验收。密钥只从启动服务的环境变量读取。</p>
+            <p className="small muted">自定义 Agent 可通过 OpenAI 兼容接口参与任务讨论并接受只读分析步骤；不能修改项目代码或独立验收。分工须经能力校验和你的方案批准。密钥只从启动服务的环境变量读取。</p>
 
             <div className="agent-card-list">
               {agents.map(a => (
@@ -667,7 +668,7 @@ export function Workspace() {
                     {a.endpoint && <p className="small muted" style={{ margin: 0 }}>接口: {a.endpoint} ({a.model})</p>}
                   </div>
                   <div>
-                  <span className={`badge ${a.ready ? 'active' : ''}`}>{a.ready ? '可参与对话' : '未就绪／已禁用'}</span>
+                  <span className={`badge ${a.ready ? 'active' : ''}`}>{a.ready ? '可讨论／分析' : '未就绪／已禁用'}</span>
                   </div>
                 </div>
               ))}
