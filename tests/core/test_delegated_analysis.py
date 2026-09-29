@@ -138,7 +138,7 @@ class DelegatedAnalysisTests(unittest.TestCase):
                 engine.submit(task, report)
                 return {"status": "COMPLETED"}
 
-        with patch("urllib.request.urlopen", return_value=Response()) as send:
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()) as send:
             result = execute(self.engine, self.task_id, self.codex, Reviewer(), max_calls=3)
         self.assertEqual(send.call_count, 1)
         self.assertEqual(result["reason"], "COMPLETED")

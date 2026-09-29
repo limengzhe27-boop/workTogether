@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from worktogether.core import Engine, CollabError
 from worktogether.agents import AgentRegistry
-from worktogether.openai_runtime import OpenAICompatibleRuntime
+from worktogether.openai_runtime import OpenAICompatibleRuntime, _NoRedirect
 
 
 class OpenAIRuntimeTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class OpenAIRuntimeTests(unittest.TestCase):
             def __exit__(self, *_): return False
             def read(self, *_): return json.dumps({"choices": [{"message": {"content": json.dumps(report)}}],
                                                "usage": {"total_tokens": 9}}).encode()
-        with patch("urllib.request.urlopen", return_value=Response()) as send:
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()) as send:
             run = self.runtime.run(self.task["id"], d["id"], timeout=30)
         self.assertEqual(send.call_count, 1)
         self.assertEqual(run["status"], "COMPLETED")
@@ -73,6 +73,10 @@ class OpenAIRuntimeTests(unittest.TestCase):
             self.engine._save(db, task, "TEST_PLAN", {})
         d = self.engine.dispatch(self.task["id"])["dispatch"]
         self.assertEqual(d["kind"], "ANALYZE")
+        with self.assertRaises(CollabError) as approval_error:
+            self.runtime.run(self.task["id"], d["id"], timeout=30)
+        self.assertEqual(approval_error.exception.code, "APPROVAL_REQUIRED")
+        self.runtime.approval(self.task["id"], self.runtime.approval(self.task["id"])["digest"])
         report = {"schema_version": 1, "task_id": self.task["id"], "dispatch_id": d["id"],
                   "role": "local-model", "attempt": 1, "status": "DONE", "summary": "API v2",
                   "basis": ["Local fixture"], "suggestions": [], "next_action": "Review",
@@ -81,12 +85,42 @@ class OpenAIRuntimeTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *_): return False
             def read(self, *_): return json.dumps({"choices": [{"message": {"content": json.dumps(report)}}]}).encode()
-        with patch("urllib.request.urlopen", return_value=Response()) as send:
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()) as send:
             run = self.runtime.run(self.task["id"], d["id"], timeout=30)
         self.assertEqual(run["status"], "COMPLETED")
         sent = send.call_args.args[0]
         self.assertNotIn("Authorization", sent.headers)
         self.assertEqual(self.engine.show(self.task["id"])["steps"][0]["status"], "VERIFYING")
+
+    def test_http_redirects_are_rejected(self):
+        import urllib.request
+        request = urllib.request.Request("https://api.example.test/v1/chat/completions",
+                                         headers={"Authorization": "Bearer secret"})
+        handler = _NoRedirect()
+        self.assertIsNone(handler.redirect_request(
+            request, None, 302, "Found", {}, "https://other.example.test/steal"))
+
+    def test_malformed_provider_response_fails_without_delivering(self):
+        self.engine.message_add(self.task["id"], "malformed", "local-model", "hello")
+        d = self.engine.chat_dispatch(self.task["id"])
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, *_): return b'{"choices":[{"message":{"content":null}}]}'
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()):
+            run = self.runtime.run(self.task["id"], d["id"], timeout=30)
+        self.assertEqual(run["status"], "FAILED")
+        self.assertEqual(self.engine.messages(self.task["id"])[0]["status"], "BLOCKED")
+
+    def test_pause_after_reservation_prevents_api_request(self):
+        self.engine.message_add(self.task["id"], "pause", "local-model", "hello")
+        d = self.engine.chat_dispatch(self.task["id"])
+        run, reserved = self.runtime._reserve(self.task["id"], d["id"], 30)
+        self.engine.pause(self.task["id"])
+        with patch("worktogether.openai_runtime._open_no_redirect") as send:
+            result = self.runtime.execute_reserved(run, reserved)
+        send.assert_not_called()
+        self.assertEqual(result["status"], "FAILED")
 
 
 if __name__ == "__main__":

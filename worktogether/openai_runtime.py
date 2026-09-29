@@ -5,6 +5,7 @@ No fabricated fallback results or code-writing claims.
 """
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -12,6 +13,17 @@ from pathlib import Path
 from .core import CollabError, encode, require, uid
 from .agents import local_endpoint
 from .runtime import Runtime
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward task content or credentials to a different URL."""
+
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_no_redirect(request, timeout):
+    return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
 
 
 class OpenAICompatibleRuntime(Runtime):
@@ -24,6 +36,7 @@ class OpenAICompatibleRuntime(Runtime):
         self.endpoint = agent_config.endpoint.rstrip("/")
         self.model = agent_config.model
         self.api_key_env = agent_config.api_key_env
+        self.require_approval = True
 
     def get_api_key(self) -> str:
         return os.environ.get(self.api_key_env, "") if self.api_key_env else ""
@@ -50,12 +63,28 @@ class OpenAICompatibleRuntime(Runtime):
         session_id = run.get("session_id") or uid()
         run["session_id"] = session_id
 
-        # Mark RUNNING in database
-        with self.engine.transaction() as db:
-            current = self._get(db, run["id"])
-            require(current["status"] == "PREPARED", "Run status conflict", "INVALID_STATE")
-            run["status"] = "RUNNING"
-            self._save(db, run)
+        # The reservation may have become stale while the prompt was prepared.
+        try:
+            with self.engine.transaction() as db:
+                task_state = self.engine._task(db, task)
+                current_dispatch = self.engine._get_dispatch(task_state, dispatch_id)
+                current = self._get(db, run["id"])
+                require((task_state["status"] == "ACTIVE" or
+                         (task_state["status"] == "COMPLETED" and d["kind"] == "CHAT"))
+                        and current_dispatch["status"] == "ACTIVE"
+                        and current_dispatch["deadline"] > time.time()
+                        and current["status"] == "PREPARED",
+                        "Task stopped before API request", "INVALID_STATE")
+                if self.require_approval and d["kind"] == "ANALYZE":
+                    approval = db.execute("SELECT digest FROM approvals WHERE task_id=?", (task,)).fetchone()
+                    require(approval is not None and approval[0] == self.plan_digest(task_state),
+                            "Approve the current plan before analysis", "APPROVAL_REQUIRED")
+                run["status"] = "RUNNING"
+                self._save(db, run)
+        except CollabError as exc:
+            run.update(status="FAILED", error=str(exc), error_code=exc.code)
+            self._fail(run)
+            return run
 
         report = None
         usage = None
@@ -90,7 +119,7 @@ class OpenAICompatibleRuntime(Runtime):
             req = urllib.request.Request(url, data=req_body, headers=headers, method="POST")
 
             try:
-                with urllib.request.urlopen(req, timeout=run.get("timeout", 120)) as resp:
+                with _open_no_redirect(req, timeout=run.get("timeout", 120)) as resp:
                     raw = resp.read(2_000_001)
                     require(len(raw) <= 2_000_000, "Provider response exceeds 2 MB", "PROVIDER_FAILED")
                     resp_data = json.loads(raw.decode("utf-8"))
@@ -106,7 +135,8 @@ class OpenAICompatibleRuntime(Runtime):
                             lines = lines[:-1]
                         content = "\n".join(lines).strip()
                     report = json.loads(content)
-            except (urllib.error.URLError, ValueError, KeyError, IndexError, TimeoutError, CollabError) as exc:
+            except (urllib.error.URLError, ValueError, TypeError, AttributeError,
+                    KeyError, IndexError, TimeoutError, CollabError) as exc:
                 err_msg = f"{type(exc).__name__}: {exc}"
                 (root / "stderr.log").write_text(err_msg, encoding="utf-8")
                 run["status"] = "FAILED"

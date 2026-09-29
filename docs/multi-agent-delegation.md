@@ -18,6 +18,7 @@ ideas:
 
 All reports remain task-scoped and audited. Provider errors never silently pass verification. The existing Antigravity tool-permission limitation remains unresolved; the tests for this feature use deterministic fake CLI/HTTP responses, not paid live models.
 An API Agent marked ready has a complete configuration; that does not prove its endpoint is currently reachable or its credentials are valid. Those failures surface when a real dispatch runs.
+For API calls, the adapter requires plan approval for analysis even when invoked directly, rechecks task/dispatch state immediately before the request, rejects HTTP redirects instead of forwarding task text or credentials, and treats malformed provider output as a failed run rather than an Agent reply.
 
 ## Explicitly not yet supported
 

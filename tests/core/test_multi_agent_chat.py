@@ -91,7 +91,7 @@ class MultiAgentChatTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *_): return False
             def read(self, *_): return json.dumps({"choices": [{"message": {"content": json.dumps(report)}}]}).encode()
-        with patch("urllib.request.urlopen", return_value=Response()):
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()):
             run3 = r3.run(self.task["id"], d3["id"], timeout=30)
         self.assertEqual(run3["status"], "COMPLETED")
 
