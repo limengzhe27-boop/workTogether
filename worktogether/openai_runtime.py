@@ -26,6 +26,51 @@ def _open_no_redirect(request, timeout):
     return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
 
 
+def probe_openai_compatible(agent):
+    """Explicit, bounded, task-free model call to check a configured API agent."""
+    require(agent.type == "openai_compat" and agent.enabled, "API agent is not enabled", "UNSUPPORTED_PROVIDER")
+    key = os.environ.get(agent.api_key_env, "") if agent.api_key_env else ""
+    if not local_endpoint(agent.endpoint) and not key:
+        return {"agent_id": agent.id, "connected": False, "code": "MISSING_KEY",
+                "message": "服务端尚未配置 API Key"}
+    payload = {"model": agent.model,
+               "messages": [{"role": "user", "content": "Connection check only. Reply with PONG."}],
+               "temperature": 0.2, "max_tokens": 16}
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    request = urllib.request.Request(agent.endpoint.rstrip("/") + "/chat/completions",
+                                     data=json.dumps(payload).encode("utf-8"), headers=headers,
+                                     method="POST")
+    try:
+        with _open_no_redirect(request, timeout=10) as response:
+            raw = response.read(65_537)
+        if len(raw) > 65_536:
+            return {"agent_id": agent.id, "connected": False, "code": "INCOMPATIBLE_RESPONSE",
+                    "message": "接口响应超过测试大小上限"}
+        result = json.loads(raw.decode("utf-8"))
+        content = result["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Empty chat completion")
+        raw_usage = result.get("usage")
+        usage = ({name: raw_usage[name] for name in
+                  ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens")
+                  if name in raw_usage and type(raw_usage[name]) is int and raw_usage[name] >= 0}
+                 if isinstance(raw_usage, dict) else None)
+        return {"agent_id": agent.id, "connected": True, "code": "OK",
+                "message": "接口已返回聊天响应；实际任务仍需验证",
+                "usage": usage}
+    except urllib.error.HTTPError as exc:
+        return {"agent_id": agent.id, "connected": False, "code": "HTTP_ERROR",
+                "message": "接口返回 HTTP " + str(exc.code)}
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return {"agent_id": agent.id, "connected": False, "code": "NETWORK_ERROR",
+                "message": "10 秒内无法连接接口"}
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return {"agent_id": agent.id, "connected": False, "code": "INCOMPATIBLE_RESPONSE",
+                "message": "接口未返回可用的聊天响应"}
+
+
 class OpenAICompatibleRuntime(Runtime):
     provider = "openai_compat"
 

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from worktogether.core import Engine, CollabError
 from worktogether.agents import AgentRegistry
-from worktogether.openai_runtime import OpenAICompatibleRuntime, _NoRedirect
+from worktogether.openai_runtime import OpenAICompatibleRuntime, _NoRedirect, probe_openai_compatible
 
 
 class OpenAIRuntimeTests(unittest.TestCase):
@@ -99,6 +99,40 @@ class OpenAIRuntimeTests(unittest.TestCase):
         handler = _NoRedirect()
         self.assertIsNone(handler.redirect_request(
             request, None, 302, "Found", {}, "https://other.example.test/steal"))
+
+    def test_explicit_probe_sends_no_task_content_and_reports_usable_response(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, *_):
+                return b'{"choices":[{"message":{"content":"PONG"}}],"usage":{"total_tokens":8}}'
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()) as send:
+            result = probe_openai_compatible(self.agent_cfg)
+        self.assertTrue(result["connected"])
+        self.assertEqual(8, result["usage"]["total_tokens"])
+        request = send.call_args.args[0]
+        self.assertEqual(10, send.call_args.kwargs["timeout"])
+        payload = json.loads(request.data)
+        self.assertEqual(16, payload["max_tokens"])
+        self.assertNotIn("Req", request.data.decode())
+        self.assertNotIn(self.temp_dir.name, request.data.decode())
+
+    def test_probe_missing_key_does_not_contact_remote(self):
+        cfg = self.registry.get("deepseek-hermes")
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}), \
+             patch("worktogether.openai_runtime._open_no_redirect") as send:
+            result = probe_openai_compatible(cfg)
+        self.assertEqual("MISSING_KEY", result["code"])
+        send.assert_not_called()
+
+    def test_probe_rejects_non_chat_response(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, *_): return b'{"choices":[]}'
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()):
+            result = probe_openai_compatible(self.agent_cfg)
+        self.assertEqual("INCOMPATIBLE_RESPONSE", result["code"])
 
     def test_malformed_provider_response_fails_without_delivering(self):
         self.engine.message_add(self.task["id"], "malformed", "local-model", "hello")

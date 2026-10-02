@@ -257,6 +257,17 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                 reg = getattr(self.server, "registry", None) or AgentRegistry(self.engine)
                 created = reg.register(body)
                 return self._send_json(HTTPStatus.CREATED, created)
+            m_agent_probe = re.fullmatch(r"/api/agents/([a-z][a-z0-9-]{0,63})/probe", path)
+            if m_agent_probe:
+                if body:
+                    raise CollabError("INVALID_INPUT", "Connection probe takes no task data")
+                from .agents import AgentRegistry
+                from .openai_runtime import probe_openai_compatible
+                reg = getattr(self.server, "registry", None) or AgentRegistry(self.engine)
+                agent = reg.get(m_agent_probe.group(1))
+                if agent is None:
+                    raise CollabError("NOT_FOUND", "Agent not found")
+                return self._send_json(HTTPStatus.OK, probe_openai_compatible(agent))
             m_messages = re.fullmatch(r"/api/tasks/([^/]+)/messages", path)
             if m_messages:
                 if set(body) != {"message_id", "recipient", "content"}:

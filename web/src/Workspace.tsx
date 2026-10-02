@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api, request } from './api';
 import { TaskChat } from './TaskChat';
-import { Project, TaskDetail, TaskSummary, RunRecord, AgentInfo, ReportEnvelope } from './types';
+import { Project, TaskDetail, TaskSummary, RunRecord, AgentInfo, AgentProbeResult, ReportEnvelope } from './types';
 
 type Detail = TaskDetail & { revision?: number };
 type Job = { id: string; status: string; error: string | null; result?: { reason?: string } };
@@ -63,6 +63,8 @@ export function Workspace() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [providers, setProviders] = useState<Record<string, { available: boolean; executable: string }> | null>(null);
   const [managingAgents, setManagingAgents] = useState(false);
+  const [probingAgent, setProbingAgent] = useState('');
+  const [probeResults, setProbeResults] = useState<Record<string, AgentProbeResult>>({});
   const [newAgent, setNewAgent] = useState({
     id: '',
     name: '',
@@ -217,6 +219,11 @@ export function Workspace() {
       });
       const res = await api.getAgents();
       setAgents(res.agents);
+      setProbeResults(current => {
+        const next = { ...current };
+        delete next[newAgent.id];
+        return next;
+      });
       setManagingAgents(false);
       setNewAgent({
         id: '',
@@ -230,6 +237,22 @@ export function Workspace() {
         avatar: '🧠',
       });
     });
+  }
+
+  async function testAgentConnection(agentId: string) {
+    if (probingAgent) return;
+    setProbingAgent(agentId);
+    try {
+      const result = await api.probeAgent(agentId);
+      setProbeResults(current => ({ ...current, [agentId]: result }));
+    } catch (e) {
+      setProbeResults(current => ({ ...current, [agentId]: {
+        agent_id: agentId, connected: false, code: 'PROBE_ERROR',
+        message: (e as Error).message,
+      } }));
+    } finally {
+      setProbingAgent('');
+    }
   }
 
   const activeDispatch = task?.dispatches.find(d => d.status === 'ACTIVE');
@@ -785,7 +808,7 @@ export function Workspace() {
               <h2>已接入的协作 Agent</h2>
               <button style={{ minHeight: 28, padding: '2px 8px' }} onClick={() => setManagingAgents(false)}>✕ 关闭</button>
             </div>
-            <p className="small muted">自定义 Agent 可通过 OpenAI 兼容接口参与任务讨论并接受只读分析步骤；不能修改项目代码或独立验收。分工须经能力校验和你的方案批准。密钥只从启动服务的环境变量读取。</p>
+            <p className="small muted">自定义 Agent 可通过 OpenAI 兼容接口参与任务讨论并接受只读分析步骤；不能修改项目代码或独立验收。分工须经能力校验和你的方案批准。密钥只从启动服务的环境变量读取。连接测试会发送一条不含任务内容的短消息，可能产生少量模型用量。</p>
 
             <div className="agent-card-list">
               {agents.map(a => (
@@ -800,8 +823,23 @@ export function Workspace() {
                     <p className="small" style={{ margin: '4px 0 0' }}>{a.description || '无描述'}</p>
                     {a.endpoint && <p className="small muted" style={{ margin: 0 }}>接口: {a.endpoint} ({a.model})</p>}
                   </div>
-                  <div>
-                  <span className={`badge ${a.ready ? 'active' : ''}`}>{a.ready ? '配置就绪 · 调用时验证' : '未配置／已禁用'}</span>
+                  <div className="agent-card-actions">
+                    <span className={`badge ${a.ready ? 'active' : ''}`}>
+                      {!a.ready ? '未配置／已禁用' : a.type === 'openai_compat' ? '配置就绪 · 未验证连接' : '内置 Agent · 调用时验证'}
+                    </span>
+                    {a.type === 'openai_compat' && (
+                      <button type="button" disabled={!a.ready || !!probingAgent}
+                        onClick={() => testAgentConnection(a.id)}>
+                        {probingAgent === a.id ? '测试中…' : '测试连接（可能计费）'}
+                      </button>
+                    )}
+                    {probeResults[a.id] && (
+                      <span className="small" role="status">
+                        {probeResults[a.id].connected ? '连接可用' : '连接失败'}：{probeResults[a.id].message}
+                        {typeof probeResults[a.id].usage?.total_tokens === 'number' &&
+                          ` · 本次 ${probeResults[a.id].usage?.total_tokens} Token`}
+                      </span>
+                    )}
                   </div>
                 </div>
               ))}

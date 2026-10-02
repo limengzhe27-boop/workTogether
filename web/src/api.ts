@@ -11,6 +11,7 @@ import {
   RunRecord,
   HandoffBundle,
   AgentInfo,
+  AgentProbeResult,
 } from './types';
 
 const BASE_URL = '/api';
@@ -49,6 +50,11 @@ export const api = {
     request<AgentInfo>('/agents', {
       method: 'POST',
       body: JSON.stringify(agent),
+    }),
+  probeAgent: (agentId: string) =>
+    request<AgentProbeResult>(`/agents/${encodeURIComponent(agentId)}/probe`, {
+      method: 'POST',
+      body: '{}',
     }),
 
   // Projects

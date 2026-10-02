@@ -27,6 +27,14 @@ export interface AgentInfo {
   has_key?: boolean;
 }
 
+export interface AgentProbeResult {
+  agent_id: string;
+  connected: boolean;
+  code: string;
+  message: string;
+  usage?: Record<string, number> | null;
+}
+
 export interface Project {
   id: string;
   name: string;

@@ -344,6 +344,33 @@ class ServerApiTests(unittest.TestCase):
         agent_ids = [a["id"] for a in res["agents"]]
         self.assertIn("qwen-coder", agent_ids)
 
+    def test_agent_probe_is_explicit_and_accepts_no_task_payload(self):
+        agent = {"id": "local-probe", "name": "Local Probe", "type": "openai_compat",
+                 "endpoint": "http://127.0.0.1:11434/v1", "model": "fixture"}
+        status, _ = execute_request(self.server, "POST", "/api/agents", agent)
+        self.assertEqual(201, status)
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, *_): return b'{"choices":[{"message":{"content":"PONG"}}]}'
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()) as send:
+            status, result = execute_request(self.server, "POST", "/api/agents/local-probe/probe")
+            self.assertEqual(200, status)
+            self.assertTrue(result["connected"])
+            self.assertEqual(1, send.call_count)
+            status, result = execute_request(self.server, "POST", "/api/agents/local-probe/probe",
+                                             {"requirement": "private task"})
+            self.assertEqual(400, status)
+            self.assertEqual("INVALID_INPUT", result["error"]["code"])
+            self.assertEqual(1, send.call_count)
+
+    def test_builtin_agent_probe_is_not_a_model_call(self):
+        with patch("worktogether.openai_runtime._open_no_redirect") as send:
+            status, result = execute_request(self.server, "POST", "/api/agents/codex/probe")
+        self.assertEqual(400, status)
+        self.assertEqual("UNSUPPORTED_PROVIDER", result["error"]["code"])
+        send.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
