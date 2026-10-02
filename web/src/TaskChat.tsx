@@ -23,9 +23,9 @@ const statusLabels: Record<string, string> = {
 
 const PROMPT_SUGGESTIONS = [
   '请各位 Agent 共同评估当前需求方案，讨论最佳架构与分工。',
-  '请 DeepSeek Hermes 深入分析当前方案的潜在缺陷与边界条件。',
-  '请 Codex 拆解具体实施步骤，预估实现难度与依赖。',
-  '请 Antigravity 列出该需求的核心验收标准与黑盒测试场景。',
+  '请各位分析当前方案的潜在缺陷与边界条件，只指出最重要的三项。',
+  '请根据各自实际工具能力说明愿意承担的任务及理由，不要按品牌固定分工。',
+  '请提出独立验收标准和测试场景，说明哪些验证需要额外权限。',
 ];
 
 export function TaskChat({
@@ -52,6 +52,14 @@ export function TaskChat({
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
   const [tick, setTick] = useState(0);
+  const bothReady = ['codex', 'antigravity'].every(id => agents.some(a => a.id === id && a.ready));
+  useEffect(() => {
+    if ((recipient === 'both' && !bothReady) ||
+        (!['all', 'both'].includes(recipient) && !agents.some(a => a.id === recipient && a.ready))) {
+      setRecipient('all');
+      setId(crypto.randomUUID());
+    }
+  }, [agents, recipient, bothReady]);
 
   const agentMap = React.useMemo(() => {
     const map: Record<string, AgentInfo> = {};
@@ -112,7 +120,7 @@ export function TaskChat({
   }
 
   function getRecipientLabel(rec: string) {
-    if (rec === 'all') return '📢 全部 Agent (多方群聊)';
+    if (rec === 'all') return '📢 本任务已就绪成员';
     if (rec === 'both') return '🤝 Codex & Antigravity (双向评审)';
     const a = agentMap[rec];
     if (a) return `${a.avatar} ${a.name}`;
@@ -140,7 +148,7 @@ export function TaskChat({
 
       {messages.length === 0 ? (
         <div className="empty" style={{ padding: '24px 16px' }}>
-          暂无对话。发一条消息，让各位 Agent 围绕方案展开多方讨论与分工协作。
+          暂无补充对话。这里每位成员依次回复一次；并行讨论、认领和执行请使用任务上方的团队流程。
         </div>
       ) : (
         messages.map(m => (
@@ -203,8 +211,8 @@ export function TaskChat({
               setId(crypto.randomUUID());
             }}
           >
-            <option value="all">📢 @全部 Agent (多方群聊与接力协作)</option>
-            <option value="both">🤝 @Codex + @Antigravity (主力双向审查)</option>
+            <option value="all">📢 本任务已就绪成员（依次回复）</option>
+            {bothReady && <option value="both">🤝 Codex + Antigravity</option>}
             {agents
               .filter(a => a.enabled && a.ready)
               .map(a => (

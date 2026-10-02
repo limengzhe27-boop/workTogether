@@ -38,7 +38,7 @@ def resolve_antigravity_executable(executable, private_cli=None):
 
 
 class WorkTogetherHandler(BaseHTTPRequestHandler):
-    server_version = "WorkTogetherServer/1.0"
+    server_version = "WorkTogetherServer/1.1"
 
     @property
     def engine(self):
@@ -124,7 +124,8 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
         try:
             # 1. Health check
             if path == "/api/health":
-                return self._send_json(HTTPStatus.OK, {"status": "ok", "version": "v1.0",
+                return self._send_json(HTTPStatus.OK, {"status": "ok", "version": "v1.1",
+                                                       "features": ["task-teams", "bounded-team-discussion", "delegate-team", "deepseek-harness"],
                                                        "providers": getattr(self.server, "provider_status", {})})
             if path == "/api/agents":
                 from .agents import AgentRegistry

@@ -4,12 +4,19 @@ import { TaskChat } from './TaskChat';
 import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentProbeResult, ReportEnvelope } from './types';
 
 type Detail = TaskDetail & { revision?: number; team?: { members: string[]; coordinator: string; reviewer: string } };
-type Job = { id: string; status: string; error: string | null; result?: { reason?: string } };
+type Job = { id: string; status: string; error: string | null; authorization?: { revision: number }; result?: { reason?: string } };
 type Approval = { digest: string; approved: boolean; requirement: string; plan: Detail['draft_plan']; revision: number };
 const labels: Record<string, string> = {
+  CONSULT: '成员意见',
+  CLAIM: '任务认领',
+  PLAN: '任务拆分',
+  PLAN_FINALIZE: '分工定稿',
+  CODE: '实现',
+  VERIFY: '独立验收',
+  FIX: '修复',
+  ANALYZE: '分析交付',
   PLANNING: '准备方案',
   PLAN_REVIEW: '审查方案',
-  PLAN_FINALIZE: '方案定稿',
   EXECUTING: '开发与验收',
   COMPLETED: '已完成',
   ACTIVE: '待推进',
@@ -588,7 +595,7 @@ export function Workspace() {
                 {task.team && !revisionStarted && <p className="small">“授权团队讨论并执行”允许团队在本需求范围内定稿后直接工作，不再逐步询问；仍受能力、独立验收、修复与调用预算限制。若要先审方案，请使用“团队讨论与认领”。</p>}
                 {teamJobs.length > 0 && <section className="card">
                   <h2>团队自动协作</h2>
-                  {teamJobs.map(j => <p key={j.id}>{j.result?.reason === 'COMPLETED' ? '全部步骤通过验收' : j.status === 'COMPLETED' ? '本轮已停止，任务未必完成' : label(j.status)} · {j.error || j.result?.reason || '讨论、认领、定稿后按授权执行'}{j.result?.reason === 'CALL_LIMIT' ? '（本轮预算已用完，不代表任务完成）' : ''}</p>)}
+                  {teamJobs.map(j => <p key={j.id}>需求版本 {j.authorization?.revision || 1} · {j.result?.reason === 'COMPLETED' ? '全部步骤通过验收' : j.status === 'COMPLETED' ? '本轮已停止，任务未必完成' : label(j.status)} · {j.error || j.result?.reason || '讨论、认领、定稿后按授权执行'}{j.result?.reason === 'CALL_LIMIT' ? '（本轮预算已用完，不代表任务完成）' : ''}</p>)}
                 </section>}
 
                 {activeDispatch && (
@@ -781,12 +788,18 @@ export function Workspace() {
                           <div className="message-heading">
                             <span className="avatar" style={{ color, borderColor: color, fontSize: 16 }}>{avatar}</span>
                             <strong style={{ color }}>{name}</strong>
+                            <span className="small muted">{label(d.kind)}</span>
                             <span className="badge">
                               {(d.payload.requirement_revision || 1) !== (task.revision || 1) ? '历史版本 · ' : ''}
                               {label(d.report!.status)}
                             </span>
                           </div>
                           <p className="prose">{d.report!.summary}</p>
+                          {d.kind === 'CLAIM' && Array.isArray(d.report!.data.claims) && (
+                            d.report!.data.claims.length ? <ul className="small">{d.report!.data.claims.map((claim: { step_id: string; reason: string }) => (
+                              <li key={claim.step_id}>愿意承担 {task.draft_plan?.steps.find(s => s.id === claim.step_id)?.title || claim.step_id}：{claim.reason}</li>
+                            ))}</ul> : <p className="small muted">本轮没有认领工作项。</p>
+                          )}
                           {d.report!.suggestions.map((s, i) => <p key={i} className="suggestion">{s}</p>)}
                           <details>
                             <summary>依据与报告</summary>
