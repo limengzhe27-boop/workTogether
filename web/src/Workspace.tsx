@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api, request } from './api';
 import { TaskChat } from './TaskChat';
-import { Project, TaskDetail, TaskSummary, RunRecord, AgentInfo, AgentProbeResult, ReportEnvelope } from './types';
+import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentProbeResult, ReportEnvelope } from './types';
 
 type Detail = TaskDetail & { revision?: number };
 type Job = { id: string; status: string; error: string | null; result?: { reason?: string } };
@@ -25,6 +25,10 @@ const labels: Record<string, string> = {
   SUPERSEDED: '已失效',
 };
 const label = (s: string) => labels[s] || s;
+const artifactLabels: Record<string, string> = {
+  'prompt.txt': '指令', 'result.json': '结果', 'events.jsonl': '运行日志',
+  'stderr.log': '错误日志', 'command.json': '启动参数',
+};
 const post = <T,>(url: string, body = {}) => request<T>(url, { method: 'POST', body: JSON.stringify(body) });
 function stored(key: string) { try { return localStorage.getItem(key) || ''; } catch { return ''; } }
 function save(key: string, value: string) { try { localStorage.setItem(key, value); } catch { /* Storage is optional. */ } }
@@ -36,6 +40,10 @@ export function Workspace() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [task, setTask] = useState<Detail | null>(null);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [artifact, setArtifact] = useState<{
+    runId: string; filename: string; loading: boolean; error: string; preview?: RunArtifactPreview;
+  } | null>(null);
+  const artifactRequest = useRef(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [executionJobs, setExecutionJobs] = useState<Job[]>([]);
   const [approval, setApproval] = useState<Approval | null>(null);
@@ -169,10 +177,12 @@ export function Workspace() {
   }, [project, taskId, tick]);
 
   function choose(id: string) {
+    artifactRequest.current += 1;
     save('wt:selected-task', id);
     setTaskId(id);
     setTask(null);
     setRuns([]);
+    setArtifact(null);
     setJobs([]);
     setExecutionJobs([]);
     setApproval(null);
@@ -252,6 +262,24 @@ export function Workspace() {
       } }));
     } finally {
       setProbingAgent('');
+    }
+  }
+
+  async function viewRunArtifact(runId: string, filename: string) {
+    const requestId = ++artifactRequest.current;
+    const currentTask = taskId;
+    setArtifact({ runId, filename, loading: true, error: '' });
+    try {
+      const preview = await api.getArtifact(runId, filename);
+      if (artifactRequest.current === requestId && selected.current.taskId === currentTask) {
+        setArtifact({ runId, filename, loading: false, error: '', preview });
+      }
+    } catch (e) {
+      if (artifactRequest.current === requestId && selected.current.taskId === currentTask) {
+        const error = e as Error & { status?: number };
+        setArtifact({ runId, filename, loading: false,
+          error: error.status === 404 ? '这次运行没有生成该文件。' : error.message });
+      }
     }
   }
 
@@ -748,6 +776,29 @@ export function Workspace() {
                     {runs.map(r => (
                       <details key={r.id} className="card">
                         <summary>{r.provider} · {label(r.status)}</summary>
+                        <p className="small muted">运行产物可能包含任务内容或本机路径，仅在本机查看。</p>
+                        <div className="actions">
+                          {Object.entries(artifactLabels).map(([filename, title]) => (
+                            <button key={filename} type="button" onClick={() => viewRunArtifact(r.id, filename)}>
+                              查看{title}
+                            </button>
+                          ))}
+                        </div>
+                        {artifact?.runId === r.id && (
+                          <section className="artifact-view" aria-live="polite">
+                            <strong>{artifactLabels[artifact.filename]}</strong>
+                            {artifact.loading && <p>正在读取…</p>}
+                            {artifact.error && <p className="error">{artifact.error}</p>}
+                            {artifact.preview && (
+                              <>
+                                {artifact.preview.truncated && (
+                                  <p className="small muted">文件共 {artifact.preview.size_bytes.toLocaleString()} 字节，只显示{artifact.preview.view === 'tail' ? '末尾' : '开头'} 512 KB。</p>
+                                )}
+                                <pre>{artifact.preview.content}</pre>
+                              </>
+                            )}
+                          </section>
+                        )}
                         <pre>{JSON.stringify(r, null, 2)}</pre>
                       </details>
                     ))}

@@ -12,6 +12,7 @@ import {
   HandoffBundle,
   AgentInfo,
   AgentProbeResult,
+  RunArtifactPreview,
 } from './types';
 
 const BASE_URL = '/api';
@@ -111,8 +112,8 @@ export const api = {
       body: JSON.stringify({ dispatch_id: dispatchId, timeout }),
     }),
   getArtifact: (runId: string, filename: string) =>
-    request<{ filename: string; run_id: string; content: string }>(
-      `/runs/${runId}/artifacts/${filename}`
+    request<RunArtifactPreview>(
+      `/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(filename)}`
     ),
 
   // Demo

@@ -26,6 +26,7 @@ from .chat import ChatQueue
 
 
 SAFE_ARTIFACT_NAMES = {"prompt.txt", "command.json", "events.jsonl", "stderr.log", "result.json"}
+ARTIFACT_PREVIEW_LIMIT = 512 * 1024
 
 
 def resolve_antigravity_executable(executable, private_cli=None):
@@ -221,8 +222,16 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                     return self._send_error(HTTPStatus.FORBIDDEN, "FORBIDDEN", "Path traversal prohibited")
                 if not target_file.is_file():
                     return self._send_error(HTTPStatus.NOT_FOUND, "NOT_FOUND", f"Artifact '{filename}' does not exist")
-                content = target_file.read_text(encoding="utf-8", errors="replace")
-                return self._send_json(HTTPStatus.OK, {"filename": filename, "run_id": run_id, "content": content})
+                size = target_file.stat().st_size
+                tail = filename in ("events.jsonl", "stderr.log") and size > ARTIFACT_PREVIEW_LIMIT
+                with target_file.open("rb") as stream:
+                    if tail:
+                        stream.seek(size - ARTIFACT_PREVIEW_LIMIT)
+                    raw = stream.read(ARTIFACT_PREVIEW_LIMIT)
+                return self._send_json(HTTPStatus.OK, {"filename": filename, "run_id": run_id,
+                                                       "content": raw.decode("utf-8", errors="replace"),
+                                                       "size_bytes": size, "truncated": size > len(raw),
+                                                       "view": "tail" if tail else "head"})
 
             # 11. Static files or SPA index
             if not path.startswith("/api/"):

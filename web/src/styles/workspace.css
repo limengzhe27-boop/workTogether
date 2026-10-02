@@ -17,4 +17,5 @@
 .agent-card-list{display:flex;flex-direction:column;gap:10px;margin:16px 0}
 .agent-card{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
 .agent-card>div:first-child{min-width:0;overflow-wrap:anywhere}.agent-card-actions{display:flex;flex-direction:column;align-items:flex-end;gap:7px;max-width:190px;text-align:right}.agent-card-actions button{min-height:32px;padding:4px 8px;font-size:12px}.agent-card-actions .small{overflow-wrap:anywhere}
+.artifact-view{margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:12px}.artifact-view pre{max-height:420px;overflow:auto;margin:8px 0 0}
 @media(max-width:600px){.agent-card{flex-direction:column}.agent-card-actions{align-items:flex-start;max-width:100%;text-align:left}}

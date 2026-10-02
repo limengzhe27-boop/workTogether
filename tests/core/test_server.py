@@ -313,6 +313,32 @@ class ServerApiTests(unittest.TestCase):
         status, res = execute_request(self.server, "GET", "/api/runs/r1/artifacts/malicious.sh")
         self.assertEqual(status, 403)
 
+    def test_artifact_view_is_bounded_and_rejects_outside_symlink(self):
+        project = self.engine.project_add("artifact", self.temp_dir.name)
+        task = self.engine.task_add(project["id"], "artifact", "preview")
+        dispatch = self.engine.dispatch(task["id"])["dispatch"]
+        run, _ = self.runtime._reserve(task["id"], dispatch["id"], 30)
+        root = Path(run["artifact_dir"])
+        root.mkdir(parents=True)
+        (root / "prompt.txt").write_bytes(b"HEAD" + b"x" * (600 * 1024))
+        (root / "stderr.log").write_bytes(b"x" * (600 * 1024) + b"TAIL")
+        status, head = execute_request(self.server, "GET", f"/api/runs/{run['id']}/artifacts/prompt.txt")
+        self.assertEqual(200, status)
+        self.assertTrue(head["truncated"])
+        self.assertEqual("head", head["view"])
+        self.assertTrue(head["content"].startswith("HEAD"))
+        self.assertLessEqual(len(head["content"]), 512 * 1024)
+        status, tail = execute_request(self.server, "GET", f"/api/runs/{run['id']}/artifacts/stderr.log")
+        self.assertEqual(200, status)
+        self.assertEqual("tail", tail["view"])
+        self.assertTrue(tail["content"].endswith("TAIL"))
+
+        outside = Path(self.temp_dir.name) / "outside-secret.txt"
+        outside.write_text("private", encoding="utf-8")
+        (root / "result.json").symlink_to(outside)
+        status, _ = execute_request(self.server, "GET", f"/api/runs/{run['id']}/artifacts/result.json")
+        self.assertEqual(403, status)
+
     def test_agents_api(self):
         # 1. GET /api/agents returns default agents
         status, res = execute_request(self.server, "GET", "/api/agents")

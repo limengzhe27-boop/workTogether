@@ -172,6 +172,15 @@ export interface RunRecord {
   } | null;
 }
 
+export interface RunArtifactPreview {
+  filename: string;
+  run_id: string;
+  content: string;
+  size_bytes: number;
+  truncated: boolean;
+  view: 'head' | 'tail';
+}
+
 export interface HandoffBundle {
   task: {
     id: string;
