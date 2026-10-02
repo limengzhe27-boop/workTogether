@@ -20,7 +20,7 @@
 
 Agent 管理页可由你主动点击“测试连接”：平台仅发送一条不含任务或代码的短请求，并检查是否返回可用的聊天响应；可能产生少量模型用量，不会在注册时自动触发。连接测试通过不等于分析能力、任务协议或实际开发流程已经验收。
 
-自定义 API Agent 分工这部分通过模拟 CLI 和协议形状的 HTTP 测试验证；尚未用真实 DeepSeek/Ollama 服务完成端到端试运行。Antigravity 对需要命令行工具权限的验收仍可能被阻断。并行修改代码、Claude Code/ZCode 编码适配器及隔离 worktree 尚未实现。
+自定义 API Agent 的讨论与只读分析分工已通过本机假服务的真实 HTTP 闭环测试：三位 Agent 在同一任务中依次回复，API Agent 接收前序摘要；批准计划后它完成分析，Antigravity 验收，依赖步骤再交给 Codex。测试使用模拟 CLI 和假 HTTP 响应，**尚未**用真实 DeepSeek/Ollama 服务完成端到端试运行。Antigravity 对需要命令行工具权限的验收仍可能被阻断。并行修改代码、Claude Code/ZCode 编码适配器及隔离 worktree 尚未实现。
 
 ## 快速启动 Web 工作台
 
