@@ -21,11 +21,21 @@ def allocate(steps, agents, members, claims=()):
         require(bool(candidates), "No team member can perform " + capability, "INVALID_PLAN")
         require(nominated is None or nominated in candidates,
                 "Nominated assignee is outside the team, unavailable or incapable", "INVALID_PLAN")
+        reviewer = step.get("verifier")
+        verification_pool = [key for key, agent in pool.items() if "verify" in agent.roles]
+        require(reviewer is None or reviewer in verification_pool,
+                "Verifier must be an independent capable team member", "INVALID_PLAN")
+        # Choose a viable pair, not an owner in isolation. Otherwise the sole
+        # verifier can win a claim/load tie and leave another capable worker idle.
+        candidates = [key for key in candidates
+                      if any(other != key for other in
+                             ([reviewer] if reviewer else verification_pool))]
+        require(bool(candidates) and (nominated is None or nominated in candidates),
+                "No independent verification-capable team member", "INVALID_PLAN")
         volunteers = {claim["agent"]: claim["reason"] for claim in claims
                       if claim["step_id"] == step["id"] and claim["agent"] in candidates}
         owner = nominated or min(list(volunteers) or candidates, key=lambda key: (load[key], owned[key], key))
         reviewers = [key for key, agent in pool.items() if key != owner and "verify" in agent.roles]
-        reviewer = step.get("verifier")
         require(bool(reviewers), "No independent verification-capable team member", "INVALID_PLAN")
         require(reviewer is None or reviewer in reviewers,
                 "Verifier must be an independent capable team member", "INVALID_PLAN")

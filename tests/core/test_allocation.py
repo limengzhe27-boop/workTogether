@@ -15,6 +15,29 @@ def step(key="s1", **extra):
 
 
 class AllocationTests(unittest.TestCase):
+    def test_sole_verifier_is_reserved_even_when_it_volunteers(self):
+        agents = {"alpha": SimpleNamespace(ready=True, roles=["analysis", "verify"]),
+                  "beta": SimpleNamespace(ready=True, roles=["analysis"])}
+        source = [step(work_kind="analysis")]
+        result = allocate(source, agents, list(agents),
+                          [{"agent": "alpha", "step_id": "s1", "reason": "I can analyze"}])
+        self.assertEqual("beta", result[0]["assignee"])
+        self.assertEqual("alpha", result[0]["verifier"])
+        self.assertNotIn("assignee", source[0])
+
+    def test_explicit_verifier_is_reserved_during_owner_selection(self):
+        agents = {key: SimpleNamespace(ready=True, roles=["code", "verify"])
+                  for key in ("alpha", "beta")}
+        result = allocate([step(verifier="alpha")], agents, list(agents))
+        self.assertEqual("beta", result[0]["assignee"])
+        self.assertEqual("alpha", result[0]["verifier"])
+
+    def test_infeasible_owner_nomination_is_not_silently_reassigned(self):
+        agents = {"alpha": SimpleNamespace(ready=True, roles=["analysis", "verify"]),
+                  "beta": SimpleNamespace(ready=True, roles=["analysis"])}
+        with self.assertRaises(CollabError):
+            allocate([step(work_kind="analysis", assignee="alpha")], agents, list(agents))
+
     def test_balances_capable_agents_without_brand_preference(self):
         agents = {key: SimpleNamespace(ready=True, roles=["code", "verify"])
                   for key in ("alpha", "beta", "gamma")}
@@ -75,6 +98,13 @@ class TeamEngineTests(unittest.TestCase):
         self.engine.submit(self.task, report)
         verification = self.engine.dispatch(self.task)["dispatch"]
         self.assertEqual("codex", verification["role"])
+
+    def test_api_worker_and_sole_cli_verifier_can_finalize_without_nominations(self):
+        self.engine.configure_team(self.task, ["thinker", "codex"], "thinker", "codex")
+        self.plan([step(work_kind="analysis")])
+        assigned = self.engine.show(self.task)["steps"][0]
+        self.assertEqual("thinker", assigned["assignee"])
+        self.assertEqual("codex", assigned["verifier"])
 
     def test_team_membership_is_frozen_and_broadcast_is_scoped(self):
         self.engine.configure_team(self.task, ["thinker", "codex"], "thinker", "codex")
