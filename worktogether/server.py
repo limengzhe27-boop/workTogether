@@ -140,6 +140,9 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
             m_execution = re.fullmatch(r"/api/tasks/([^/]+)/execution-jobs", path)
             if m_execution:
                 return self._send_json(200, {"jobs": self.server.execution_jobs.list(m_execution.group(1))})
+            m_team_jobs = re.fullmatch(r"/api/tasks/([^/]+)/team-jobs", path)
+            if m_team_jobs:
+                return self._send_json(200, {"jobs": self.server.team_jobs.list(m_team_jobs.group(1))})
             m_approval = re.fullmatch(r"/api/tasks/([^/]+)/approval", path)
             if m_approval:
                 return self._send_json(200, self.runtime.approval(m_approval.group(1)))
@@ -314,11 +317,17 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                     raise CollabError("INVALID_INPUT", "Execution uses a fixed six-call budget")
                 return self._send_json(202, self.server.execution_jobs.start(m_execute.group(1)))
 
-            m_recover = re.fullmatch(r"/api/tasks/([^/]+)/(execution|planning)-jobs/([^/]+)/recover", path)
+            m_auto_team = re.fullmatch(r"/api/tasks/([^/]+)/delegate-team", path)
+            if m_auto_team:
+                if set(body) != {"authorize_execution"} or body["authorize_execution"] is not True:
+                    raise CollabError("APPROVAL_REQUIRED", "Explicit authorization to discuss AND execute is required")
+                return self._send_json(202, self.server.team_jobs.start(m_auto_team.group(1)))
+
+            m_recover = re.fullmatch(r"/api/tasks/([^/]+)/(execution|planning|team)-jobs/([^/]+)/recover", path)
             if m_recover:
                 if body:
                     raise CollabError("INVALID_INPUT", "Recovery does not accept overrides")
-                manager = self.server.execution_jobs if m_recover.group(2) == "execution" else self.server.planning_jobs
+                manager = getattr(self.server, m_recover.group(2) + "_jobs")
                 return self._send_json(200, manager.recover(m_recover.group(1), m_recover.group(3)))
 
             # 1. Project Add
@@ -525,6 +534,8 @@ def create_server(db_path, host="127.0.0.1", port=8765, static_dir=None, executa
     server.planning_jobs = PlanningJobs(engine, runtime, server.antigravity_runtime)
     from .jobs import ExecutionJobs
     server.execution_jobs = ExecutionJobs(engine, runtime, server.antigravity_runtime)
+    from .auto_team import TeamJobs
+    server.team_jobs = TeamJobs(engine, runtime, server.antigravity_runtime)
     server.chat_queue = ChatQueue(engine, runtime, server.antigravity_runtime)
     if static_dir is None:
         # Default static dir is next to server.py in web/static or static

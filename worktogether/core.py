@@ -176,7 +176,9 @@ class Engine:
             require(not any(d["status"] == "ACTIVE" for d in task["dispatches"]),
                     "Finish or resolve all in-flight dispatches before revising", "INVALID_STATE")
             for table, states in (("runs", ("PREPARED", "RUNNING", "EXITED")),
-                                  ("planning_jobs", ("QUEUED", "RUNNING"))):
+                                  ("planning_jobs", ("QUEUED", "RUNNING")),
+                                  ("team_jobs", ("QUEUED", "RUNNING")),
+                                  ("execution_jobs", ("QUEUED", "RUNNING"))):
                 if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                     for row in db.execute(f"SELECT body FROM {table} WHERE task_id=?", (task_id,)):
                         require(json.loads(row[0])["status"] not in states,
@@ -208,6 +210,11 @@ class Engine:
             task = self._task(db, task_id)
             require(task["status"] == "ACTIVE" and task["phase"] == "PLANNING"
                     and not task["dispatches"], "Configure the team before any dispatch", "INVALID_STATE")
+            for table in ("planning_jobs", "team_jobs"):
+                if db.execute("SELECT name FROM sqlite_master WHERE name=?", (table,)).fetchone():
+                    require(not any(json.loads(row[0])["status"] in ("QUEUED", "RUNNING") for row in db.execute(
+                        f"SELECT body FROM {table} WHERE task_id=?", (task_id,))),
+                        "An active workflow prevents changing the team", "INVALID_STATE")
             require(not any(json.loads(row[0])["status"] in ("QUEUED", "RUNNING") for row in db.execute(
                 "SELECT body FROM messages WHERE task_id=?", (task_id,))),
                 "Finish queued conversations before changing the team", "INVALID_STATE")
@@ -304,9 +311,11 @@ class Engine:
             t = self._task(db, task_id)
             if t["status"] not in ("ACTIVE", "COMPLETED") or any(d["status"] == "ACTIVE" for d in t["dispatches"]):
                 return None
-            if db.execute("SELECT name FROM sqlite_master WHERE name='planning_jobs'").fetchone():
-                if any(json.loads(r[0])["status"] in ("QUEUED", "RUNNING") for r in db.execute("SELECT body FROM planning_jobs WHERE task_id=?", (task_id,))):
-                    return None
+            for table in ("planning_jobs", "team_jobs"):
+                if db.execute("SELECT name FROM sqlite_master WHERE name=?", (table,)).fetchone():
+                    if any(json.loads(r[0])["status"] in ("QUEUED", "RUNNING") for r in db.execute(
+                            f"SELECT body FROM {table} WHERE task_id=?", (task_id,))):
+                        return None
             if db.execute("SELECT name FROM sqlite_master WHERE name='runs'").fetchone():
                 if any(json.loads(r[0])["status"] in ("PREPARED", "RUNNING", "EXITED") for r in db.execute("SELECT body FROM runs WHERE task_id=?", (task_id,))):
                     return None

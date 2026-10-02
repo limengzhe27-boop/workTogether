@@ -32,13 +32,12 @@ class PlanningJobs:
             require(task["status"] == "ACTIVE" and task["phase"] in
                     self.phases,
                     "Task is not ready for planning", "INVALID_STATE")
-            for row in db.execute(f"SELECT body FROM {self.table} WHERE task_id=?", (task_id,)):
-                require(json.loads(row[0])["status"] not in ("QUEUED", "RUNNING"),
-                        "Planning already started; inspect existing job, never replay unknown work", "ALREADY_STARTED")
+            self.require_idle(db, task_id)
             require(not any(d["status"] == "ACTIVE" for d in task["dispatches"]),
                     "An existing dispatch needs to be handled first", "INVALID_STATE")
             job = {"id": uid(), "task_id": task_id, "status": "QUEUED",
                    "created_at": time.time(), "result": None, "error": None}
+            job.update(self.job_fields(task))
             db.execute(f"INSERT INTO {self.table} VALUES(?,?,?)", (job["id"], task_id, encode(job)))
         response = dict(job)
         try:
@@ -49,6 +48,19 @@ class PlanningJobs:
             self._save(job)
             raise
         return response
+
+    def require_idle(self, db, task_id):
+        for table in ("planning_jobs", "execution_jobs", "team_jobs"):
+            if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                for row in db.execute(f"SELECT body FROM {table} WHERE task_id=?", (task_id,)):
+                    require(json.loads(row[0])["status"] not in ("QUEUED", "RUNNING"),
+                            "A workflow already owns this task; inspect before restarting", "ALREADY_STARTED")
+
+    def job_fields(self, task):
+        return {}
+
+    def perform_job(self, job, timeout):
+        return self.perform(job["task_id"], timeout)
 
     def _save(self, job):
         job["updated_at"] = time.time()
@@ -103,7 +115,7 @@ class PlanningJobs:
         try:
             job["status"] = "RUNNING"
             self._save(job)
-            result = self.perform(job["task_id"], timeout)
+            result = self.perform_job(job, timeout)
             job.update(result=result, status="COMPLETED" if result["status"] == "STOPPED" else "FAILED")
             if result.get("reason") == "MESSAGE_PENDING":
                 job["status"] = "INTERRUPTED"

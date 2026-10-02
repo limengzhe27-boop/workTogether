@@ -46,6 +46,7 @@ export function Workspace() {
   const artifactRequest = useRef(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [executionJobs, setExecutionJobs] = useState<Job[]>([]);
+  const [teamJobs, setTeamJobs] = useState<Job[]>([]);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [draft, setDraft] = useState('');
   const [edit, setEdit] = useState<{ text: string; revision: number; id: string } | null>(null);
@@ -144,13 +145,14 @@ export function Workspace() {
           if (valid) setTasks(result.tasks);
         }
         if (taskId) {
-          const [t, r, j, a, x, ag] = await Promise.all([
+          const [t, r, j, a, x, ag, tj] = await Promise.all([
             api.getTask(taskId),
             api.getRuns(taskId),
             request<{ jobs: Job[] }>(`/tasks/${taskId}/planning-jobs`),
             request<Approval>(`/tasks/${taskId}/approval`),
             request<{ jobs: Job[] }>(`/tasks/${taskId}/execution-jobs`),
             api.getAgents(),
+            request<{ jobs: Job[] }>(`/tasks/${taskId}/team-jobs`),
           ]);
           if (valid) {
             if (project && t.project_id !== project) {
@@ -158,6 +160,7 @@ export function Workspace() {
               return;
             }
             setExecutionJobs(x.jobs);
+            setTeamJobs(tj.jobs);
             setTask(t);
             setRuns(r.runs);
             setJobs(j.jobs);
@@ -186,6 +189,7 @@ export function Workspace() {
     setArtifact(null);
     setJobs([]);
     setExecutionJobs([]);
+    setTeamJobs([]);
     setApproval(null);
     setEdit(null);
     setError('');
@@ -289,7 +293,8 @@ export function Workspace() {
   const inflight = runs.some(r => ['RUNNING', 'PREPARED', 'EXITED'].includes(r.status));
   const planningBusy = jobs.some(j => ['QUEUED', 'RUNNING'].includes(j.status));
   const executionBusy = executionJobs.some(j => ['QUEUED', 'RUNNING'].includes(j.status));
-  const locked = busy || inflight || planningBusy || chatPending || executionBusy;
+  const teamBusy = teamJobs.some(j => ['QUEUED', 'RUNNING'].includes(j.status));
+  const locked = busy || inflight || planningBusy || chatPending || executionBusy || teamBusy;
   const planning = !!task && ['PLANNING', 'PLAN_REVIEW', 'PLAN_FINALIZE'].includes(task.phase);
   const canRevise = !!task && !locked && !activeDispatch;
   const base = '/tasks/' + taskId;
@@ -423,7 +428,7 @@ export function Workspace() {
               <section className="home">
                 <p className="eyebrow">多 Agent 讨论 · 受控分工与验收</p>
                 <h1>这个项目，你想完成什么？</h1>
-                <p className="muted">说明目标和验收标准。已就绪的 Agent 可讨论方案并承担分析工作；编码仍由 Codex 承担，执行前需你批准。</p>
+                <p className="muted">说明目标和验收标准。创建后选择任务团队，按能力讨论与分工。你可以先审方案，也可以明确授权团队在当前需求范围内连续执行。</p>
 
                 <form className="composer" onSubmit={e => {
                   e.preventDefault();
@@ -502,6 +507,11 @@ export function Workspace() {
                 {task.team && <p className="muted">规划协调：{agentMap[task.team.coordinator]?.name || task.team.coordinator} · 方案复核：{agentMap[task.team.reviewer]?.name || task.team.reviewer} · 步骤执行与验收按能力另行分配</p>}
 
                 <div className="actions controls">
+                  {task.team && task.phase === 'PLANNING' && task.dispatches.length === 0 && (
+                    <button className="primary" disabled={locked || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/delegate-team', { authorize_execution: true }))}>
+                      授权团队讨论并执行 · 最多 {2 * task.team.members.length + 15} 次调用
+                    </button>
+                  )}
                   {planning && (
                     <button className="primary" disabled={locked || !!activeDispatch || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/discuss'))}>
                       {task.team ? '团队讨论与认领 · 两轮成员发言＋三次规划' : '开始方案讨论 · 最多三轮'}
@@ -545,6 +555,11 @@ export function Workspace() {
                   <button disabled={!canRevise} onClick={beginEdit}>修改需求</button>
                 </div>
                 <p className="small">暂停不会终止已运行的模型；执行状态不明时，请查看执行详情，不要重复启动。</p>
+                {task.team && task.dispatches.length === 0 && <p className="small">“授权团队讨论并执行”允许团队在本需求范围内定稿后直接工作，不再逐步询问；仍受能力、独立验收、修复与调用预算限制。若要先审方案，请使用“团队讨论与认领”。</p>}
+                {teamJobs.length > 0 && <section className="card">
+                  <h2>团队自动协作</h2>
+                  {teamJobs.map(j => <p key={j.id}>{j.result?.reason === 'COMPLETED' ? '全部步骤通过验收' : j.status === 'COMPLETED' ? '本轮已停止，任务未必完成' : label(j.status)} · {j.error || j.result?.reason || '讨论、认领、定稿后按授权执行'}{j.result?.reason === 'CALL_LIMIT' ? '（本轮预算已用完，不代表任务完成）' : ''}</p>)}
+                </section>}
 
                 {activeDispatch && (
                   <section className="card stack">
@@ -609,11 +624,11 @@ export function Workspace() {
                   </section>
                 )}
 
-                {(planningBusy || executionBusy) && (
+                {(planningBusy || executionBusy || teamBusy) && (
                   <section className="card">
                     <h2>重启后卡住了？</h2>
                     <p>检查只会解除没有运行中作业、没有待处理模型结果的旧记录，不会启动模型。仍在工作时会拒绝解除。</p>
-                    {[{ kind: 'planning', records: jobs }, { kind: 'execution', records: executionJobs }].flatMap(group =>
+                    {[{ kind: 'planning', records: jobs }, { kind: 'execution', records: executionJobs }, { kind: 'team', records: teamJobs }].flatMap(group =>
                       group.records.filter(j => ['QUEUED', 'RUNNING'].includes(j.status)).map(j => (
                         <button key={j.id} disabled={busy} onClick={() => act(() => post(`${base}/${group.kind}-jobs/${j.id}/recover`))}>
                           检查并解除{group.kind === 'planning' ? '讨论' : '执行'}等待
