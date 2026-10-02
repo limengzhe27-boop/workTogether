@@ -270,6 +270,12 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                 created = reg.register(body)
                 return self._send_json(HTTPStatus.CREATED, created)
             m_agent_probe = re.fullmatch(r"/api/agents/([a-z][a-z0-9-]{0,63})/probe", path)
+            m_agent_enabled = re.fullmatch(r"/api/agents/([a-z][a-z0-9-]{0,63})/enabled", path)
+            if m_agent_enabled:
+                if set(body) != {"enabled"}:
+                    raise CollabError("INVALID_INPUT", "enabled boolean required")
+                from .agents import AgentRegistry
+                return self._send_json(200, AgentRegistry(self.engine).set_enabled(m_agent_enabled.group(1), body["enabled"]))
             if m_agent_probe:
                 if body:
                     raise CollabError("INVALID_INPUT", "Connection probe takes no task data")

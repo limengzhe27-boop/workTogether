@@ -44,7 +44,7 @@ def parser():
     a.add_argument("--task", required=True)
     a.add_argument("--dispatch", required=True)
     a.add_argument("--timeout", type=float, default=300)
-    a.add_argument("--provider", choices=["codex", "antigravity"], default="codex")
+    a.add_argument("--provider", choices=["codex", "antigravity", "deepseek-harness"], default="codex")
     a.add_argument("--executable", help="Explicit local provider CLI path")
     a.add_argument("--model", help="AGY model ID verified with its models command")
     a = sub.add_parser("discuss", help="At most three planning turns; never starts coding")
@@ -100,12 +100,19 @@ def run(args):
                        max_calls=args.max_calls, timeout=args.timeout)
     if cmd == "discuss":
         from .discussion import discuss
+        if engine.show(args.task).get("team"):
+            from .teamwork import discuss_team as discuss
         return discuss(engine, args.task, Runtime(engine, args.codex_executable),
                         AntigravityRuntime(engine, args.antigravity_executable,
                                            args.antigravity_model), args.timeout)
     if cmd == "run":
         if args.provider == "antigravity":
             runtime = AntigravityRuntime(engine, args.executable or "agy", args.model)
+        elif args.provider == "deepseek-harness":
+            if args.model:
+                raise CollabError("INVALID_INPUT", "Harness model selection comes from its local profile")
+            from .harness import HarnessRuntime
+            runtime = HarnessRuntime(engine, args.executable)
         else:
             if args.model:
                 raise CollabError("INVALID_INPUT", "--model here is only supported for Antigravity")
@@ -116,9 +123,22 @@ def run(args):
     if cmd == "collect":
         runtime = Runtime(engine)
         with engine.transaction() as db:
-            provider = runtime._get(db, args.run)["provider"]
+            run = runtime._get(db, args.run)
+            provider = run["provider"]
+            task = engine._task(db, run["task_id"])
+            role = engine._get_dispatch(task, run["dispatch_id"])["role"]
         if provider == "antigravity":
             runtime = AntigravityRuntime(engine)
+        elif provider == "deepseek_harness":
+            from .harness import HarnessRuntime
+            runtime = HarnessRuntime(engine, role=role)
+        elif provider == "openai_compat":
+            from .agents import AgentRegistry
+            from .openai_runtime import OpenAICompatibleRuntime
+            config = AgentRegistry(engine).get(role)
+            if config is None:
+                raise CollabError("UNSUPPORTED_PROVIDER", "Agent configuration is missing")
+            runtime = OpenAICompatibleRuntime(engine, config)
         return runtime.collect(args.run)
     if cmd == "resolve-stopped":
         return Runtime(engine).resolve_stopped(args.run, args.confirmed_stopped)

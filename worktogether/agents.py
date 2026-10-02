@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 from urllib.parse import urlsplit
 
 from .core import CollabError, require, string
@@ -23,6 +24,9 @@ DEFAULT_AGENTS = [
      "endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat",
      "api_key_env": "DEEPSEEK_API_KEY", "roles": ["chat", "analysis"], "color": "#f59e0b",
      "avatar": "🧠", "description": "配置密钥后可参与任务讨论；不是本地 Harness", "enabled": True},
+    {"id": "deepseek-harness", "name": "DeepSeek Harness", "type": "cli", "executable": "dsh",
+     "roles": ["code", "plan", "chat", "analysis", "review", "verify"], "color": "#2563eb",
+     "avatar": "🐋", "description": "本地 Harness 后台适配器；需本机登录，真实模型闭环待验证", "enabled": False},
 ]
 
 
@@ -56,6 +60,9 @@ class AgentConfig:
         self.name = data["name"]
         self.type = data["type"]
         self.executable = data.get("executable", self.id)
+        if self.id == "deepseek-harness" and self.executable == "dsh":
+            from .harness import resolve_executable
+            self.executable = resolve_executable()
         self.endpoint = data.get("endpoint", "")
         self.model = data.get("model", "")
         self.api_key_env = data.get("api_key_env", "")
@@ -79,6 +86,8 @@ class AgentConfig:
         if not self.enabled:
             return False
         if self.type == "cli":
+            if self.id == "deepseek-harness":
+                return shutil.which(self.executable) is not None
             return self.id in ("codex", "antigravity")  # Actual executable/login is checked at runtime.
         return local_endpoint(self.endpoint) or bool(self.api_key_env and os.environ.get(self.api_key_env))
 
@@ -141,7 +150,7 @@ class AgentRegistry:
         agent_id = data.get("id")
         require(isinstance(agent_id, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", agent_id),
                 "Agent ID must be lowercase letters, digits or hyphens", "INVALID_INPUT")
-        require(agent_id not in ("codex", "antigravity"), "Built-in agents cannot be replaced", "INVALID_INPUT")
+        require(agent_id not in ("codex", "antigravity", "deepseek-harness"), "Built-in agents cannot be replaced", "INVALID_INPUT")
         require(data.get("type") == "openai_compat", "Custom agents currently require an OpenAI-compatible API", "INVALID_INPUT")
         require(string(data.get("name")) and len(data["name"]) <= 100 and string(data.get("model"))
                 and len(data["model"]) <= 150, "Name and model required", "INVALID_INPUT")
@@ -166,10 +175,21 @@ class AgentRegistry:
         return AgentConfig(clean).to_dict()
 
     def remove(self, agent_id):
-        require(agent_id not in ("codex", "antigravity"), "Built-in agents cannot be removed", "INVALID_INPUT")
+        require(agent_id not in ("codex", "antigravity", "deepseek-harness"), "Built-in agents cannot be removed", "INVALID_INPUT")
         with self.engine.transaction() as db:
             self._ensure_not_in_flight(db, agent_id)
             return db.execute("DELETE FROM agents WHERE id=?", (agent_id,)).rowcount > 0
+
+    def set_enabled(self, agent_id, enabled):
+        require(type(enabled) is bool, "enabled must be boolean", "INVALID_INPUT")
+        with self.engine.transaction() as db:
+            row = db.execute("SELECT body FROM agents WHERE id=?", (agent_id,)).fetchone()
+            require(row is not None, "Unknown agent", "NOT_FOUND")
+            self._ensure_not_in_flight(db, agent_id)
+            data = json.loads(row[0])
+            data["enabled"] = enabled
+            db.execute("UPDATE agents SET body=? WHERE id=?", (json.dumps(data, ensure_ascii=False), agent_id))
+        return AgentConfig(data).to_dict()
 
     def get_runtime(self, agent_id, custom_executables=None):
         from .runtime import Runtime
@@ -181,5 +201,9 @@ class AgentRegistry:
             return Runtime(self.engine, executable=(custom_executables or {}).get("codex") or cfg.executable)
         if agent_id == "antigravity":
             return AntigravityRuntime(self.engine, executable=(custom_executables or {}).get("antigravity") or cfg.executable)
+        if agent_id == "deepseek-harness":
+            from .harness import HarnessRuntime
+            require(cfg.ready, "Harness executable not found", "UNSUPPORTED_PROVIDER")
+            return HarnessRuntime(self.engine, executable=(custom_executables or {}).get(agent_id) or cfg.executable)
         require(cfg.type == "openai_compat" and cfg.ready, "Agent is not configured", "UNSUPPORTED_PROVIDER")
         return OpenAICompatibleRuntime(self.engine, cfg)

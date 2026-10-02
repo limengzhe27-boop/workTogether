@@ -80,17 +80,22 @@ class Runtime:
             require(db.execute("SELECT id FROM runs WHERE dispatch_id=?", (dispatch_id,)).fetchone() is None,
                     "This dispatch already has a run; inspect or collect it", "ALREADY_STARTED")
             p = self.engine._project(db, t["project_id"])
-            session = db.execute("SELECT session_id FROM sessions WHERE task_id=? AND role=? AND provider=?", (task, self.role, self.provider)).fetchone()
+            scope = self.session_scope(d)
+            session = db.execute("SELECT session_id FROM sessions WHERE task_id=? AND role=? AND provider=?", (task, self.role, scope)).fetchone()
             run_id = uid()
             root = Path(self.engine.path).parent / "runs" / run_id
             run = {"id": run_id, "task_id": task, "dispatch_id": dispatch_id, "provider": self.provider,
                    "status": "PREPARED", "cwd": p["path"], "artifact_dir": str(root),
                    "session_id": session[0] if session else None, "pid": None,
+                   "session_scope": scope,
                    "created_at": time.time(), "timeout": min(timeout, d["deadline"] - time.time()),
                    "exit_code": None, "error": None, "usage": None}
             db.execute("INSERT INTO runs VALUES(?,?,?,?)", (run_id, task, dispatch_id, encode(run)))
             self.engine._save(db, t, "RUN_RESERVED", {"run_id": run_id, "dispatch_id": dispatch_id})
             return run, d
+
+    def session_scope(self, dispatch):
+        return self.provider
 
     def command(self, run, dispatch):
         sandbox = "workspace-write" if dispatch["kind"] in ("CODE", "FIX") else "read-only"
@@ -337,9 +342,11 @@ class Runtime:
             require(completed and isinstance(session, str) and session.strip(), "Missing completion/session event", "INVALID_SESSION")
             require(run["session_id"] in (None, session), "Resumed session mismatch", "INVALID_SESSION")
             with self.engine.transaction() as db:
-                owner = db.execute("SELECT task_id FROM sessions WHERE session_id=?", (session,)).fetchone()
-                require(owner is None or owner[0] == run["task_id"], "Session belongs to another task", "INVALID_SESSION")
-                db.execute("INSERT OR IGNORE INTO sessions VALUES(?,?,?,?)", (run["task_id"], self.role, self.provider, session))
+                scope = run.get("session_scope", self.provider)
+                owner = db.execute("SELECT task_id,role,provider FROM sessions WHERE session_id=?", (session,)).fetchone()
+                require(owner is None or tuple(owner) == (run["task_id"], self.role, scope),
+                        "Session belongs to another task, agent or permission scope", "INVALID_SESSION")
+                db.execute("INSERT OR IGNORE INTO sessions VALUES(?,?,?,?)", (run["task_id"], self.role, scope, session))
                 run["session_id"] = session
                 self._save(db, run)
             with self.engine.transaction() as db:

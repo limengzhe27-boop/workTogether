@@ -703,7 +703,7 @@ export function Workspace() {
                 </div>
 
                 <div hidden={tab !== 'progress'}>
-                  <TaskChat key={taskId} taskId={taskId} agents={agents} completed={task.status === 'COMPLETED'} onPending={setChatPending} />
+                  <TaskChat key={taskId} taskId={taskId} agents={task.team ? agents.filter(a => task.team!.members.includes(a.id)) : agents} completed={task.status === 'COMPLETED'} onPending={setChatPending} />
                 </div>
 
                 {tab === 'progress' ? (
@@ -914,6 +914,10 @@ export function Workspace() {
                     {a.endpoint && <p className="small muted" style={{ margin: 0 }}>接口: {a.endpoint} ({a.model})</p>}
                   </div>
                   <div className="agent-card-actions">
+                    <button type="button" disabled={busy} onClick={() => act(async () => {
+                      await post(`/agents/${a.id}/enabled`, { enabled: !a.enabled });
+                      setAgents((await api.getAgents()).agents);
+                    })}>{a.enabled ? '停用' : '启用（不会立即调用模型）'}</button>
                     <span className={`badge ${a.ready ? 'active' : ''}`}>
                       {!a.ready ? '未配置／已禁用' : a.type === 'openai_compat' ? '配置就绪 · 未验证连接' : '内置 Agent · 调用时验证'}
                     </span>
@@ -936,7 +940,7 @@ export function Workspace() {
             </div>
 
             <hr className="divider" />
-            <h3>添加新 Agent (如 DeepSeek Hermes, Qwen, Ollama 等)</h3>
+            <h3>添加 API Agent（如 DeepSeek、Qwen、Ollama 等）</h3>
             <form onSubmit={handleAddAgent} className="stack" style={{ marginTop: 12 }}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 <label>标识 ID (英文)<input required placeholder="如 qwen-coder" value={newAgent.id} onChange={e => setNewAgent({ ...newAgent, id: e.target.value.toLowerCase().replace(/\s+/g, '-') })} /></label>
