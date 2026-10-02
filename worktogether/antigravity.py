@@ -27,6 +27,15 @@ class AntigravityRuntime(Runtime):
     def input_bytes(self, prompt):
         return (encode({"event": "user", "message": {"content": prompt}}) + "\n").encode("utf-8")
 
+    def _prompt(self, dispatch):
+        prompt = super()._prompt(dispatch)
+        if dispatch["kind"] == "VERIFY":
+            return ("For file existence or content checks, use read-only file tools such as list_dir and view_file "
+                    "instead of run_command. Run a command only when the acceptance criterion actually requires "
+                    "executing code or tests and permission is available. If required permission is denied, "
+                    "report BLOCKED; never treat a partial tool result as a passing check.\n\n" + prompt)
+        return prompt
+
     def read_result(self, root):
         initial, result = None, None
         denied_commands = []
@@ -56,6 +65,7 @@ class AntigravityRuntime(Runtime):
             error = CollabError("PERMISSION_DENIED", "Antigravity permission denied: verification was not completed. "
                                 "Review permissions explicitly; do not bypass or automatically retry.")
             error.details = {"denied_commands": denied_commands[:10], "retry_allowed": False}
+            error.usage = result.get("usage")
             raise error
         require(result.get("status") == "SUCCESS", "AGY terminal status: " + str(result.get("status")), "PROVIDER_FAILED")
         session = result.get("conversation_id")

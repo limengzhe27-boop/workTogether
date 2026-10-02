@@ -41,7 +41,7 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
 
 export const api = {
   // Health
-  getHealth: () => request<{ status: string; version: string }>('/health'),
+  getHealth: () => request<{ status: string; version: string; providers?: Record<string, { available: boolean; executable: string }> }>('/health'),
 
   // Agents
   getAgents: () => request<{ agents: AgentInfo[] }>('/agents'),

@@ -243,7 +243,8 @@ class Runtime:
             return run
         except (OSError, ValueError, CollabError, AttributeError) as exc:
             run.update(status="FAILED", error=str(exc), error_code=getattr(exc, "code", "INVALID_REPORT"),
-                       error_details=getattr(exc, "details", None))
+                       error_details=getattr(exc, "details", None),
+                       usage=getattr(exc, "usage", run.get("usage")))
             self._fail(run)
             return run
 

@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -25,6 +26,14 @@ from .chat import ChatQueue
 
 
 SAFE_ARTIFACT_NAMES = {"prompt.txt", "command.json", "events.jsonl", "stderr.log", "result.json"}
+
+
+def resolve_antigravity_executable(executable, private_cli=None):
+    if executable != "agy" or shutil.which("agy") is not None:
+        return executable
+    candidate = Path(private_cli) if private_cli else (
+        Path(__file__).resolve().parent.parent / ".collab/tools/antigravity-1.2.8/antigravity")
+    return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else executable
 
 
 class WorkTogetherHandler(BaseHTTPRequestHandler):
@@ -114,7 +123,8 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
         try:
             # 1. Health check
             if path == "/api/health":
-                return self._send_json(HTTPStatus.OK, {"status": "ok", "version": "v1.0"})
+                return self._send_json(HTTPStatus.OK, {"status": "ok", "version": "v1.0",
+                                                       "providers": getattr(self.server, "provider_status", {})})
             if path == "/api/agents":
                 from .agents import AgentRegistry
                 reg = getattr(self.server, "registry", None) or AgentRegistry(self.engine)
@@ -470,6 +480,7 @@ def create_server(db_path, host="127.0.0.1", port=8765, static_dir=None, executa
                   antigravity_executable="agy", antigravity_model="gemini-3.8-flash-high"):
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise CollabError("INVALID_INPUT", "Only loopback binding is supported")
+    antigravity_executable = resolve_antigravity_executable(antigravity_executable)
     engine = Engine(db_path)
     from .agents import AgentRegistry
     registry = AgentRegistry(engine)
@@ -480,6 +491,11 @@ def create_server(db_path, host="127.0.0.1", port=8765, static_dir=None, executa
     server.registry = registry
     server.runtime = runtime
     server.antigravity_runtime = AntigravityRuntime(engine, antigravity_executable, antigravity_model)
+    server.provider_status = {
+        "codex": {"available": shutil.which(executable) is not None, "executable": executable},
+        "antigravity": {"available": shutil.which(antigravity_executable) is not None,
+                        "executable": antigravity_executable},
+    }
     server.planning_jobs = PlanningJobs(engine, runtime, server.antigravity_runtime)
     from .jobs import ExecutionJobs
     server.execution_jobs = ExecutionJobs(engine, runtime, server.antigravity_runtime)
@@ -497,6 +513,8 @@ def run_server(db_path, host="127.0.0.1", port=8765, static_dir=None, **provider
     print(f"🚀 WorkTogether Web Server running at http://{host}:{port}/", flush=True)
     print(f"📁 SQLite Database: {Path(db_path).resolve()}", flush=True)
     print(f"🌐 Static Web Dir:  {server.static_dir}", flush=True)
+    for name, info in server.provider_status.items():
+        print(f"🤖 {name}: {'CLI found' if info['available'] else 'CLI missing'} ({info['executable']})", flush=True)
     print("===========================================================", flush=True)
     try:
         server.chat_queue.start()

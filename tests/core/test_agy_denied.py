@@ -23,6 +23,7 @@ class DeniedResultTests(unittest.TestCase):
                 run = runtime.run(task, d['id'], 30)
             self.assertEqual('PERMISSION_DENIED', run['error_code'])
             self.assertEqual(['python3 -m unittest -v'], run['error_details']['denied_commands'])
+            self.assertEqual({'input_tokens': 5}, run['usage'])
             self.assertEqual('PERMISSION_DENIED', e.show(task)['block_reason'])
             self.assertEqual('FAILED', runtime.list(task)['runs'][0]['status'])
 

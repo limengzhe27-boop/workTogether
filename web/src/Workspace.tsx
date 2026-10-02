@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api, request } from './api';
 import { TaskChat } from './TaskChat';
-import { Project, TaskDetail, TaskSummary, RunRecord, AgentInfo } from './types';
+import { Project, TaskDetail, TaskSummary, RunRecord, AgentInfo, ReportEnvelope } from './types';
 
 type Detail = TaskDetail & { revision?: number };
 type Job = { id: string; status: string; error: string | null; result?: { reason?: string } };
@@ -51,6 +51,9 @@ export function Workspace() {
   const [tab, setTab] = useState('progress');
   const [composerRequest, setComposerRequest] = useState(0);
   const [chatPending, setChatPending] = useState(false);
+  const [manualDispatchId, setManualDispatchId] = useState('');
+  const [handoffText, setHandoffText] = useState('');
+  const [reportText, setReportText] = useState('');
   const actionLock = useRef(false);
   const selected = useRef({ project, taskId });
   selected.current = { project, taskId };
@@ -58,6 +61,7 @@ export function Workspace() {
 
   // Multi-agent states
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [providers, setProviders] = useState<Record<string, { available: boolean; executable: string }> | null>(null);
   const [managingAgents, setManagingAgents] = useState(false);
   const [newAgent, setNewAgent] = useState({
     id: '',
@@ -78,6 +82,20 @@ export function Workspace() {
     }
     return map;
   }, [agents]);
+  const usageByProvider = React.useMemo(() => {
+    const totals: Record<string, { calls: number; input: number; output: number; cached: number }> = {};
+    for (const run of runs) {
+      const usage = run.usage;
+      if (!usage || typeof usage.input_tokens !== 'number') continue;
+      const entry = totals[run.provider] ||= { calls: 0, input: 0, output: 0, cached: 0 };
+      entry.calls += 1;
+      entry.input += usage.input_tokens;
+      entry.output += typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
+      const cached = usage.cached_input_tokens ?? usage.cache_read_tokens ?? usage.cached_tokens;
+      entry.cached += typeof cached === 'number' ? cached : 0;
+    }
+    return Object.entries(totals);
+  }, [runs]);
 
   // Load projects & agents
   useEffect(() => {
@@ -90,6 +108,9 @@ export function Workspace() {
 
     api.getAgents()
       .then(r => setAgents(r.agents))
+      .catch(() => {});
+    api.getHealth()
+      .then(r => setProviders(r.providers || {}))
       .catch(() => {});
   }, []);
 
@@ -121,6 +142,10 @@ export function Workspace() {
             api.getAgents(),
           ]);
           if (valid) {
+            if (project && t.project_id !== project) {
+              choose('');
+              return;
+            }
             setExecutionJobs(x.jobs);
             setTask(t);
             setRuns(r.runs);
@@ -129,7 +154,12 @@ export function Workspace() {
             setApproval(a.requirement === t.requirement && JSON.stringify(a.plan) === JSON.stringify(t.draft_plan) ? a : null);
           }
         }
-      } catch (e) { if (valid) setError((e as Error).message); }
+      } catch (e) {
+        if (valid) {
+          if ((e as Error & { status?: number }).status === 404 && taskId) choose('');
+          else setError((e as Error).message);
+        }
+      }
       finally { if (valid) timer = setTimeout(refresh, 2500); }
     };
     refresh();
@@ -146,6 +176,9 @@ export function Workspace() {
     setApproval(null);
     setEdit(null);
     setError('');
+    setManualDispatchId('');
+    setHandoffText('');
+    setReportText('');
     setNavigation(false);
   }
 
@@ -200,6 +233,7 @@ export function Workspace() {
   }
 
   const activeDispatch = task?.dispatches.find(d => d.status === 'ACTIVE');
+  const blockedDispatches = task?.dispatches.filter(d => d.status === 'BLOCKED') || [];
   const inflight = runs.some(r => ['RUNNING', 'PREPARED', 'EXITED'].includes(r.status));
   const planningBusy = jobs.some(j => ['QUEUED', 'RUNNING'].includes(j.status));
   const executionBusy = executionJobs.some(j => ['QUEUED', 'RUNNING'].includes(j.status));
@@ -207,6 +241,30 @@ export function Workspace() {
   const planning = !!task && ['PLANNING', 'PLAN_REVIEW', 'PLAN_FINALIZE'].includes(task.phase);
   const canRevise = !!task && !locked && !activeDispatch;
   const base = '/tasks/' + taskId;
+
+  async function prepareManual(dispatchId: string) {
+    await act(async () => {
+      const bundle = await api.getHandoff(taskId, dispatchId);
+      setManualDispatchId(dispatchId);
+      setHandoffText(JSON.stringify(bundle, null, 2));
+      setReportText(JSON.stringify(bundle.template, null, 2));
+    });
+  }
+
+  async function submitManual() {
+    await act(async () => {
+      let report: unknown;
+      try { report = JSON.parse(reportText); }
+      catch { throw new Error('报告不是有效 JSON，请检查后再提交。'); }
+      if (!report || typeof report !== 'object' || Array.isArray(report)) {
+        throw new Error('报告必须是 JSON 对象。');
+      }
+      await api.submitReport(taskId, report as ReportEnvelope);
+      setManualDispatchId('');
+      setHandoffText('');
+      setReportText('');
+    });
+  }
 
   return (
     <div className="workspace">
@@ -243,7 +301,7 @@ export function Workspace() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <div className="agents-strip">
               {agents.map(a => (
-                <span key={a.id} className="agent-pill active" style={{ color: a.color }} title={a.description}>
+                <span key={a.id} className={`agent-pill ${a.ready ? 'active' : ''}`} style={{ color: a.color }} title={a.description}>
                   <span className="agent-avatar">{a.avatar}</span>
                   <span>{a.name}</span>
                 </span>
@@ -266,6 +324,15 @@ export function Workspace() {
               <div className="error" role="alert">
                 {error}
                 <button onClick={() => setError('')}>关闭提示</button>
+              </div>
+            )}
+
+            {providers && (providers.codex?.available === false || providers.antigravity?.available === false) && (
+              <div className="notice" role="status">
+                自动调用尚未就绪：{[
+                  providers.codex?.available === false ? 'Codex' : '',
+                  providers.antigravity?.available === false ? 'Antigravity' : '',
+                ].filter(Boolean).join('、')} 的命令行程序未找到。仍可用“手动派发下一项”和交接包推进；安装或指定路径后请重启服务。
               </div>
             )}
 
@@ -367,6 +434,12 @@ export function Workspace() {
                       开始方案讨论 · 最多三轮
                     </button>
                   )}
+                  {!activeDispatch && task.phase !== 'COMPLETED' && (
+                    <button disabled={locked || task.status !== 'ACTIVE' || (task.phase === 'EXECUTING' && !approval?.approved)}
+                      onClick={() => act(() => api.dispatch(taskId))}>
+                      手动派发下一项（不调用模型）
+                    </button>
+                  )}
                   {task.phase === 'EXECUTING' && !approval?.approved && (
                     <button className="primary" disabled={locked || !approval || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/approve', { digest: approval!.digest }))}>
                       批准下方方案
@@ -395,6 +468,51 @@ export function Workspace() {
                 </div>
                 <p className="small">暂停不会终止已运行的模型；执行状态不明时，请查看执行详情，不要重复启动。</p>
 
+                {activeDispatch && (
+                  <section className="card stack">
+                    <h2>当前交接 · {activeDispatch.kind} → {agentMap[activeDispatch.role]?.name || activeDispatch.role}</h2>
+                    <p className="small">自动执行不可用时，可把交接包发给对应 Agent，再将它返回的结构化报告贴回这里。手动提交不会调用模型；平台只校验身份、版本和证据字段格式，不能证明测试确实执行。请你核对报告真实性。</p>
+                    <div className="actions">
+                      <button disabled={locked || task.status !== 'ACTIVE'} onClick={() => prepareManual(activeDispatch.id)}>
+                        准备手动交接与报告模板
+                      </button>
+                      {activeDispatch.deadline < Date.now() / 1000 && (
+                        <button disabled={locked} onClick={() => act(() => api.expireDispatches(taskId))}>标记超时并处理</button>
+                      )}
+                    </div>
+                    {manualDispatchId === activeDispatch.id && (
+                      <>
+                        <label>交接包（只读）
+                          <textarea readOnly value={handoffText} rows={10} aria-label="交接包" />
+                        </label>
+                        <button type="button" disabled={!handoffText} onClick={async () => {
+                          try { await navigator.clipboard.writeText(handoffText); }
+                          catch { setError('无法自动复制，请在交接包文本框中手动选择并复制。'); }
+                        }}>复制交接包</button>
+                        <label>Agent 返回的 JSON 报告
+                          <textarea value={reportText} onChange={e => setReportText(e.target.value)} rows={12} aria-label="JSON 报告" />
+                        </label>
+                        <p className="small">模板中的 REPLACE 和 BLOCKED 只是占位，不能当作完成证明；验收报告必须填写每项标准的真实检查与证据。</p>
+                        <button className="primary" disabled={locked || task.status !== 'ACTIVE' || !reportText.trim()} onClick={submitManual}>校验并提交报告</button>
+                      </>
+                    )}
+                  </section>
+                )}
+
+                {task.status === 'BLOCKED' && blockedDispatches.length > 0 && (
+                  <section className="card stack" role="alert">
+                    <h2>任务已阻塞 · {task.block_reason || '检查失败详情'}</h2>
+                    <p>平台不会自动重试。先查看失败记录和证据，再决定是否重新派发。重新派发会产生新的报告编号，旧报告不能用于新派发。</p>
+                    {task.block_reason === 'REPAIR_LIMIT' ? (
+                      <p>返工次数已达上限；不能直接重试。请人工检查结果，并通过“修改需求”重新规划。</p>
+                    ) : blockedDispatches.map(d => (
+                      <button key={d.id} disabled={locked} onClick={() => act(() => api.retryDispatch(taskId, d.id))}>
+                        检查后重试 {d.kind} · {agentMap[d.role]?.name || d.role}
+                      </button>
+                    ))}
+                  </section>
+                )}
+
                 {task.block_reason === 'PERMISSION_DENIED' && (
                   <section className="card" role="alert">
                     <h2>验收权限被拒绝</h2>
@@ -409,7 +527,7 @@ export function Workspace() {
                         )}
                       </details>
                     ))}
-                    <p>请先在 Antigravity 支持的权限界面核对操作范围。本平台尚不能代你批准其工具权限；不要通过关闭安全检查来继续。</p>
+                    <p>请先在 Antigravity 支持的权限界面核对操作范围。也可在检查后重试该派发，再使用上方“手动交接与报告模板”完成验收；不要通过关闭安全检查来继续。</p>
                   </section>
                 )}
 
@@ -589,6 +707,15 @@ export function Workspace() {
                     ))}
 
                     <h2>模型运行记录</h2>
+                    {usageByProvider.length > 0 && (
+                      <section className="card">
+                        <h3>模型报告的 Token 用量</h3>
+                        {usageByProvider.map(([provider, usage]) => (
+                          <p key={provider}>{provider}：{usage.calls} 次有用量记录；输入 {usage.input.toLocaleString()}，输出 {usage.output.toLocaleString()}，其中缓存输入/读取 {usage.cached.toLocaleString()}。</p>
+                        ))}
+                        <p className="small">仅汇总提供方实际返回的字段；失败调用若未返回用量则不计入。不同提供方口径不同，这不是费用或节省比例。</p>
+                      </section>
+                    )}
                     {runs.map(r => (
                       <details key={r.id} className="card">
                         <summary>{r.provider} · {label(r.status)}</summary>
@@ -668,7 +795,7 @@ export function Workspace() {
                     {a.endpoint && <p className="small muted" style={{ margin: 0 }}>接口: {a.endpoint} ({a.model})</p>}
                   </div>
                   <div>
-                  <span className={`badge ${a.ready ? 'active' : ''}`}>{a.ready ? '可讨论／分析' : '未就绪／已禁用'}</span>
+                  <span className={`badge ${a.ready ? 'active' : ''}`}>{a.ready ? '配置就绪 · 调用时验证' : '未配置／已禁用'}</span>
                   </div>
                 </div>
               ))}

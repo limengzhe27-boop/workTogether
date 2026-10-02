@@ -16,7 +16,7 @@ ideas:
 4. The scheduler computes a digest for the analysis output. Antigravity receives an independent `VERIFY` dispatch against that digest and the exact acceptance criteria. A pass unlocks dependent steps; a fail returns the analysis with findings, subject to the existing two-repair cap.
 5. A dependent Codex step receives a bounded excerpt of the verified analysis rather than a full model transcript.
 
-All reports remain task-scoped and audited. Provider errors never silently pass verification. The existing Antigravity tool-permission limitation remains unresolved; the tests for this feature use deterministic fake CLI/HTTP responses, not paid live models.
+All reports remain task-scoped and audited. Provider errors never silently pass verification. The custom API-Agent delegation tests use deterministic fake CLI/HTTP responses, not paid live API models. Separately, an isolated real Codex-to-Antigravity file-check trial completed after retrying a permission-denied shell attempt with a read-only file tool; this does not validate command-based test execution in a real project.
 An API Agent marked ready has a complete configuration; that does not prove its endpoint is currently reachable or its credentials are valid. Those failures surface when a real dispatch runs.
 For API calls, the adapter requires plan approval for analysis even when invoked directly, rechecks task/dispatch state immediately before the request, rejects HTTP redirects instead of forwarding task text or credentials, and treats malformed provider output as a failed run rather than an Agent reply.
 

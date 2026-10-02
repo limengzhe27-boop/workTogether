@@ -47,6 +47,12 @@ class AntigravityTests(unittest.TestCase):
         self.assertNotIn("--continue", args)
         self.assertNotIn("--dangerously-skip-permissions", args)
 
+    def test_verification_prefers_read_only_file_tools_without_bypassing_permissions(self):
+        prompt = self.r._prompt(dict(self.d, kind="VERIFY"))
+        self.assertIn("view_file", prompt)
+        self.assertIn("report BLOCKED", prompt)
+        self.assertNotIn("--dangerously-skip-permissions", prompt)
+
     def test_wrong_role_rejected(self):
         self.r.run(self.task, self.d["id"])
         d = self.e.dispatch(self.task)["dispatch"]

@@ -10,12 +10,12 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from worktogether.adapters import MockAdapter
 from worktogether.core import Engine
 from worktogether.runtime import Runtime
-from worktogether.server import WorkTogetherHandler
+from worktogether.server import WorkTogetherHandler, resolve_antigravity_executable
 
 
 class DummyServer:
@@ -119,9 +119,23 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data["status"], "ok")
 
+        self.server.provider_status = {"antigravity": {"available": False, "executable": "agy"}}
+        status, data = execute_request(self.server, "GET", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertFalse(data["providers"]["antigravity"]["available"])
+
         status, html = execute_request(self.server, "GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("WorkTogether Web Workspace", html)
+
+    def test_private_antigravity_cli_is_used_only_when_executable(self):
+        candidate = Path(self.temp_dir.name) / "antigravity"
+        candidate.write_text("fixture", encoding="utf-8")
+        with patch("worktogether.server.shutil.which", return_value=None):
+            self.assertEqual(resolve_antigravity_executable("agy", candidate), "agy")
+            candidate.chmod(0o700)
+            self.assertEqual(resolve_antigravity_executable("agy", candidate), str(candidate))
+            self.assertEqual(resolve_antigravity_executable("/explicit/agy", candidate), "/explicit/agy")
 
     def test_real_static_assets_packaging(self):
         real_static_dir = Path(__file__).resolve().parent.parent.parent / "worktogether" / "static"
@@ -231,6 +245,52 @@ class ServerApiTests(unittest.TestCase):
         status, resume_res = execute_request(self.server, "POST", f"/api/tasks/{task_id}/resume")
         self.assertEqual(status, 200)
         self.assertEqual(resume_res["status"], "ACTIVE")
+
+    def test_manual_verification_recovery_via_http(self):
+        _, project = execute_request(self.server, "POST", "/api/projects", {
+            "name": "Manual Recovery", "path": self.temp_dir.name})
+        _, task = execute_request(self.server, "POST", "/api/tasks", {
+            "project_id": project["id"], "title": "Recover", "requirement": "Verify one step"})
+        task_id = task["id"]
+        adapter = MockAdapter()
+        for _ in range(3):
+            status, result = execute_request(self.server, "POST", f"/api/tasks/{task_id}/dispatch")
+            self.assertEqual(status, 200)
+            dispatch = result["dispatch"]
+            status, template = execute_request(self.server, "GET", f"/api/tasks/{task_id}/template/{dispatch['id']}")
+            self.assertEqual(status, 200)
+            report = adapter.prepare(dispatch, template["template"])
+            self.assertEqual(execute_request(self.server, "POST", f"/api/tasks/{task_id}/submit", report)[0], 200)
+
+        status, result = execute_request(self.server, "POST", f"/api/tasks/{task_id}/dispatch")
+        self.assertEqual(status, 200)
+        code = result["dispatch"]
+        _, template = execute_request(self.server, "GET", f"/api/tasks/{task_id}/template/{code['id']}")
+        self.assertEqual(execute_request(self.server, "POST", f"/api/tasks/{task_id}/submit",
+                                         adapter.prepare(code, template["template"]))[0], 200)
+
+        _, result = execute_request(self.server, "POST", f"/api/tasks/{task_id}/dispatch")
+        verify = result["dispatch"]
+        self.assertEqual(verify["kind"], "VERIFY")
+        blocked = self.engine.template(task_id, verify["id"])
+        blocked["summary"] = "Verification tool permission denied"
+        blocked["basis"] = ["Permission prompt could not be accepted"]
+        blocked["data"] = {"reason": "Permission denied"}
+        self.assertEqual(execute_request(self.server, "POST", f"/api/tasks/{task_id}/submit", blocked)[0], 200)
+        self.assertEqual(self.engine.show(task_id)["status"], "BLOCKED")
+
+        status, retried = execute_request(self.server, "POST", f"/api/tasks/{task_id}/retry",
+                                          {"dispatch_id": verify["id"]})
+        self.assertEqual(status, 200)
+        replacement = retried["dispatch"]
+        self.assertNotEqual(replacement["id"], verify["id"])
+        self.assertEqual(replacement["kind"], "VERIFY")
+        status, bundle = execute_request(self.server, "GET", f"/api/tasks/{task_id}/handoff/{replacement['id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(bundle["template"]["attempt"], replacement["attempt"])
+        passed = adapter.prepare(replacement, bundle["template"])
+        self.assertEqual(execute_request(self.server, "POST", f"/api/tasks/{task_id}/submit", passed)[0], 200)
+        self.assertEqual(self.engine.show(task_id)["status"], "COMPLETED")
 
     def test_demo_endpoint(self):
         dir_demo = os.path.join(self.temp_dir.name, "demo_ws")
