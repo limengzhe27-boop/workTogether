@@ -71,6 +71,8 @@ export function Workspace() {
   // Multi-agent states
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [teamChoice, setTeamChoice] = useState<{ taskId: string; members: string[] }>({ taskId: '', members: [] });
+  const [delegateOnCreate, setDelegateOnCreate] = useState(false);
+  const [newTeamChoice, setNewTeamChoice] = useState<{ project: string; members: string[] }>({ project: '', members: [] });
   const [providers, setProviders] = useState<Record<string, { available: boolean; executable: string }> | null>(null);
   const [managingAgents, setManagingAgents] = useState(false);
   const [probingAgent, setProbingAgent] = useState('');
@@ -296,8 +298,10 @@ export function Workspace() {
   const teamBusy = teamJobs.some(j => ['QUEUED', 'RUNNING'].includes(j.status));
   const locked = busy || inflight || planningBusy || chatPending || executionBusy || teamBusy;
   const planning = !!task && ['PLANNING', 'PLAN_REVIEW', 'PLAN_FINALIZE'].includes(task.phase);
+  const revisionStarted = !!task?.dispatches.some(d => (d.payload.requirement_revision || 1) === (task.revision || 1));
   const canRevise = !!task && !locked && !activeDispatch;
   const base = '/tasks/' + taskId;
+  const newTeamMembers = newTeamChoice.project === project ? newTeamChoice.members : ['codex', 'antigravity'];
 
   async function prepareManual(dispatchId: string) {
     await act(async () => {
@@ -433,11 +437,19 @@ export function Workspace() {
                 <form className="composer" onSubmit={e => {
                   e.preventDefault();
                   const p = project;
+                  const delegate = delegateOnCreate;
+                  const members = [...newTeamMembers];
                   act(async () => {
                     const t = await api.addTask(p, draft.trim().split('\n')[0].slice(0, 60), draft.trim());
                     save('wt:draft:' + p, '');
                     setDraft('');
                     choose(t.id);
+                    if (delegate) {
+                      // Keep the created task visible if configuration or launch
+                      // fails; never recreate it blindly or hide partial state.
+                      await post(`/tasks/${t.id}/team`, { members });
+                      await post(`/tasks/${t.id}/delegate-team`, { authorize_execution: true });
+                    }
                   });
                 }}>
                   <label htmlFor="requirement" className="small">任务需求</label>
@@ -450,9 +462,21 @@ export function Workspace() {
                       save('wt:draft:' + project, e.target.value);
                     }}
                   />
+                  <label className="small">
+                    <input type="checkbox" checked={delegateOnCreate} disabled={busy}
+                      onChange={e => setDelegateOnCreate(e.target.checked)} /> 创建后授权团队讨论、分工并执行当前需求
+                  </label>
+                  {delegateOnCreate && <div>
+                    <div className="actions">{agents.filter(a => a.ready).map(a => <label key={a.id}>
+                      <input type="checkbox" disabled={busy} checked={newTeamMembers.includes(a.id)} onChange={e => setNewTeamChoice({
+                        project, members: e.target.checked ? [...newTeamMembers, a.id] : newTeamMembers.filter(id => id !== a.id),
+                      })} /> {a.name}
+                    </label>)}</div>
+                    <p className="small">至少选择两位成员。选定 Agent 将收到需求并可能修改项目，定稿后不再逐步询问。最多 {2 * newTeamMembers.length + 15} 次 Agent 调用；外部接口会接收必要任务信息。暂停、失败或预算耗尽会停止。</p>
+                  </div>}
                   <div className="composer-footer">
-                    <span className="small">创建不会消耗模型额度</span>
-                    <button className="primary" disabled={!project || !draft.trim() || busy}>创建任务</button>
+                    <span className="small">{delegateOnCreate ? '将调用选定 Agent，可能消耗其额度' : '仅创建不会消耗模型额度'}</span>
+                    <button className="primary" disabled={!project || !draft.trim() || busy || (delegateOnCreate && newTeamMembers.length < 2)}>{delegateOnCreate ? '创建并授权团队执行' : '创建任务'}</button>
                   </div>
                 </form>
 
@@ -485,7 +509,7 @@ export function Workspace() {
                   <span className="badge">{label(task.status)}</span>
                 </div>
 
-                {task.phase === 'PLANNING' && task.dispatches.length === 0 && (
+                {task.phase === 'PLANNING' && !revisionStarted && (
                   <section className="card">
                     <h2>任务团队</h2>
                     <p className="muted">选择参与本任务的成员。规划与执行按能力分工；普通 API 不能修改代码或运行测试。可用配置不代表登录与配额已验证。</p>
@@ -507,7 +531,7 @@ export function Workspace() {
                 {task.team && <p className="muted">规划协调：{agentMap[task.team.coordinator]?.name || task.team.coordinator} · 方案复核：{agentMap[task.team.reviewer]?.name || task.team.reviewer} · 步骤执行与验收按能力另行分配</p>}
 
                 <div className="actions controls">
-                  {task.team && task.phase === 'PLANNING' && task.dispatches.length === 0 && (
+                  {task.team && task.phase === 'PLANNING' && !revisionStarted && (
                     <button className="primary" disabled={locked || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/delegate-team', { authorize_execution: true }))}>
                       授权团队讨论并执行 · 最多 {2 * task.team.members.length + 15} 次调用
                     </button>
@@ -555,7 +579,7 @@ export function Workspace() {
                   <button disabled={!canRevise} onClick={beginEdit}>修改需求</button>
                 </div>
                 <p className="small">暂停不会终止已运行的模型；执行状态不明时，请查看执行详情，不要重复启动。</p>
-                {task.team && task.dispatches.length === 0 && <p className="small">“授权团队讨论并执行”允许团队在本需求范围内定稿后直接工作，不再逐步询问；仍受能力、独立验收、修复与调用预算限制。若要先审方案，请使用“团队讨论与认领”。</p>}
+                {task.team && !revisionStarted && <p className="small">“授权团队讨论并执行”允许团队在本需求范围内定稿后直接工作，不再逐步询问；仍受能力、独立验收、修复与调用预算限制。若要先审方案，请使用“团队讨论与认领”。</p>}
                 {teamJobs.length > 0 && <section className="card">
                   <h2>团队自动协作</h2>
                   {teamJobs.map(j => <p key={j.id}>{j.result?.reason === 'COMPLETED' ? '全部步骤通过验收' : j.status === 'COMPLETED' ? '本轮已停止，任务未必完成' : label(j.status)} · {j.error || j.result?.reason || '讨论、认领、定稿后按授权执行'}{j.result?.reason === 'CALL_LIMIT' ? '（本轮预算已用完，不代表任务完成）' : ''}</p>)}

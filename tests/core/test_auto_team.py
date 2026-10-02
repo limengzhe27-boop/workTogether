@@ -93,3 +93,16 @@ class AutoTeamTests(unittest.TestCase):
         status, result = execute_request(server, "GET", url + "/team-jobs")
         self.assertEqual(200, status)
         self.assertEqual(job["id"], result["jobs"][0]["id"])
+
+    def test_new_revision_can_reconfigure_and_delegate_again(self):
+        job = self.queued()
+        self.jobs._work(job, 30)
+        self.engine.message_add(self.task, "old", "all", "Old follow-up")
+        self.engine.revise(self.task, "r", 1, "Refined requirement")
+        self.assertEqual("NEEDS_REVIEW", self.engine.messages(self.task)[0]["status"])
+        self.engine.configure_team(self.task, ["codex", "antigravity"], "codex", "antigravity")
+        next_job = self.queued()
+        self.assertEqual(2, next_job["authorization"]["revision"])
+        self.jobs._work(next_job, 30)
+        self.assertEqual("COMPLETED", self.engine.show(self.task)["status"])
+        self.assertEqual(18, len(self.codex.list(self.task)["runs"]))

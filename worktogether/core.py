@@ -41,6 +41,11 @@ def uid():
     return uuid.uuid4().hex
 
 
+def revision_dispatches(task):
+    return [d for d in task["dispatches"]
+            if d["payload"].get("requirement_revision", 1) == task.get("revision", 1)]
+
+
 def plan_validate(data):
     exact(data, ["steps"])
     steps = data["steps"]
@@ -191,6 +196,12 @@ class Engine:
             for d in task["dispatches"]:
                 if d["status"] == "BLOCKED":
                     d["status"] = "SUPERSEDED"
+            for row in db.execute("SELECT id,body FROM messages WHERE task_id=?", (task_id,)):
+                message = json.loads(row["body"])
+                if message["status"] in ("QUEUED", "BLOCKED"):
+                    message["status"] = "NEEDS_REVIEW"
+                    db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?",
+                               (encode(message), task_id, row["id"]))
             task.update(requirement=requirement, revision=revision + 1, draft_plan=None,
                         plan_review=None, steps=[], phase="PLANNING", block_reason=None,
                         status="PAUSED" if task["status"] == "PAUSED" else "ACTIVE")
@@ -209,7 +220,7 @@ class Engine:
         with self.transaction() as db:
             task = self._task(db, task_id)
             require(task["status"] == "ACTIVE" and task["phase"] == "PLANNING"
-                    and not task["dispatches"], "Configure the team before any dispatch", "INVALID_STATE")
+                    and not revision_dispatches(task), "Configure the team before this revision's dispatches", "INVALID_STATE")
             for table in ("planning_jobs", "team_jobs"):
                 if db.execute("SELECT name FROM sqlite_master WHERE name=?", (table,)).fetchone():
                     require(not any(json.loads(row[0])["status"] in ("QUEUED", "RUNNING") for row in db.execute(

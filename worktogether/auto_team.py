@@ -1,6 +1,6 @@
 """Explicit, bounded task delegation from discussion through independent review."""
 import json
-from .core import require
+from .core import require, revision_dispatches
 from .jobs import PlanningJobs
 from .runtime import Runtime
 from .teamwork import discuss_team
@@ -12,7 +12,7 @@ class TeamJobs(PlanningJobs):
     phases = ("PLANNING",)
 
     def job_fields(self, task):
-        require(task.get("team") and not task["dispatches"],
+        require(task.get("team") and not revision_dispatches(task),
                 "Automatic delegation requires a configured, unstarted team task", "INVALID_STATE")
         # Fixed, visible budget includes every consultation/claim and model call.
         return {"max_calls": 2 * len(task["team"]["members"]) + 15,
