@@ -323,6 +323,19 @@ class Engine:
                     return True
         return False
 
+    def _workspace_busy(self, db, task, kind, exclude_dispatch_id=None):
+        # Without a pinned snapshot, CODE/FIX must not change the checkout
+        # while any task in the same project is verifying it (or vice versa).
+        if kind not in ("CODE", "FIX", "VERIFY"):
+            return False
+        for row in db.execute("SELECT body FROM tasks WHERE project_id=?", (task["project_id"],)):
+            other = json.loads(row[0])
+            if any(d["id"] != exclude_dispatch_id and d["status"] in ("ACTIVE", "BLOCKED")
+                   and d["kind"] in ("CODE", "FIX", "VERIFY")
+                   for d in other["dispatches"]):
+                return True
+        return False
+
     def _issue(self, task, kind, step=None, attempt=1, role=None):
         now = time.time()
         if role is None:
@@ -369,8 +382,12 @@ class Engine:
                         candidates.append(("FIX", s))
                     elif s["status"] == "PENDING" and set(s["depends_on"]) <= complete:
                         candidates.append(("ANALYZE" if s.get("work_kind", "code") == "analysis" else "CODE", s))
+            workspace_busy = False
             for kind, step in candidates:
                 role = (step.get("assignee") if step and kind in ("CODE", "FIX", "ANALYZE") else None) or ("antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex")
+                if self._workspace_busy(db, t, kind):
+                    workspace_busy = True
+                    continue
                 if self._busy(db, t, role):
                     continue
                 if step and kind == "CODE":
@@ -396,7 +413,7 @@ class Engine:
                         if a.ready]
                 self._save(db, t, "DISPATCHED", {"dispatch_id": d["id"], "kind": kind})
                 return {"dispatch": d}
-            return {"dispatch": None}
+            return {"dispatch": None, "reason": "PROJECT_WORKSPACE_BUSY" if workspace_busy else "NO_ELIGIBLE_STEP"}
 
     def agents_list(self, enabled_only=False):
         from .agents import AgentRegistry
@@ -583,6 +600,8 @@ class Engine:
             self._require_process_stopped(db, d["id"])
             d["status"] = "SUPERSEDED"
             require(not self._busy(db, t, d["role"]), "Another dispatch occupies this role", "INVALID_STATE")
+            require(not self._workspace_busy(db, t, d["kind"], d["id"]),
+                    "Another code or verification step occupies this project", "INVALID_STATE")
             step = next((s for s in t["steps"] if s["id"] == d["step_id"]), None)
             if step:
                 step["status"] = {"CODE": "CODING", "ANALYZE": "ANALYZING", "FIX": "FIXING", "VERIFY": "VERIFYING"}[d["kind"]]

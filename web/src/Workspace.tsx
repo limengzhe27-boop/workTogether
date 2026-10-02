@@ -436,7 +436,12 @@ export function Workspace() {
                   )}
                   {!activeDispatch && task.phase !== 'COMPLETED' && (
                     <button disabled={locked || task.status !== 'ACTIVE' || (task.phase === 'EXECUTING' && !approval?.approved)}
-                      onClick={() => act(() => api.dispatch(taskId))}>
+                      onClick={() => act(async () => {
+                        const next = await api.dispatch(taskId);
+                        if (!next.dispatch && next.reason === 'PROJECT_WORKSPACE_BUSY') {
+                          throw new Error('同一项目还有开发或验收项未处理；请先完成、重试或修订那个任务。');
+                        }
+                      })}>
                       手动派发下一项（不调用模型）
                     </button>
                   )}
@@ -561,6 +566,7 @@ export function Workspace() {
                             MESSAGE_PENDING: '有新消息待处理。',
                             TASK_NOT_ACTIVE: '任务已暂停或需要处理。',
                             EXISTING_DISPATCH: '已有派发需要检查。',
+                            PROJECT_WORKSPACE_BUSY: '同一项目有开发或验收项尚未处理。',
                             APPROVAL_REQUIRED: '请重新批准方案。',
                             PROVIDER_FAILED: '模型运行失败，没有自动重试。',
                           } as Record<string, string>)[j.result?.reason || ''] ||

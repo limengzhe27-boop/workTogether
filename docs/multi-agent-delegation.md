@@ -25,4 +25,5 @@ For API calls, the adapter requires plan approval for analysis even when invoked
 - Claude Code, ZCode, or arbitrary CLI work adapters.
 - Model-initiated changes to the approved plan or unchecked autonomous task spawning.
 - Multiple concurrent code writers sharing one checkout; worktrees and merge review must precede that capability.
+- Concurrent code changes and verification in the same project checkout; dispatches are serialized until version-pinned worktrees are available.
 - A successful real DeepSeek/Antigravity end-to-end trial. The next validation should exercise one approved analysis step with the user's actual configured providers.

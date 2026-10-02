@@ -64,6 +64,33 @@ class EngineTests(unittest.TestCase):
         self.e.submit(self.t, self.report(d))
         self.assertEqual("COMPLETED", self.e.show(self.t)["status"])
 
+    def test_same_project_code_waits_for_verification_without_snapshot(self):
+        self.plan()
+        other = self.e.task_add(self.p, "second", "Another code change")["id"]
+        for _ in range(3):
+            dispatch = self.e.dispatch(other)["dispatch"]
+            self.assertIsNotNone(dispatch)
+            self.e.submit(other, MockAdapter().prepare(dispatch, self.e.template(other, dispatch["id"])))
+
+        code = self.issue()
+        self.assertEqual("CODE", code["kind"])
+        self.assertEqual("PROJECT_WORKSPACE_BUSY", self.e.dispatch(other)["reason"])
+        self.e.submit(self.t, self.report(code))
+        verify = self.issue()
+        self.assertEqual("VERIFY", verify["kind"])
+        self.assertEqual("PROJECT_WORKSPACE_BUSY", self.e.dispatch(other)["reason"])
+        independent_path = Path(self.temp.name) / "independent"
+        independent_path.mkdir()
+        independent_project = self.e.project_add("independent", independent_path)["id"]
+        independent = self.e.task_add(independent_project, "third", "Independent change")["id"]
+        for _ in range(3):
+            dispatch = self.e.dispatch(independent)["dispatch"]
+            self.e.submit(independent, MockAdapter().prepare(
+                dispatch, self.e.template(independent, dispatch["id"])))
+        self.assertEqual("CODE", self.e.dispatch(independent)["dispatch"]["kind"])
+        self.e.submit(self.t, self.report(verify))
+        self.assertEqual("CODE", self.e.dispatch(other)["dispatch"]["kind"])
+
     def test_repair_limit(self):
         self.plan()
         self.complete()
@@ -174,20 +201,22 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("PLAN_FINALIZE", self.complete()["kind"])
         self.assertEqual("CODE", self.issue()["kind"])
 
-    def test_overlap_and_dependencies(self):
+    def test_same_checkout_serializes_code_and_verification_with_dependencies(self):
         steps = [{"id": k, "title": k, "acceptance": [k], "depends_on": deps}
                  for k, deps in [("a", []), ("b", []), ("c", ["a"])]]
         self.plan(steps)
         self.assertEqual("a", self.complete()["step_id"])
         verify = self.issue()
         self.assertEqual("VERIFY", verify["kind"])
+        self.assertEqual("PROJECT_WORKSPACE_BUSY", self.e.dispatch(self.t)["reason"])
+        self.e.submit(self.t, self.report(verify))
         code = self.issue()
         self.assertEqual("b", code["step_id"])
-        self.assertIsNone(self.e.dispatch(self.t)["dispatch"])
         self.e.submit(self.t, self.report(code))
-        self.assertIsNone(self.e.dispatch(self.t)["dispatch"])
-        self.e.submit(self.t, self.report(verify))
-        self.assertEqual("b", self.issue()["step_id"])
+        verify_b = self.issue()
+        self.assertEqual("VERIFY", verify_b["kind"])
+        self.assertEqual("PROJECT_WORKSPACE_BUSY", self.e.dispatch(self.t)["reason"])
+        self.e.submit(self.t, self.report(verify_b))
         self.assertEqual("c", self.issue()["step_id"])
 
     def test_concurrent_dispatch_once(self):
@@ -219,20 +248,22 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("NOT_FOUND", json.loads(r.stdout)["error"]["code"])
 
     def test_repair_limit_survives_other_dispatch_timeout(self):
-        self.plan([{"id": k, "title": k, "acceptance": [k], "depends_on": []} for k in ("a", "b")])
+        self.plan([{"id": "a", "title": "a", "acceptance": ["a"], "depends_on": []},
+                   {"id": "b", "title": "b", "work_kind": "analysis", "assignee": "codex",
+                    "acceptance": ["b"], "depends_on": []}])
         self.complete()
         for _ in range(2):
             d = self.issue()
             self.e.submit(self.t, self.fail(d))
             self.assertEqual("FIX", self.complete()["kind"])
         verify = self.issue()
-        other_code = self.issue()
-        self.assertEqual("b", other_code["step_id"])
+        other_analysis = self.issue()
+        self.assertEqual("ANALYZE", other_analysis["kind"])
         self.e.submit(self.t, self.fail(verify))
-        with patch("worktogether.core.time.time", return_value=other_code["deadline"] + 1):
+        with patch("worktogether.core.time.time", return_value=other_analysis["deadline"] + 1):
             self.e.expire(self.t)
         self.assertEqual("REPAIR_LIMIT", self.e.show(self.t)["block_reason"])
-        self.assert_error("INVALID_STATE", lambda: self.e.retry(self.t, other_code["id"]))
+        self.assert_error("INVALID_STATE", lambda: self.e.retry(self.t, other_analysis["id"]))
 
     def test_malformed_reports_rollback(self):
         d = self.issue()

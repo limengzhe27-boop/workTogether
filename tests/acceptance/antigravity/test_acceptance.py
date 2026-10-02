@@ -519,8 +519,8 @@ class AcceptanceScenariosTest(AcceptanceTestBase):
         self.assertEqual(t_blocked["block_reason"], "Mock server unavailable")
         self.assertEqual(t_blocked["steps"][0]["status"], "BLOCKED")
 
-    def test_acc_010_dependencies_and_pipeline_overlap(self):
-        """ACC-010: Dependent steps are gated; independent steps overlap CODE and VERIFY."""
+    def test_acc_010_dependencies_and_checkout_safety(self):
+        """ACC-010: Dependent steps are gated; one checkout cannot mix CODE and VERIFY."""
         task = self.engine.task_add(self.project["id"], "Task", "Req")
         task_id = task["id"]
 
@@ -548,18 +548,18 @@ class AcceptanceScenariosTest(AcceptanceTestBase):
         # Codex completes s1 -> enters VERIFYING
         self.engine.submit(task_id, self.make_code_report(task_id, d_code_s1, "v1"))
 
-        # Pipeline Overlap Check:
-        # Now Antigravity can VERIFY s1 AND Codex can simultaneously CODE independent step s2!
-        d_first = self.engine.dispatch(task_id)["dispatch"]
-        d_second = self.engine.dispatch(task_id)["dispatch"]
+        d_verify = self.engine.dispatch(task_id)["dispatch"]
+        self.assertEqual(d_verify["kind"], "VERIFY")
+        self.assertEqual(d_verify["role"], "antigravity")
+        self.assertEqual(self.engine.dispatch(task_id)["reason"], "PROJECT_WORKSPACE_BUSY")
 
-        active_kinds = {d_first["kind"], d_second["kind"]}
-        active_roles = {d_first["role"], d_second["role"]}
-        self.assertEqual(active_kinds, {"VERIFY", "CODE"})
-        self.assertEqual(active_roles, {"antigravity", "codex"})
-
-        # Step 3 (dependent on s1) must NOT be dispatched yet
-        self.assertIsNone(self.engine.dispatch(task_id)["dispatch"])
+        checks = [{"criterion": "c1", "status": "PASS", "evidence": ["fixture verification"]}]
+        self.engine.submit(task_id, self.make_verify_report(task_id, d_verify, "v1", checks))
+        d_code_s2 = self.engine.dispatch(task_id)["dispatch"]
+        self.assertEqual(d_code_s2["kind"], "CODE")
+        self.assertEqual(d_code_s2["step_id"], "s2")
+        # s3 depends on s1, but it still cannot write alongside s2 in one checkout.
+        self.assertEqual(self.engine.dispatch(task_id)["reason"], "PROJECT_WORKSPACE_BUSY")
 
     def test_acc_cli_invocations(self):
         """Verify public CLI commands via python3 -m worktogether."""

@@ -46,9 +46,10 @@ def _execute(engine, task_id, codex, antigravity, *, max_calls, timeout):
             return stop("EXISTING_DISPATCH")
         if any(m["status"] in ("QUEUED", "RUNNING") for m in engine.messages(task_id)):
             return stop("MESSAGE_PENDING")
-        dispatch = engine.dispatch(task_id)["dispatch"]
+        decision = engine.dispatch(task_id)
+        dispatch = decision["dispatch"]
         if dispatch is None:
-            return stop("NO_DISPATCH")
+            return stop(decision.get("reason", "NO_DISPATCH"))
         require(dispatch["kind"] in ("CODE", "ANALYZE", "VERIFY", "FIX"),
                 "Execution cannot run planning or chat", "INVALID_STATE")
         if dispatch["role"] == "codex":

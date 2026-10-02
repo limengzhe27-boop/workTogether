@@ -71,7 +71,7 @@ export const api = {
     }),
   getTask: (taskId: string) => request<TaskDetail>(`/tasks/${taskId}`),
   dispatch: (taskId: string) =>
-    request<{ dispatch: Dispatch | null }>(`/tasks/${taskId}/dispatch`, {
+    request<{ dispatch: Dispatch | null; reason?: string }>(`/tasks/${taskId}/dispatch`, {
       method: 'POST',
     }),
   submitReport: (taskId: string, report: ReportEnvelope) =>

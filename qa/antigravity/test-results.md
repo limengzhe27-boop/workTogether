@@ -36,7 +36,7 @@ $ python3 -m unittest discover -s tests/acceptance/antigravity -v
 | `ACC-007` | `test_acc_007_pause_accepts_inflight_and_resumes` | 暂停后 `dispatch` 立即返回 null；在途结果允许正常落库并推进步骤，但任务主状态严格保持 `PAUSED`；恢复后任务正确重算状态并继续派发。 | **PASS** |
 | `ACC-008` | `test_acc_008_process_restart_crash_recovery` | 新创建的独立 `Engine` 实例指向同一 SQLite 库，能完全恢复任务、步骤与时序事件，且不会重复派发已处于 `ACTIVE` 的外部任务。 | **PASS** |
 | `ACC-009` | `test_acc_009_invalid_input_and_state_invariance` | 缺少 evidence、缺少或多出 acceptance 验收项、包含未定义字段的报告均被拦截；**断言每次拦截后数据库状态、事件总数与失败前严格完全一致（事务零副作用回滚）**；`BLOCKED` 报告安全进入阻塞态而非被误判为通过。 | **PASS** |
-| `ACC-010` | `test_acc_010_dependencies_and_pipeline_overlap` | 存在依赖的步骤在先决步骤 `COMPLETED` 前无法被派发；无依赖独立步骤允许同时处于 Codex `CODING` 与 Antigravity `VERIFYING` 的流水线重叠态。 | **PASS** |
+| `ACC-010` | 历史测试：`test_acc_010_dependencies_and_pipeline_overlap` | 当时的实现允许同一工作区 CODE 与 VERIFY 重叠；此历史结论已被后续安全互斥策略取代，当前测试为 `test_acc_010_dependencies_and_checkout_safety`。 | **SUPERSEDED** |
 | `CLI-001` | `test_acc_cli_invocations` | 通过标准子进程调用 `python3 -m worktogether --db ...` 验证 `doctor`, `task-add`, `show`, `pause`, `resume`，标准输出 JSON 解析正常，退出码严格符合契约。 | **PASS** |
 
 ---

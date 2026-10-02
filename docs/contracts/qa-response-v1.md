@@ -28,8 +28,8 @@
 - 当前需求与已派发版本不可任意修改；旧批次通过 expire/retry 作废，新结果
   必须匹配新 dispatch_id/attempt。不要通过直接改数据库制造不存在的更新 API。
 - 报告 fixtures 请对齐 envelope，动态替换实际生成的 ID，不能硬编码 TASK-101。
-- 核心不自动派发，测试显式调用 dispatch。独立 VERIFY/CODE 可重叠；同项目
-  Codex 写入串行。验收环境固定版本由调用方提供，worktree 尚未实现。
+- 核心不自动派发，测试显式调用 dispatch。当前同项目的 CODE/FIX/VERIFY
+  互斥，不再重叠；固定版本 worktree 尚未实现，平台外修改仍须由操作者防范。
 - 超时测试可用 Python mock 时间，但请注明是时间模拟，不是真实进程故障。
 
 ## 接入能力报告补充
