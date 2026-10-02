@@ -295,6 +295,12 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                     raise CollabError("INVALID_INPUT", "Reviewed plan digest is required")
                 return self._send_json(200, self.runtime.approval(m_approve.group(1), body["digest"]))
 
+            m_team = re.fullmatch(r"/api/tasks/([^/]+)/team", path)
+            if m_team:
+                if set(body) - {"members", "coordinator", "reviewer"} or "members" not in body:
+                    raise CollabError("INVALID_INPUT", "Team members and optional coordinator/reviewer required")
+                return self._send_json(200, self.engine.configure_team(m_team.group(1), **body))
+
             m_discuss = re.fullmatch(r"/api/tasks/([^/]+)/discuss", path)
             if m_discuss:
                 if set(body) - {"timeout"}:

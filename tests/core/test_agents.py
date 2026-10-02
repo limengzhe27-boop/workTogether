@@ -48,7 +48,7 @@ class AgentRegistryTests(unittest.TestCase):
         fetched = self.registry.get("claude-sonnet")
         self.assertIsNotNone(fetched)
         self.assertEqual(fetched.name, "Claude Sonnet")
-        self.assertEqual(fetched.roles, ["chat", "analysis"])
+        self.assertEqual(fetched.roles, ["chat", "analysis", "plan", "review"])
 
     def test_remove_custom_agent(self):
         custom = {"id": "temp-agent", "name": "Temp", "type": "openai_compat",

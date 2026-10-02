@@ -3,7 +3,7 @@ import { api, request } from './api';
 import { TaskChat } from './TaskChat';
 import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentProbeResult, ReportEnvelope } from './types';
 
-type Detail = TaskDetail & { revision?: number };
+type Detail = TaskDetail & { revision?: number; team?: { members: string[]; coordinator: string; reviewer: string } };
 type Job = { id: string; status: string; error: string | null; result?: { reason?: string } };
 type Approval = { digest: string; approved: boolean; requirement: string; plan: Detail['draft_plan']; revision: number };
 const labels: Record<string, string> = {
@@ -69,6 +69,7 @@ export function Workspace() {
 
   // Multi-agent states
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [teamChoice, setTeamChoice] = useState<{ taskId: string; members: string[] }>({ taskId: '', members: [] });
   const [providers, setProviders] = useState<Record<string, { available: boolean; executable: string }> | null>(null);
   const [managingAgents, setManagingAgents] = useState(false);
   const [probingAgent, setProbingAgent] = useState('');
@@ -479,10 +480,31 @@ export function Workspace() {
                   <span className="badge">{label(task.status)}</span>
                 </div>
 
+                {task.phase === 'PLANNING' && task.dispatches.length === 0 && (
+                  <section className="card">
+                    <h2>任务团队</h2>
+                    <p className="muted">选择参与本任务的成员。规划与执行按能力分工；普通 API 不能修改代码或运行测试。可用配置不代表登录与配额已验证。</p>
+                    <div className="actions">
+                      {agents.filter(a => a.ready).map(a => {
+                        const members = teamChoice.taskId === taskId ? teamChoice.members : task.team?.members || ['codex', 'antigravity'];
+                        return <label key={a.id}>
+                          <input type="checkbox" disabled={locked} checked={members.includes(a.id)} onChange={e => setTeamChoice({
+                            taskId, members: e.target.checked ? [...members, a.id] : members.filter(id => id !== a.id),
+                          })} /> {a.name}
+                        </label>;
+                      })}
+                    </div>
+                    <button disabled={locked || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/team', {
+                      members: teamChoice.taskId === taskId ? teamChoice.members : task.team?.members || ['codex', 'antigravity'],
+                    }))}>保存团队与能力分工</button>
+                  </section>
+                )}
+                {task.team && <p className="muted">规划协调：{agentMap[task.team.coordinator]?.name || task.team.coordinator} · 方案复核：{agentMap[task.team.reviewer]?.name || task.team.reviewer} · 步骤执行与验收按能力另行分配</p>}
+
                 <div className="actions controls">
                   {planning && (
                     <button className="primary" disabled={locked || !!activeDispatch || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/discuss'))}>
-                      开始方案讨论 · 最多三轮
+                      {task.team ? '团队讨论与认领 · 两轮成员发言＋三次规划' : '开始方案讨论 · 最多三轮'}
                     </button>
                   )}
                   {!activeDispatch && task.phase !== 'COMPLETED' && (
@@ -694,6 +716,8 @@ export function Workspace() {
                                   </span>
                                 )}
                               </div>
+                              {s.verifier && <p className="muted">独立验收：{agentMap[s.verifier]?.name || s.verifier}</p>}
+                              {s.assignment_reason && <p className="muted">分工依据：{s.assignment_reason}</p>}
                               <ul>{s.acceptance.map(c => <li key={c}>{c}</li>)}</ul>
                             </div>
                           );

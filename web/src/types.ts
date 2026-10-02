@@ -5,7 +5,7 @@
 export type TaskStatus = 'ACTIVE' | 'PAUSED' | 'BLOCKED' | 'COMPLETED';
 export type TaskPhase = 'PLANNING' | 'PLAN_REVIEW' | 'PLAN_FINALIZE' | 'EXECUTING' | 'COMPLETED';
 export type StepStatus = 'PENDING' | 'CODING' | 'ANALYZING' | 'VERIFYING' | 'FIXING' | 'COMPLETED' | 'BLOCKED';
-export type DispatchKind = 'PLAN' | 'PLAN_REVIEW' | 'PLAN_FINALIZE' | 'CODE' | 'ANALYZE' | 'VERIFY' | 'FIX' | 'CHAT';
+export type DispatchKind = 'PLAN' | 'PLAN_REVIEW' | 'PLAN_FINALIZE' | 'CODE' | 'ANALYZE' | 'VERIFY' | 'FIX' | 'CHAT' | 'CONSULT' | 'CLAIM';
 export type DispatchStatus = 'ACTIVE' | 'DONE' | 'BLOCKED' | 'SUPERSEDED';
 export type AgentRole = string;
 export type RunStatus = 'PREPARED' | 'RUNNING' | 'EXITED' | 'COMPLETED' | 'FAILED';
@@ -63,6 +63,8 @@ export interface PlanStep {
   acceptance: string[];
   depends_on: string[];
   assignee?: string;
+  verifier?: string;
+  assignment_reason?: string;
   status?: StepStatus;
   repair_count?: number;
   repair_exhausted?: boolean;

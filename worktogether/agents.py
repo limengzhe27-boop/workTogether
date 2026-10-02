@@ -62,6 +62,13 @@ class AgentConfig:
         self.roles = data.get("roles", ["chat"]) if self.type == "cli" else ["chat", "analysis"]
         if self.id == "antigravity" and "analysis" not in self.roles:
             self.roles = [*self.roles, "analysis"]
+        # Adapter-supported capabilities, not a fixed job description. API-only
+        # agents can reason about supplied material but cannot run tests or edit.
+        extra = {"codex": ["analysis", "review", "verify"],
+                 "antigravity": ["plan"]}.get(self.id, [])
+        if self.type == "openai_compat":
+            extra = ["plan", "review"]
+        self.roles = list(dict.fromkeys([*self.roles, *extra]))
         self.color = data.get("color", "#6366f1")
         self.avatar = data.get("avatar", "🤖")
         self.description = data.get("description", "")
@@ -122,9 +129,11 @@ class AgentRegistry:
         for row in db.execute("SELECT body FROM tasks"):
             task = json.loads(row[0])
             if task["phase"] == "EXECUTING" and any(
-                    step.get("assignee") == agent_id and step["status"] != "COMPLETED"
+                    agent_id in (step.get("assignee"), step.get("verifier")) and step["status"] != "COMPLETED"
                     for step in task["steps"]):
                 raise CollabError("INVALID_STATE", "Agent owns unfinished work")
+            if task.get("team") and task["status"] != "COMPLETED" and agent_id in task["team"]["members"]:
+                raise CollabError("INVALID_STATE", "Agent belongs to an unfinished team task")
 
     def register(self, data):
         require(isinstance(data, dict), "Agent object required", "INVALID_INPUT")

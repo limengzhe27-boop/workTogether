@@ -139,13 +139,29 @@ class Runtime:
             "Never invent observations, changes, tests, or evidence.\n"
         )
         instructions = {
+            "CONSULT": (
+                "Read the requirement and propose a concise approach plus at most three risks. "
+                "Do not edit files or launch other agents. This is the single independent "
+                "consultation round; no need for acknowledgement or extended debate. "
+                "status=DONE; data={}; suggestions has at most three entries."
+            ),
+            "CLAIM": (
+                "Read the draft plan and team_inputs. Claim only steps you can usefully complete "
+                "with payload.capabilities; do not equate model confidence with tool access. "
+                "This is the single claim round. Do not edit files or start work. "
+                "status=DONE; data={\"claims\":[{\"step_id\":\"existing step id\",\"reason\":\"specific fit/evidence\"}]}. "
+                "An empty claims array is valid. Each step can appear once. Claims are nominations, "
+                "not ownership; the finalized approved plan is authoritative."
+            ),
             "PLAN": (
                 "Plan only; do not edit files. status=DONE; data={\"steps\":[...]}. "
                 "Use 1-100 steps. Each step requires id (unique nonempty string), title, "
                 "acceptance (nonempty array of unique nonempty strings), depends_on "
                 "(array of unique step IDs; existing IDs only; no cycles). Optional work_kind "
                 "is code or analysis; optional assignee names a ready capable agent from "
-                "payload.available_agents. Code steps must belong to codex. "
+                "payload.available_agents. Code requires the code capability; do not fix roles by brand. "
+                "Optional verifier must be a different agent with verify capability. "
+                "Include assignment_reason for nominations, using relevant peer proposals as evidence. "
                 "Analysis is read-only. Include specific, testable acceptance criteria. "
                 "Do not begin implementation; user approval is required after finalization."
             ),
@@ -156,12 +172,15 @@ class Runtime:
             ),
             "PLAN_FINALIZE": (
                 "Finalize the reviewed plan; do not edit files or begin implementation. "
-                "Consider payload.plan_review and the current requirement. "
+                "Consider payload.plan_review, team_inputs (including member claims) and the current requirement. "
+                "Prefer justified capable volunteers, resolve duplicate claims to one owner; "
+                "do not preserve initial assignments merely because they came first. "
                 "status=DONE; data={\"steps\":[...]}. Use 1-100 steps. Each step "
                 "requires a unique nonempty id, title, acceptance (nonempty unique "
                 "criteria), depends_on (existing unique IDs, acyclic). Optional work_kind "
                 "is code or analysis; optional assignee must be ready and capable per "
-                "payload.available_agents. Code steps must belong to codex. Analysis "
+                "payload.available_agents. Code requires code capability. Optional verifier must "
+                "be a different agent with verify capability; include assignment_reason. Analysis "
                 "is read-only. User approval is required before work starts."
             ),
             "CODE": (

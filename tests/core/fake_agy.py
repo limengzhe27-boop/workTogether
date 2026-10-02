@@ -14,6 +14,12 @@ report = {"schema_version": 1, "task_id": dispatch["task_id"], "dispatch_id": di
           "role": "antigravity", "attempt": dispatch["attempt"], "status": "DONE",
           "summary": "Fixture review", "basis": ["Fixture only"], "suggestions": ["Check persistence"],
           "next_action": "Finalize plan", "data": {}}
+if dispatch["kind"] in ("PLAN", "PLAN_FINALIZE"):
+    report["data"] = {"steps": [{"id": "s1", "title": "fixture", "acceptance": ["works"], "depends_on": []}]}
+if dispatch["kind"] == "CLAIM":
+    report["data"] = {"claims": [{"step_id": s["id"], "reason": "Fixture capable volunteer"}
+                               for s in dispatch["payload"]["draft_plan"]["steps"]
+                               if s.get("work_kind", "code") in dispatch["payload"]["capabilities"]]}
 if dispatch["kind"] == "VERIFY":
     report.update(status="PASS", suggestions=[], next_action="Finish step",
                   data={"version": dispatch["version"], "checks": [

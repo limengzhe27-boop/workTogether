@@ -27,6 +27,16 @@ report = {"schema_version": 1, "task_id": dispatch["task_id"], "dispatch_id": di
 if dispatch["kind"] == "CHAT":
     report["data"] = {}
     report["summary"] = "Fixture reply: " + dispatch["payload"]["message"]
+if dispatch["kind"] in ("CONSULT", "PLAN_REVIEW"):
+    report["data"] = {}
+if dispatch["kind"] == "CLAIM":
+    report["data"] = {"claims": [{"step_id": s["id"], "reason": "Fixture capable volunteer"}
+                               for s in dispatch["payload"]["draft_plan"]["steps"]
+                               if s.get("work_kind", "code") in dispatch["payload"]["capabilities"]]}
+if dispatch["kind"] == "VERIFY":
+    report.update(status="PASS", data={"version": dispatch["version"], "checks": [
+        {"criterion": c, "status": "PASS", "evidence": ["Fixture check"]}
+        for c in dispatch["payload"]["step"]["acceptance"]], "findings": []})
 if dispatch["kind"] in ("CODE", "FIX"):
     report["data"] = {"version": "fixture-" + dispatch["id"],
                       "changes": ["Fixture only"], "known_limits": []}

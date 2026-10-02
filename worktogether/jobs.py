@@ -56,6 +56,9 @@ class PlanningJobs:
             db.execute(f"UPDATE {self.table} SET body=? WHERE id=?", (encode(job), job["id"]))
 
     def perform(self, task_id, timeout):
+        if self.engine.show(task_id).get("team"):
+            from .teamwork import discuss_team
+            return discuss_team(self.engine, task_id, self.codex, self.antigravity, timeout)
         return discuss(self.engine, task_id, self.codex, self.antigravity, timeout)
 
     def _lease(self, job_id):

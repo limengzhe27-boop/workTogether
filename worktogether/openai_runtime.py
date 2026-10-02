@@ -91,15 +91,17 @@ class OpenAICompatibleRuntime(Runtime):
         return ["http-post", f"{self.endpoint}/chat/completions", "--model", self.model]
 
     def execute_reserved(self, run, d):
-        if d["kind"] not in ("CHAT", "ANALYZE"):
-            run.update(status="FAILED", error="API agents support conversation and read-only analysis only")
+        if d["kind"] not in ("CHAT", "ANALYZE", "PLAN", "PLAN_REVIEW", "PLAN_FINALIZE", "CONSULT", "CLAIM"):
+            run.update(status="FAILED", error="API agents support conversation, supplied-context planning and read-only analysis only")
             self._fail(run)
             return run
         task, dispatch_id = run["task_id"], run["dispatch_id"]
         root = Path(run["artifact_dir"])
         root.mkdir(parents=True, exist_ok=True)
 
-        prompt = self._prompt(d)
+        prompt = ("You have no repository, shell, browser or filesystem tools. Reason only "
+                  "from supplied context; label assumptions and missing evidence. Never "
+                  "claim that you inspected files or executed tests.\n" + self._prompt(d))
         (root / "prompt.txt").write_text(prompt, encoding="utf-8")
         args = self.command(run, d)
         (root / "command.json").write_text(encode(args), encoding="utf-8")
