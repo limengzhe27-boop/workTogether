@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+from pathlib import Path
 
 request = json.loads(sys.stdin.readline())
 dispatch = json.loads(request["message"]["content"].split("DISPATCH:\n", 1)[1])
@@ -13,6 +14,13 @@ report = {"schema_version": 1, "task_id": dispatch["task_id"], "dispatch_id": di
           "role": "antigravity", "attempt": dispatch["attempt"], "status": "DONE",
           "summary": "Fixture review", "basis": ["Fixture only"], "suggestions": ["Check persistence"],
           "next_action": "Finalize plan", "data": {}}
+if dispatch["kind"] == "VERIFY":
+    report.update(status="PASS", suggestions=[], next_action="Finish step",
+                  data={"version": dispatch["version"], "checks": [
+                      {"criterion": criterion, "status": "PASS", "evidence": ["Fixture inspection"]}
+                      for criterion in dispatch["payload"]["step"]["acceptance"]], "findings": []})
+if mode == "mutate":
+    Path("tracked.txt").write_text("changed during verification", encoding="utf-8")
 print(json.dumps({"event": "init", "conversation_id": session}))
 result = {"event": "result", "result": {"conversation_id": session if mode != "mismatch" else "wrong",
           "status": "SUCCESS" if mode != "waiting" else "WAITING",

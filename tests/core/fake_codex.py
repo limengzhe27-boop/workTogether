@@ -27,6 +27,9 @@ report = {"schema_version": 1, "task_id": dispatch["task_id"], "dispatch_id": di
 if dispatch["kind"] == "CHAT":
     report["data"] = {}
     report["summary"] = "Fixture reply: " + dispatch["payload"]["message"]
+if dispatch["kind"] in ("CODE", "FIX"):
+    report["data"] = {"version": "fixture-" + dispatch["id"],
+                      "changes": ["Fixture only"], "known_limits": []}
 if mode == "invalid":
     report = {}
 Path(args[args.index("-o") + 1]).write_text(json.dumps(report))

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from .core import CollabError, encode, require, uid
+from .workspace import fingerprint
 
 
 class Runtime:
@@ -203,11 +204,30 @@ class Runtime:
         run, d = self._reserve(task, dispatch_id, timeout)
         return self.execute_reserved(run, d)
 
+    def _handoff_fingerprint(self, dispatch):
+        if dispatch["kind"] != "VERIFY" or dispatch["payload"]["step"].get("work_kind", "code") == "analysis":
+            return None
+        handoff = dispatch["payload"]["step"].get("handoff") or {}
+        with self.engine.transaction() as db:
+            row = db.execute("SELECT body FROM runs WHERE dispatch_id=?", (handoff.get("dispatch_id"),)).fetchone()
+        if row is None:
+            return None  # Manual or older handoff: no recorded workspace digest.
+        return json.loads(row["body"]).get("workspace_fingerprint")
+
+    def _check_handoff_workspace(self, run, expected):
+        if expected is not None:
+            current = fingerprint(run["cwd"], self.engine.path)
+            require(current == expected,
+                    "Project files changed since the code handoff; do not verify a different working tree",
+                    "WORKSPACE_CHANGED")
+
     def execute_reserved(self, run, d):
         task, dispatch_id = run["task_id"], run["dispatch_id"]
         root = Path(run["artifact_dir"])
         process = None
         try:
+            expected_workspace = self._handoff_fingerprint(d)
+            self._check_handoff_workspace(run, expected_workspace)
             root.mkdir(parents=True, exist_ok=False)
             prompt = self._prompt(d)
             (root / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -231,6 +251,9 @@ class Runtime:
                 except subprocess.TimeoutExpired:
                     self._stop(process)
                     raise CollabError("RUN_TIMEOUT", "Provider exceeded timeout; process group terminated")
+            if process.returncode == 0 and d["kind"] in ("CODE", "FIX"):
+                run["workspace_fingerprint"] = fingerprint(run["cwd"], self.engine.path)
+            self._check_handoff_workspace(run, expected_workspace)
             run.update(status="EXITED", exit_code=process.returncode)
             with self.engine.transaction() as db:
                 self._save(db, run)
@@ -274,7 +297,9 @@ class Runtime:
                 for step in t["steps"]:
                     if step["id"] == d["step_id"]:
                         step["status"] = "BLOCKED"
-                t["block_reason"] = "PERMISSION_DENIED" if run.get("error_code") == "PERMISSION_DENIED" else "PROVIDER_FAILED"
+                t["block_reason"] = (run["error_code"] if run.get("error_code") in
+                                     ("PERMISSION_DENIED", "WORKSPACE_CHANGED", "WORKSPACE_UNAVAILABLE")
+                                     else "PROVIDER_FAILED")
                 self.engine._status(t)
                 self.engine._save(db, t, "RUN_FAILED", {"run_id": run["id"], "error": run["error"], "error_code": run.get("error_code")})
 
@@ -298,6 +323,11 @@ class Runtime:
                 db.execute("INSERT OR IGNORE INTO sessions VALUES(?,?,?,?)", (run["task_id"], self.role, self.provider, session))
                 run["session_id"] = session
                 self._save(db, run)
+            with self.engine.transaction() as db:
+                task = self.engine._task(db, run["task_id"])
+                dispatch = self.engine._get_dispatch(task, run["dispatch_id"])
+            if dispatch["report"] is None:
+                self._check_handoff_workspace(run, self._handoff_fingerprint(dispatch))
             # If the host crashes after submit, collecting again performs an idempotent
             # report replay, then marks this run complete.
             self.engine.submit(run["task_id"], report)
