@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import threading
 from pathlib import Path
 from unittest.mock import patch
 from worktogether.core import Engine, CollabError
@@ -115,3 +116,37 @@ class ChatTests(unittest.TestCase):
         self.assertEqual("antigravity", retried["role"])
         self.a.run(self.t, retried["id"])
         self.assertEqual("DELIVERED", self.e.messages(self.t)[0]["status"])
+
+    def test_background_tasks_overlap_without_duplicate_workers(self):
+        other_dir = Path(self.tmp.name) / "other-project"
+        other_dir.mkdir()
+        p = self.e.project_add("independent", str(other_dir))
+        other = self.e.task_add(p["id"], "other", "independent")["id"]
+        self.e.message_add(self.t, "one", "codex", "Discuss")
+        self.e.message_add(other, "two", "codex", "Discuss independently")
+        barrier = threading.Barrier(3)
+        release = threading.Event()
+        runtime = self.c
+
+        class HeldProvider:
+            def run(inner, task_id, dispatch_id, timeout):
+                barrier.wait(timeout=5)
+                if not release.wait(5):
+                    raise TimeoutError("Fixture never released")
+                return runtime.run(task_id, dispatch_id, timeout)
+
+        self.q.providers["codex"] = HeldProvider()
+        self.assertEqual(2, self.q.background_once())
+        try:
+            barrier.wait(timeout=5)
+            self.assertEqual(0, self.q.background_once())
+        finally:
+            release.set()
+            for worker in self.q._workers.values():
+                worker.join(timeout=5)
+        self.assertEqual("DELIVERED", self.e.messages(self.t)[0]["status"])
+        self.assertEqual("DELIVERED", self.e.messages(other)[0]["status"])
+        self.assertEqual(1, len(runtime.list(self.t)["runs"]))
+        self.assertEqual(1, len(runtime.list(other)["runs"]))
+        self.q.stopped.set()
+        self.assertEqual(0, self.q.background_once())

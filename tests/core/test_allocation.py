@@ -95,3 +95,18 @@ class TeamEngineTests(unittest.TestCase):
         with self.assertRaises(CollabError):
             self.plan([step(assignee="thinker")])
         self.assertEqual("PLAN_FINALIZE", self.engine.show(self.task)["phase"])
+
+    def test_api_only_team_fails_before_spending_on_discussion(self):
+        self.registry.register(dict(id="thinker-two", name="Thinker 2", type="openai_compat",
+                                    endpoint="http://127.0.0.1:1234/v1", model="test"))
+        with self.assertRaises(CollabError):
+            self.engine.configure_team(self.task, ["thinker", "thinker-two"])
+        self.assertEqual([], self.engine.show(self.task)["dispatches"])
+
+    def test_disabled_builtin_does_not_run_in_legacy_mode(self):
+        self.registry.set_enabled("codex", False)
+        self.assertEqual("AGENT_UNAVAILABLE", self.engine.dispatch(self.task)["reason"])
+        self.registry.set_enabled("codex", True)
+        self.assertEqual("codex", self.engine.dispatch(self.task)["dispatch"]["role"])
+        with self.assertRaises(CollabError):
+            self.registry.set_enabled("codex", False)

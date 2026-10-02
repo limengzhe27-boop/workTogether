@@ -133,14 +133,18 @@ class AgentRegistry:
     def _ensure_not_in_flight(db, agent_id):
         for row in db.execute("SELECT body FROM messages"):
             message = json.loads(row[0])
-            if message["status"] in ("QUEUED", "RUNNING") and agent_id in message.get("participants", []):
+            participants = message.get("participants") or (["codex", "antigravity"]
+                           if message["recipient"] in ("both", "all") else [message["recipient"]])
+            if message["status"] in ("QUEUED", "RUNNING") and agent_id in participants:
                 raise CollabError("INVALID_STATE", "Agent has an unfinished conversation")
         for row in db.execute("SELECT body FROM tasks"):
             task = json.loads(row[0])
             if task["phase"] == "EXECUTING" and any(
-                    agent_id in (step.get("assignee"), step.get("verifier")) and step["status"] != "COMPLETED"
+                    agent_id in (step.get("assignee", "codex"), step.get("verifier", "antigravity")) and step["status"] != "COMPLETED"
                     for step in task["steps"]):
                 raise CollabError("INVALID_STATE", "Agent owns unfinished work")
+            if any(d["role"] == agent_id and d["status"] in ("ACTIVE", "BLOCKED") for d in task["dispatches"]):
+                raise CollabError("INVALID_STATE", "Agent has an unresolved dispatch")
             if task.get("team") and task["status"] != "COMPLETED" and agent_id in task["team"]["members"]:
                 raise CollabError("INVALID_STATE", "Agent belongs to an unfinished team task")
 
@@ -185,8 +189,10 @@ class AgentRegistry:
         with self.engine.transaction() as db:
             row = db.execute("SELECT body FROM agents WHERE id=?", (agent_id,)).fetchone()
             require(row is not None, "Unknown agent", "NOT_FOUND")
-            self._ensure_not_in_flight(db, agent_id)
             data = json.loads(row[0])
+            if data.get("enabled", True) == enabled:
+                return AgentConfig(data).to_dict()
+            self._ensure_not_in_flight(db, agent_id)
             data["enabled"] = enabled
             db.execute("UPDATE agents SET body=? WHERE id=?", (json.dumps(data, ensure_ascii=False), agent_id))
         return AgentConfig(data).to_dict()

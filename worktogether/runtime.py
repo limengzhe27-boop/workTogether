@@ -169,6 +169,8 @@ class Runtime:
                 "is code or analysis; optional assignee names a ready capable agent from "
                 "payload.available_agents. Code requires the code capability; do not fix roles by brand. "
                 "Optional verifier must be a different agent with verify capability. "
+                "When executable_work_kinds is supplied, use only those work kinds. If the "
+                "requirement needs an unavailable kind, report BLOCKED rather than pretend analysis is implementation. "
                 "Include assignment_reason for nominations, using relevant peer proposals as evidence. "
                 "Analysis is read-only. Include specific, testable acceptance criteria. "
                 "Do not begin implementation; user approval is required after finalization."

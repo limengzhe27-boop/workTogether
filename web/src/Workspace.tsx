@@ -548,6 +548,12 @@ export function Workspace() {
                         if (!next.dispatch && next.reason === 'PROJECT_WORKSPACE_BUSY') {
                           throw new Error('同一项目还有开发或验收项未处理；请先完成、重试或修订那个任务。');
                         }
+                        if (!next.dispatch && next.reason === 'AGENT_UNAVAILABLE') {
+                          throw new Error('当前负责人已停用或未就绪，请检查 Agent 配置。');
+                        }
+                        if (!next.dispatch && next.reason === 'TEAM_ROUND_REQUIRED') {
+                          throw new Error('需要先完成团队意见或认领轮，请使用“团队讨论与认领”。');
+                        }
                       })}>
                       手动派发下一项（不调用模型）
                     </button>
@@ -679,6 +685,7 @@ export function Workspace() {
                             TASK_NOT_ACTIVE: '任务已暂停或需要处理。',
                             EXISTING_DISPATCH: '已有派发需要检查。',
                             PROJECT_WORKSPACE_BUSY: '同一项目有开发或验收项尚未处理。',
+                            AGENT_UNAVAILABLE: '当前负责人已停用或未就绪。',
                             APPROVAL_REQUIRED: '请重新批准方案。',
                             PROVIDER_FAILED: '模型运行失败，没有自动重试。',
                           } as Record<string, string>)[j.result?.reason || ''] ||

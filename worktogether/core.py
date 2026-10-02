@@ -232,6 +232,11 @@ class Engine:
             agents = {a.id: a for a in (AgentConfig(json.loads(row[0])) for row in db.execute("SELECT body FROM agents"))}
             require(all(key in agents and agents[key].ready for key in members),
                     "Team contains an unavailable agent", "INVALID_INPUT")
+            executable_kinds = [kind for kind in ("code", "analysis")
+                                if any(kind in agents[owner].roles and any(
+                                    checker != owner and "verify" in agents[checker].roles for checker in members)
+                                    for owner in members)]
+            require(bool(executable_kinds), "Team needs a capable worker and an independent verifier", "INVALID_INPUT")
             planners = sorted(key for key in members if "plan" in agents[key].roles)
             require(bool(planners), "Team needs a planning-capable agent", "INVALID_INPUT")
             coordinator = coordinator or planners[0]
@@ -482,13 +487,19 @@ class Engine:
                         candidates.append(("FIX", s))
                     elif s["status"] == "PENDING" and set(s["depends_on"]) <= complete:
                         candidates.append(("ANALYZE" if s.get("work_kind", "code") == "analysis" else "CODE", s))
-            workspace_busy = False
+            workspace_busy, unavailable = False, False
             for kind, step in candidates:
                 role = (step.get("assignee") if step and kind in ("CODE", "FIX", "ANALYZE") else
                         step.get("verifier") if step and kind == "VERIFY" else
                         t["team"]["reviewer" if kind == "PLAN_REVIEW" else "coordinator"]
                         if t.get("team") and kind in ("PLAN", "PLAN_REVIEW", "PLAN_FINALIZE") else None
                         ) or ("antigravity" if kind in ("PLAN_REVIEW", "VERIFY") else "codex")
+                agent_row = db.execute("SELECT body FROM agents WHERE id=?", (role,)).fetchone()
+                if agent_row:
+                    from .agents import AgentConfig
+                    if not AgentConfig(json.loads(agent_row[0])).ready:
+                        unavailable = True
+                        continue
                 if self._workspace_busy(db, t, kind):
                     workspace_busy = True
                     continue
@@ -515,9 +526,15 @@ class Engine:
                         {"id": a.id, "roles": a.roles}
                         for a in (AgentConfig(json.loads(r[0])) for r in db.execute("SELECT body FROM agents ORDER BY rowid"))
                         if a.ready and (not t.get("team") or a.id in t["team"]["members"])]
+                    if t.get("team"):
+                        available = d["payload"]["available_agents"]
+                        d["payload"]["executable_work_kinds"] = [work for work in ("code", "analysis")
+                            if any(work in a["roles"] and any(b["id"] != a["id"] and "verify" in b["roles"]
+                                   for b in available) for a in available)]
                 self._save(db, t, "DISPATCHED", {"dispatch_id": d["id"], "kind": kind})
                 return {"dispatch": d}
-            return {"dispatch": None, "reason": "PROJECT_WORKSPACE_BUSY" if workspace_busy else "NO_ELIGIBLE_STEP"}
+            return {"dispatch": None, "reason": "PROJECT_WORKSPACE_BUSY" if workspace_busy else
+                    "AGENT_UNAVAILABLE" if unavailable else "NO_ELIGIBLE_STEP"}
 
     def agents_list(self, enabled_only=False):
         from .agents import AgentRegistry
