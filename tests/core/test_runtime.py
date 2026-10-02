@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +92,28 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(CollabError):
             self.r.run(self.t, self.d["id"])
         self.assertEqual([], self.r.list(self.t)["runs"])
+
+    def test_prompts_use_task_specific_contract_without_entire_public_document(self):
+        required = {
+            "PLAN": ("1-100 steps", "acceptance", "user approval"),
+            "PLAN_REVIEW": ("at most 3", "data={}"),
+            "PLAN_FINALIZE": ("payload.plan_review", "User approval"),
+            "CODE": ("known_limits", "exact delivered version"),
+            "FIX": ("dispatch.version", "prior verification findings"),
+            "VERIFY": ("criterion copied verbatim", "reproduction", "partial PASS"),
+        }
+        for kind, phrases in required.items():
+            with self.subTest(kind=kind):
+                dispatch = dict(self.d, kind=kind)
+                prompt = self.r._prompt(dispatch)
+                self.assertEqual(dispatch, json.loads(prompt.split("DISPATCH:\n", 1)[1]))
+                self.assertIn("dispatch_id=dispatch.id", prompt)
+                self.assertIn("status=BLOCKED", prompt)
+                self.assertIn("Never invent", prompt)
+                for phrase in phrases:
+                    self.assertIn(phrase, prompt)
+                self.assertNotIn("## Public CLI", prompt)
+                self.assertLess(len(prompt.encode("utf-8")), 3500)
 
 
 if __name__ == "__main__":
