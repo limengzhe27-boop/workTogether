@@ -2,6 +2,8 @@ import React, { useEffect, useRef, useState } from 'react';
 import { api, request } from './api';
 import { TaskChat } from './TaskChat';
 import { Dialog } from './Dialog';
+import { ProjectNavigation } from './ProjectNavigation';
+import { Home, Folder, PanelLeft, PanelRight, Users, Search, Settings2, ClipboardList, MessageSquare } from 'lucide-react';
 import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentProbeResult, ReportEnvelope } from './types';
 
 type Detail = TaskDetail & { revision?: number; team?: { members: string[]; coordinator: string; reviewer: string } };
@@ -65,6 +67,9 @@ export function Workspace() {
   const [busy, setBusy] = useState(false);
   const [tick, setTick] = useState(0);
   const [navigation, setNavigation] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [searchText, setSearchText] = useState('');
   const [tab, setTab] = useState('progress');
   const [dialog, setDialog] = useState<'' | 'team' | 'plan' | 'authorize' | 'discuss' | 'execute'>('');
   const [composerRequest, setComposerRequest] = useState(0);
@@ -84,7 +89,11 @@ export function Workspace() {
     const sidebar = document.querySelector<HTMLElement>('.sidebar')!;
     const main = document.querySelector<HTMLElement>('main')!;
     const trigger = document.activeElement as HTMLElement | null;
+    const chrome = document.querySelector<HTMLElement>('.windowbar');
+    const rail = document.querySelector<HTMLElement>('.tool-rail');
     main.setAttribute('inert', '');
+    chrome?.setAttribute('inert', '');
+    rail?.setAttribute('inert', '');
     const controls = () => Array.from(sidebar.querySelectorAll<HTMLElement>('button:not(:disabled),select:not(:disabled)'))
       .filter(el => el.getClientRects().length > 0);
     controls()[0]?.focus();
@@ -101,6 +110,8 @@ export function Workspace() {
     query.addEventListener('change', resized);
     return () => {
       main.removeAttribute('inert');
+      chrome?.removeAttribute('inert');
+      rail?.removeAttribute('inert');
       document.removeEventListener('keydown', keys);
       query.removeEventListener('change', resized);
       trigger?.focus();
@@ -238,6 +249,7 @@ export function Workspace() {
     setHandoffText('');
     setReportText('');
     setNavigation(false);
+    setSearching(false);
     setTab('progress');
     setDialog('');
     setChatPending(false);
@@ -380,44 +392,48 @@ export function Workspace() {
     chatPending ? '正在处理消息' : task?.phase === 'EXECUTING' && !approval?.approved ? '方案待你确认' :
     task ? label(task.phase) : '';
 
+  function toggleNavigation() {
+    if (window.matchMedia('(max-width: 959px)').matches) setNavigation(open => !open);
+    else setSidebarCollapsed(collapsed => !collapsed);
+  }
+
+  function openSearch() { setSearchText(''); setNavigation(false); setSearching(true); }
+
   return (
-    <div className="workspace">
+    <div className={'workspace ' + (sidebarCollapsed ? 'sidebar-collapsed' : '')}>
+      <header className="windowbar">
+        <div className="window-leading">
+          <span className="window-logo" aria-hidden="true">W</span>
+          <button className="icon-button sidebar-toggle" onClick={toggleNavigation}
+            aria-label="切换项目侧栏" title="展开／收起项目侧栏"><PanelLeft /></button>
+          <span className="window-caption">本地工作区</span>
+        </div>
+        <div className="window-title"><Folder aria-hidden="true" /><h1 title={task?.title || currentProject?.name}>
+          {task?.title || (taskId ? '正在加载…' : currentProject?.name || 'WorkTogether')}
+        </h1></div>
+        <div className="window-actions">
+          {task && <button className="icon-button team-button" onClick={() => setDialog('team')} aria-label="任务团队" title={'任务团队 · ' + (members.length || agents.filter(a => a.ready).length) + ' 位成员'}><Users /></button>}
+          {task?.draft_plan && <button className="icon-button" onClick={() => setDialog('plan')} aria-label="查看方案" title="查看方案"><ClipboardList /></button>}
+          <button className="icon-button" disabled={!task} aria-label={tab === 'details' ? '返回对话' : '任务详情'}
+            title={tab === 'details' ? '返回对话' : '任务详情'} aria-pressed={tab === 'details'}
+            onClick={() => setTab(tab === 'details' ? 'progress' : 'details')}>{tab === 'details' ? <MessageSquare /> : <PanelRight />}</button>
+        </div>
+      </header>
+      <nav className="tool-rail" aria-label="工作区工具">
+        <button className="icon-button" disabled={!project || busy} onClick={newTask} aria-label="新任务首页" title="新任务首页" aria-current={!taskId ? 'page' : undefined}><Home /></button>
+        <button className="icon-button" onClick={toggleNavigation} aria-label="项目导航" title="项目导航"><Folder /></button>
+        <button className="icon-button" onClick={openSearch} aria-label="搜索任务" title="搜索任务"><Search /></button>
+        <button className="icon-button" onClick={() => { setNavigation(false); setManagingAgents(true); }} aria-label="Agent 设置" title="Agent 设置"><Users /></button>
+        <div className="rail-bottom"><button className="icon-button" onClick={() => setManagingAgents(true)} aria-label="管理工作区 Agent" title="管理 Agent"><Settings2 /></button><span className="rail-mark" title="WorkTogether 本地工作区">W</span></div>
+      </nav>
       {navigation && <button className="nav-scrim" tabIndex={-1} aria-label="关闭项目导航" onClick={() => setNavigation(false)} />}
       <aside className={'sidebar ' + (navigation ? 'visible' : '')} aria-label="项目与任务">
-        <button className="mobile-nav nav-close" onClick={() => setNavigation(false)}>关闭导航</button>
-        <div className="brand"><span className="brand-mark">w.</span>WorkTogether</div>
-        <label className="small" htmlFor="project">当前项目</label>
-        <select id="project" value={project} disabled={busy} onChange={e => { setProject(e.target.value); setTasks([]); choose(''); }}>
-          <option value="" disabled>选择项目</option>
-          {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-        </select>
-        <button className="new-task" disabled={!project || busy} onClick={newTask}>＋ 新建任务</button>
-        <p className="small section-label">最近任务 <span>{tasks.length}</span></p>
-        <nav aria-label="最近任务">
-          {tasks.map(t => <button key={t.id} disabled={busy} aria-current={t.id === taskId ? 'page' : undefined}
-            className="task-link" onClick={() => choose(t.id)}>
-            <span>{t.title}</span><small>{label(t.status)}</small>
-          </button>)}
-          {!tasks.length && <p className="small empty-nav">还没有任务，从一个想法开始。</p>}
-        </nav>
-        <div className="sidebar-bottom">
-          <button disabled={busy} onClick={() => { setAdding(true); setNavigation(false); }}>添加项目</button>
-          <button disabled={busy} onClick={() => { setManagingAgents(true); setNavigation(false); }}>Agent 设置</button>
-          <p className="small">本地工作区 · 项目独立</p>
-        </div>
+        <ProjectNavigation projects={projects} project={project} tasks={tasks} taskId={taskId} busy={busy}
+          onProject={id => { setProject(id); setTasks([]); choose(''); }} onTask={choose} onNew={newTask}
+          onAdd={() => { setNavigation(false); setAdding(true); }} onSearch={openSearch} onClose={() => setNavigation(false)}
+          onSettings={() => { setNavigation(false); setManagingAgents(true); }} />
       </aside>
-      <main className="main">
-        <header className="topbar">
-          <button className="mobile-nav" aria-expanded={navigation} onClick={() => setNavigation(!navigation)}>项目</button>
-          <div className="heading-copy">
-            <p className="small">{currentProject?.name || '工作区'}</p>
-            <h1 title={task?.title}>{task?.title || (taskId ? '正在加载…' : '新任务')}</h1>
-          </div>
-          {task && <button className="team-button" onClick={() => setDialog('team')}>
-            团队{members.length > 0 ? ' · ' + members.length : ''}
-          </button>}
-          {!task && <button onClick={() => setManagingAgents(true)}>Agent 设置</button>}
-        </header>
+      <main className="main" aria-label="工作对话">
         {error && <div className="global-error error" role="alert">{error}<button onClick={() => setError('')}>关闭提示</button></div>}
         {!taskId ? <div className="home-scroll"><div className="reading page-enter">
               <section className="home">
@@ -507,16 +523,11 @@ export function Workspace() {
               <button onClick={() => setTab('details')}>查看并处理</button>
             </div>}
             {task.status === 'PAUSED' && <p className="inline-notice">已暂停后续派发；正在运行的模型仍会完成并保留结果。</p>}
-            <div className="view-tabs" aria-label="任务视图">
-              <button aria-pressed={tab === 'progress'} onClick={() => setTab('progress')}>对话</button>
-              <button aria-pressed={tab === 'details'} onClick={() => setTab('details')}>详情</button>
-              {task.draft_plan && <button className="plan-link" onClick={() => setDialog('plan')}>查看方案</button>}
-            </div>
             <div className="conversation-panel" hidden={tab !== 'progress'}>
               <TaskChat key={taskId} taskId={taskId}
                 agents={task.team ? agents.filter(a => members.includes(a.id)) : agents}
                 completed={task.status === 'COMPLETED'} onPending={setChatPending}
-                onDetails={() => setTab('details')} visible={tab === 'progress'}>
+                onDetails={() => setTab('details')} onTeam={() => setDialog('team')} visible={tab === 'progress'}>
                 <details className="task-brief"><summary>任务需求 <span className="small">版本 {task.revision || 1}</span></summary>
                   <p className="prose">{task.requirement}</p>
                 </details>
@@ -927,6 +938,14 @@ export function Workspace() {
           setDialog('');
         })}>{dialog === 'authorize' ? '确认授权并执行' : '确认开始'}</button>
         <button onClick={() => setDialog('')}>取消</button></div>
+      </Dialog>}
+      {searching && <Dialog title="搜索当前项目任务" initialFocus=".search-field input" onClose={() => setSearching(false)}>
+        <label className="search-field"><Search aria-hidden="true" /><input autoFocus aria-label="搜索任务标题" placeholder="输入任务名称…" value={searchText} onChange={e => setSearchText(e.target.value)} /></label>
+        <p className="small">{currentProject?.name || '未选择项目'} · 仅搜索当前项目</p>
+        <div className="search-results">{tasks.filter(t => t.title.toLocaleLowerCase().includes(searchText.trim().toLocaleLowerCase())).map(t =>
+          <button key={t.id} disabled={busy} onClick={() => choose(t.id)}><MessageSquare /><span>{t.title}</span><small>{label(t.status)}</small></button>
+        )}</div>
+        {!tasks.some(t => t.title.toLocaleLowerCase().includes(searchText.trim().toLocaleLowerCase())) && <p className="empty">没有匹配的任务。</p>}
       </Dialog>}
       {managingAgents && <Dialog title="Agent 设置" onClose={() => setManagingAgents(false)}>
         {error && <p className="error" role="alert">{error}</p>}

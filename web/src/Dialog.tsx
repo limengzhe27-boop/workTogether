@@ -1,8 +1,8 @@
 import React, { useEffect, useId, useRef } from 'react';
 
 /** Native modal owns focus containment and Escape; return focus on unmount. */
-export function Dialog({ title, onClose, children }: {
-  title: string; onClose: () => void; children: React.ReactNode;
+export function Dialog({ title, onClose, children, initialFocus }: {
+  title: string; onClose: () => void; children: React.ReactNode; initialFocus?: string;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
@@ -10,6 +10,7 @@ export function Dialog({ title, onClose, children }: {
     const dialog = ref.current!;
     const trigger = document.activeElement as HTMLElement | null;
     dialog.showModal();
+    if (initialFocus) dialog.querySelector<HTMLElement>(initialFocus)?.focus();
     return () => { dialog.close(); trigger?.focus(); };
   }, []);
   return <dialog ref={ref} className="modal-card" aria-labelledby={titleId}

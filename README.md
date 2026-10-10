@@ -53,7 +53,9 @@ python3 -m worktogether web --port 8765 --db .collab/state.sqlite3
 
 ### Web 工作台特性
 
-- 浅色双栏、对话优先：左侧选项目和任务，右侧查看对话，输入区固定在面板底部；窄屏使用可关闭的项目抽屉。切换“对话／详情”保留消息草稿，⌘/Ctrl + Enter 可发送。
+- 参照 Codex 工作界面的深色布局：顶部工作栏、窄工具栏、项目任务树、宽对话区；蓝色用户气泡和底部大圆角输入框。保留 WorkTogether 品牌和原协作功能，不复制无功能的语音、上传或系统窗控。
+- 项目侧栏可收起，任务支持当前项目内搜索；窄屏使用项目抽屉，并保留 Agent 设置入口。右上角“任务详情”切换视图时保留消息草稿，⌘/Ctrl + Enter 可发送。
+- Agent 回复支持 Markdown 标题、列表、链接、代码块和复制；不执行原始 HTML、不自动加载回复中的远程图片。输入框的“＋”打开任务团队，成员选择用于决定消息接收者，不冒充模型切换。
 - 顶部只显示当前阶段操作：“讨论方案”→“审阅方案”→“开始执行”。普通消息只交流，不自动授权开发；模型调用前的确认保留调用上限与额度说明。
 - “详情”集中放置手动交接、修改需求、暂停、连续执行授权、重试恢复、历史报告与日志；“Agent 设置”管理接入，高级 API 注册默认收起。当前阻塞仍有醒目处理入口。设计见 [DESIGN.md](DESIGN.md)。
 - 多项目和任务列表、任务内有限轮对话、规划、方案批准、后台自动执行以及状态轮询。
@@ -112,13 +114,15 @@ python3 -m worktogether doctor --project PROJECT_ID
 
 ## 前端开发（可选）
 
-工作台内置零依赖静态包（位于 `worktogether/static/`）。若需基于 TypeScript / React 源码调试前端：
+工作台内置预构建静态包（位于 `worktogether/static/`，使用时无需安装 Node 依赖）。若需基于 TypeScript / React 源码调试前端：
 
 ```bash
 cd web
 npm install
 npm run dev
 ```
+
+前端渲染与安全回归运行 `npm test`；发布前运行 `npm run build`，并一起提交更新的 `worktogether/static/`。本次 Codex 截图对齐的验证范围见 [界面验收记录](qa/ui-simplification/codex-reference.md)。
 
 ## 开发交接与文档
 

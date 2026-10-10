@@ -1,71 +1,118 @@
-# WorkTogether 界面设计规范
-版本 2 · 2026-10-10 · 已获用户确认：浅色极简两栏、对话优先、底部输入、L1 轻动效。
+# WorkTogether · Codex 工作界面参考规范
 
-本次仅重排前端，不改变调度权限、Agent 配置或任务数据。旧版架构记录见 [design-legacy-v1.md](docs/design-legacy-v1.md)，接口以当前后端为准。
+版本 3 · 2026-10-10。用户明确要求尽量对齐 Codex，随后提供完整深色截图并要求据此修改；该截图是本轮视觉基准，替代 v2 浅色方向。保留先前确认的 L1 轻动效。
+
+参考优先级：用户截图 > [官方项目与对话导航示意](https://learn.chatgpt.com/docs/features) > 旧界面。截图约 2040×1540 像素，按桌面逻辑尺寸解释比例，不把高分辨率截图的像素当作 CSS 字号。截图不纳入公开仓库。旧后端架构记录见 [design-legacy-v1.md](docs/design-legacy-v1.md)。
 
 ## 1. Visual Theme & Atmosphere
-Minimal Pure：白色主区、浅灰导航、克制蓝色。让用户专注讨论和下一步，不是面对监控大屏。项目、任务、对话三层导航；技术信息按需展开。无渐变、文字阴影、装饰图片、彩虹标签或假在线状态。
+
+Codex-style dark workspace：石墨黑、平面层级、宽阅读区、弱分隔线、项目树、底部大圆角输入。结构分为四块：顶部工作栏、左侧窄工具轨、项目/任务栏、主对话区。主内容不是卡片仪表盘。
+保留 WorkTogether 品牌；不冒充官方产品。不复制 macOS 红黄绿窗控、虚构通知、账号身份、语音按钮、宠物或未接入的文件上传。所有显示的操作均有真实功能。
 
 ## 2. Color Palette & Roles
-统一 CSS 变量：
-- --bg: #f7f8fa；--surface: #ffffff；--surface-alt: #f2f4f7；--surface-hover: #e8edf4。
-- --text: #202630；--secondary: #505b6b；--muted: #606d7e。
-- --border: #e5e8ed；--border-hover: #9aa7b8。
-- --accent: #245fc7；--accent-hover: #194b9e；--on-accent: #ffffff。
-- --error: #b02e38；--error-bg: #fff7f7。
-- --shadow-rgb: 32,38,48；--accent-rgb: 36,95,199。
 
-红色用于当前错误；历史失败收进详情，不宣称仍在失败。未配置或禁用的成员不伪装在线。
+以截图视觉采样估值为准，并非从 Codex 私有代码获取：
+```css
+:root {
+  color-scheme: dark;
+  --bg: #181818; --surface: #202020; --surface-alt: #303030;
+  --surface-hover: #383838; --rail: #252727; --chrome: #262f36;
+  --composer: #353535; --border: #333333; --border-hover: #626262;
+  --text: #ededed; --secondary: #cccccc; --muted: #a2a2a2;
+  --accent: #3072d2; --accent-hover: #3375d5; --on-accent: #ffffff;
+  --user-bubble: #1b4079; --on-user: #eef4ff;
+  --error: #ffb4b4; --error-bg: #382526;
+  --shadow-rgb: 0,0,0; --accent-rgb: 48,114,210; --bg-rgb: 24,24,24;
+}
+```
+蓝色主要用于用户气泡与发送按钮。选中任务使用灰色底而非蓝色描边。历史失败不涂满首屏，当前阻塞保留高对比入口。注册表中的用户自选颜色属于数据，不作为页面主题色。
 
 ## 3. Typography Rules
-中文优先字体栈：'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif。
-样式引用 https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap；离线回退本机字体，display=swap 避免文字等待。
-正文 15px / 1.75，字距 .02em；元数据 13px / 1.7；任务标题 18px / 1.5；首页标题 28px / 1.5。字重只用 400、500、600。正文不截断，代码可独立滚动；标题单行截断并提供完整 title。
+
+中文优先字体栈：'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif。字体引用：
+```css
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap');
+```
+离线使用本机回退。正文 16px / 1.8；侧栏与控件 15px / 1.7；辅助标签 12–13px；顶部标题 16px / 1.5；首页标题 28px。字距 .02em，字重 400/500/600，代码采用 SFMono-Regular/Consolas。
+H1/H2/H3 均无渐变、无投影；正文按 Markdown 显示真实加粗、列表、链接和代码。忽略原始 HTML，不自动加载远程图片。禁止全大写装饰标签、伪造时间和截图正文占位。
 
 ## 4. Component Stylings
-- 按钮：44px 最小点击高度、8px 圆角、默认白底细边；hover 浅灰、active 更深灰；主按钮蓝底，hover 深蓝；disabled 降透明度并禁止点击。
-- 焦点：focus-visible 2px 蓝色轮廓 + 3px 间隔；选中使用 aria-current 或 aria-pressed，不只靠颜色。
-- 输入：白底细边，聚焦蓝边；聊天固定 2–4 行高度，发送失败保留草稿。
-- 消息：用户浅灰气泡，Agent 开放式正文和中性首字头像，不重复多层卡片。
-- 详情：原生 details/summary，键盘可展开，明确标题。
-- 弹窗：原生 dialog 管理焦点锁定、Escape 与焦点返回；取消与有成本授权明确区分。
-- 图标：无需新图标依赖；文字与首字头像已能表达，避免无意义装饰。
+
+```css
+button { min-height:44px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--text); }
+button:hover { background:var(--surface-hover); }
+button:active { background:var(--surface-alt); }
+button:disabled { opacity:.45; cursor:not-allowed; }
+:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+.icon-button { width:44px; padding:10px; border-color:transparent; background:transparent; display:inline-flex; align-items:center; justify-content:center; }
+.task-link { background:transparent; border-color:transparent; border-radius:10px; }
+.task-link[aria-current=page] { background:var(--surface-alt); }
+.user-message { width:fit-content; max-width:84%; margin-left:auto; background:var(--user-bubble); color:var(--on-user); border-radius:22px; padding:12px 18px; }
+.chat-composer { background:var(--composer); border:1px solid var(--border); border-radius:24px; padding:14px; }
+.chat-composer:focus-within { border-color:var(--border-hover); }
+.send-button { background:var(--accent); border-radius:50%; }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:12px; }
+.card:hover { border-color:var(--border-hover); }
+a { color:var(--secondary); text-decoration:underline; text-underline-offset:3px; }
+a:hover { color:var(--text); }
+.badge { background:var(--surface-alt); color:var(--secondary); border-radius:6px; }
+```
+图标统一 lucide-react 20–22px，描边 1.7；不混用 Emoji。Agent 回复无独立气泡、没有彩色左边线，身份小标题和细线分隔，底部可复制正文。
+弹窗使用原生 dialog（焦点锁定、Escape、焦点归还）；设置、团队、任务搜索复用相同暗色规范。折叠使用原生 details/summary。
 
 ## 5. Layout Principles
-桌面 232px 左导航 + 剩余宽主区，移除第三栏。主区紧凑标题、一行真实进度和阶段操作，然后进入对话。
-对话正文单独滚动；输入区位于面板底部，用 flex 布局，不覆盖消息。内容最大宽 880px、横向留白 28px。
-默认「对话」，「详情」保留任务修改、授权连续执行、手动派发、报告交接、阻塞重试、恢复、历史记录、用量及日志。切换不卸载聊天，不丢草稿。
-首页只展示需求输入和默认不勾选的连续执行授权；Agent 管理集中在设置。
+
+桌面网格：54px 工具轨 + 246px 项目栏 + minmax(0,1fr) 对话；48px 顶部工作栏横跨全宽。对话区尽量用满剩余宽度，最大内容宽 1240px，左右留白 24–32px。结构比例接近截图的约 5% 工具轨、23% 项目栏、72% 对话。
+项目为文件夹行，当前项目下缩进显示任务；左上“新任务”，搜索图标打开当前项目任务搜索。侧栏支持折叠，折叠后对话扩宽。
+主区不再保留常驻双标签栏：顶部“任务详情”图标切换详情；进度和下一步压为一条轻量栏。模型授权流程与原 API 保持不变。
+底部输入框内部：上半部多行文字，下半部“团队”入口、仅交流说明、接收成员选择、圆形发送。输入框和正文同宽、固定在 flex 面板底部，不盖住正文。
+间距梯度 4/8/12/16/24/32；用户消息与 Agent 回复间 28–36px，正文不做浮动卡片。
 
 ## 6. Depth & Elevation
-用空间与细边线划分层级。只有弹窗、移动导航、新消息提示有轻阴影。卡片 12px 圆角；弹窗 16px。不堆叠边框、阴影或背景装饰。
+
+正文和侧栏基本无阴影，通过 #181818/#202020/#303030 分层。只有弹窗和手机抽屉使用 0 16px 40px rgba(var(--shadow-rgb),.35)。不加光晕、毛玻璃或背景渐变。工作栏略带冷灰色，区别于纯灰内容区。
 
 ## 7. Animation & Interaction
-L1：按钮颜色/边框 140ms，fadeIn 180ms，无滚动揭示、弹跳、假流式打字或常驻脉冲。prefers-reduced-motion: reduce 关闭全部动画和过渡。
-普通消息用于交流，不授权开发。讨论、审阅、执行按阶段出现，启动前说明调用上限、额度与必要上下文传输。暂停只停止后续工作，不杀死在途模型。
-聊天初次加载定位底部；仅在用户靠近底部时跟随新消息。向上阅读不抢滚动。CHAT 回复只显示一次；协作报告可从详情核查。
+
+L1，CSS only，无额外动效依赖：
+```css
+button { transition:background 140ms,border-color 140ms; }
+@keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+.page-enter, dialog[open] { animation:fadeIn 180ms ease-out; }
+@media(prefers-reduced-motion:reduce) {
+  *,*::before,*::after { animation:none!important; transition:none!important; scroll-behavior:auto!important; }
+}
+```
+不做滚动 reveal、跳动、自动打字或假忙碌。消息只有初次加载、自己发送或靠近底部时跟随；向上阅读时给新动态入口。
+项目切换隔离任务；搜索只读；复制不执行代码；“仅交流”不授权开发；讨论/执行仍需原确认和预算说明。调用中不替用户关闭权限检查。
+真实时间字段存在才显示时间分隔；不添加“用时 xx 秒”假数据。
 
 ## 8. Do’s / Don’ts
+
 Do：
-1. 把对话与发送作为日常核心。
-2. 只显示真实阶段和完成步骤数。
-3. 当前阻塞给出明确处理入口。
-4. 保留批准、重试、恢复与手动交接。
-5. 保存项目隔离、任务选择和草稿。
-6. 控件有可读名称，弹窗支持键盘。
+
+1. 以截图的四区结构与深灰层级为基准。
+2. 对话作为主要工作面，保持足够阅读宽度。
+3. 左侧呈现项目与任务层级，选中行低调高亮。
+4. Agent 身份、当前阻塞、审批和额度说明保持真实。
+5. 保留草稿、项目隔离、手动交接、日志、恢复与重试。
+6. 所有图标按钮有名称、提示和键盘焦点。
 
 Don’t：
-1. 不把全部技术按钮堆在首屏。
-2. 不用历史失败代替当前状态。
-3. 不把发消息变成授权代码修改。
-4. 不默认勾选连续开发。
-5. 不自动启用或注册云端 Agent。
-6. 不制造假进度、假在线和假回复。
-7. 不扩大工具权限。
-8. 不让长对话挤走输入框。
-9. 不引入沉重 UI 或动效依赖。
-10. 不删除既有任务和后端功能。
+
+1. 不再沿用浅色商务卡片风。
+2. 不把浅色 CSS 简单反色了事。
+3. 不冒充 Codex 官方品牌或用户身份。
+4. 不造语音、宠物、文件上传、反馈投票等空按钮。
+5. 不复制截图里的私人项目或对话作为示例数据。
+6. 不把 Agent 配置就绪显示为在线/授权已就绪。
+7. 不把发送消息改为自动开发。
+8. 不自动开启云端 Agent。
+9. 不引入虚假日期、进度、未读蓝点或运行耗时。
+10. 不在视觉改版中改变后端调度或清理用户任务。
 
 ## 9. Responsive Behavior
->=960px 双栏；601–959px 侧栏收为项目抽屉；<=600px 单列、标题收紧、弹窗留 12px 边距、表单单列。触控按钮与选择控件至少 44px。主容器 100dvh，正文承担滚动；短屏也保留输入区。
-验收：1046×653 桌面和 390×844 窄屏无横向溢出、输入与发送可见；长记录独立滚动；详情切换保留草稿；弹窗 Escape 关闭并归还焦点。新建、讨论、审批、错误处理入口均保留。构建与现有后端回归通过，验收不调用真实模型或修改真实任务。
+
+>=960px 展示完整工作栏+工具轨+项目树；601–959px 默认折叠项目栏，以抽屉打开；<=600px 隐藏工具轨，由顶部导航按钮打开项目抽屉。抽屉锁定焦点、Escape 关闭，主区与顶部在打开时 inert。
+移动端正文 15–16px、16px 留白、输入框 20px 圆角；图标点击区至少 44×44px。整体 100dvh，正文独立滚动；小屏不出现横向溢出。模态框宽 calc(100vw - 24px)，内部表单单列。
+验收：1046×653、1440×900、390×844；确认底部输入可见、导航收放、项目切换、搜索、复制、草稿与授权入口。对照截图记录对齐点和有意差异。仅本地假服务可用于自动化发送测试，不触发真实 Agent。

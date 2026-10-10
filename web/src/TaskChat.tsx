@@ -1,9 +1,12 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { request } from './api';
 import { AgentInfo } from './types';
+import { ArrowUp, Plus, ShieldCheck, Copy, Check, ChevronRight } from 'lucide-react';
+import { MessageContent } from './MessageContent';
 
 type Message = {
   id: string;
+  created_at?: number;
   content: string;
   recipient: string;
   status: string;
@@ -41,6 +44,7 @@ export function TaskChat({
   completed,
   onPending,
   onDetails,
+  onTeam,
   visible,
   children,
 }: {
@@ -49,6 +53,7 @@ export function TaskChat({
   completed: boolean;
   onPending: (pending: boolean) => void;
   onDetails: () => void;
+  onTeam: () => void;
   visible: boolean;
   children?: React.ReactNode;
 }) {
@@ -56,6 +61,7 @@ export function TaskChat({
   const nearBottom = useRef(true);
   const previousVersion = useRef('');
   const [unseen, setUnseen] = useState(false);
+  const [copied, setCopied] = useState('');
   const [loadError, setLoadError] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -179,10 +185,13 @@ export function TaskChat({
             <p className="small">要拆分任务并开始工作，请使用上方的“讨论方案”。</p>
           </div>}
           {messages.map(m => <article className="chat-turn" key={m.id}>
+            {typeof m.created_at === 'number' && <time className="message-time" dateTime={new Date(m.created_at * 1000).toISOString()}>
+              {new Date(m.created_at * 1000).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+            </time>}
             <div className="user-message">
-              <div className="message-heading"><strong>你</strong><span className="small">发给 {getRecipientLabel(m.recipient)}</span></div>
+              <span className="sr-only">你，发给 {getRecipientLabel(m.recipient)}</span>
               <p className="prose">{m.content}</p>
-              <span className="message-status small">{statusLabels[m.status] || m.status}</span>
+              {m.status !== 'DELIVERED' && <span className="message-status small">{statusLabels[m.status] || m.status}</span>}
             </div>
             {m.error && <p className={m.status === 'CANCELLED' ? 'wait-note small' : 'error small'}
               role={m.status === 'CANCELLED' ? undefined : 'alert'}>{m.error} <button type="button" onClick={onDetails}>查看详情</button></p>}
@@ -193,9 +202,9 @@ export function TaskChat({
             {m.replies.map((r, i) => {
               const name = agentMap[r.role]?.name || r.role;
               return <div key={i} className="agent-message">
-                <div className="message-heading"><span className="avatar" aria-hidden="true">{name.slice(0, 1).toUpperCase()}</span><strong>{name}</strong></div>
+                <div className="reply-heading"><strong>{name}</strong><button type="button" className="icon-button" aria-label={'查看 ' + name + ' 的协作详情'} title="查看任务详情" onClick={onDetails}><ChevronRight /></button></div>
                 <div className="agent-message-body">
-                  <p className="prose">{r.content}</p>
+                  <MessageContent text={r.content} />
                   {!!r.report?.data?.proposals?.length && <details>
                     <summary>工作建议 · {r.report.data.proposals.length} 项</summary>
                     <ul>{r.report.data.proposals.map((proposal, index) => <li key={index}>
@@ -203,6 +212,14 @@ export function TaskChat({
                       {' → '}{agentMap[proposal.assignee]?.name || proposal.assignee}：{proposal.reason}
                     </li>)}</ul>
                   </details>}
+                  <div className="reply-actions">
+                    <button type="button" className="icon-button" aria-label={copied === m.id + ':' + i ? '已复制回复' : '复制 ' + name + ' 的回复'} title="复制回复"
+                      onClick={async () => {
+                        try { await navigator.clipboard.writeText(r.content); setCopied(m.id + ':' + i); }
+                        catch { setError('无法自动复制，请手动选择回复文字并复制。'); }
+                      }}>{copied === m.id + ':' + i ? <Check /> : <Copy />}</button>
+                    {copied === m.id + ':' + i && <span className="small" role="status">已复制</span>}
+                  </div>
                 </div>
               </div>;
             })}
@@ -219,7 +236,7 @@ export function TaskChat({
         {completed && <p className="small compose-notice">任务已完成，仍可交流；继续开发需修改需求并重新规划。</p>}
         <form onSubmit={send} className="chat-composer">
           <textarea aria-label="对话消息" disabled={sending} rows={2}
-            placeholder="给团队发消息，讨论下一步…"
+            placeholder="向团队发送消息…"
             value={text} onKeyDown={e => {
               if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.nativeEvent.isComposing) {
                 e.preventDefault(); e.currentTarget.form?.requestSubmit();
@@ -230,26 +247,24 @@ export function TaskChat({
               try { localStorage.setItem('wt:chat:' + taskId, e.target.value); } catch { /* Optional storage */ }
             }} />
           <div className="chat-composer-footer">
+            <button className="icon-button composer-team" type="button" aria-label="管理任务团队" title="查看任务团队" onClick={onTeam}><Plus /></button>
+            <details className="chat-policy"><summary><ShieldCheck /><span>仅交流</span></summary>
+              <p>本任务的已就绪成员依次回复一次，后发言者会看到前面的简要回复。发送会消耗 Agent 额度，外部服务会接收本任务的必要上下文；不会自动修改方案或启动开发。</p>
+            </details>
             <label className="recipient-field"><span className="sr-only">消息接收者</span>
               <select aria-label="消息接收者" value={recipient} disabled={sending} onChange={e => {
                 setRecipient(e.target.value); setId(crypto.randomUUID());
               }}>
-                <option value="all">本任务成员</option>
+                <option value="all">整个任务团队</option>
                 {bothReady && <option value="both">Codex + Antigravity</option>}
                 {agents.filter(a => a.enabled && a.ready).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
               </select>
             </label>
-            <button className="primary" title="⌘ / Ctrl + Enter 发送" disabled={sending || !text.trim() || !agents.some(a => a.ready)}>
-              {sending ? '发送中…' : '发送'}
+            <button className="primary icon-button send-button" aria-label={sending ? '发送中' : '发送消息'} title="⌘ / Ctrl + Enter 发送" disabled={sending || !text.trim() || !agents.some(a => a.ready)}>
+              <ArrowUp /><span className="sr-only">{sending ? '发送中…' : '发送消息'}</span>
             </button>
           </div>
         </form>
-        <div className="composer-meta">
-          <span>只交流，不自动开发</span>
-          <details className="chat-policy"><summary>发送说明</summary>
-            <p>本任务的已就绪成员依次回复一次，后发言者会看到前面的简要回复。发送会消耗 Agent 额度，外部服务会接收本任务的必要上下文；不会自动修改方案或启动开发。</p>
-          </details>
-        </div>
         {!agents.some(a => a.ready) && <p className="small error">没有就绪成员，请先检查团队与 Agent 设置。</p>}
       </div>
     </section>
