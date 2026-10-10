@@ -42,7 +42,7 @@ class EngineTests(unittest.TestCase):
                 report["data"] = {"steps": steps}
             self.e.submit(self.t, report)
 
-    def fail(self, d):
+    def failure_report(self, d):
         report = self.report(d)
         report["status"] = "FAIL"
         report["data"]["checks"][0]["status"] = "FAIL"
@@ -97,7 +97,7 @@ class EngineTests(unittest.TestCase):
         for repair in range(3):
             d = self.issue()
             self.assertEqual("VERIFY", d["kind"])
-            self.e.submit(self.t, self.fail(d))
+            self.e.submit(self.t, self.failure_report(d))
             if repair < 2:
                 self.assertEqual("FIX", self.complete()["kind"])
         state = self.e.show(self.t)
@@ -226,15 +226,29 @@ class EngineTests(unittest.TestCase):
             results = list(pool.map(call, range(16)))
         self.assertEqual(1, sum(d is not None for d in results))
 
-    def test_project_writer_lock_and_separate_projects(self):
+    def test_planning_sessions_are_isolated_within_and_across_projects(self):
         self.issue()
         other = self.e.task_add(self.p, "other", "Other")["id"]
-        self.assertIsNone(self.e.dispatch(other)["dispatch"])
+        self.assertEqual("PLAN", self.e.dispatch(other)["dispatch"]["kind"])
         directory = Path(self.temp.name) / "second"
         directory.mkdir()
         p2 = self.e.project_add("second", str(directory))["id"]
         t2 = self.e.task_add(p2, "other", "Other")["id"]
         self.assertIsNotNone(self.e.dispatch(t2)["dispatch"])
+
+    def test_blocked_writer_still_locks_shared_checkout(self):
+        self.plan()
+        code = self.issue()
+        with self.e.transaction() as db:
+            task = self.e._task(db, self.t)
+            self.e._get_dispatch(task, code["id"])["deadline"] = 0
+            self.e._save(db, task, "TEST_EXPIRED", {})
+        self.e.expire(self.t)
+        other = self.e.task_add(self.p, "other", "Other")["id"]
+        for _ in range(3):
+            dispatch = self.e.dispatch(other)["dispatch"]
+            self.e.submit(other, MockAdapter().prepare(dispatch, self.e.template(other, dispatch["id"])))
+        self.assertEqual("PROJECT_WORKSPACE_BUSY", self.e.dispatch(other)["reason"])
 
     def test_cli_demo_and_error_json(self):
         base = [sys.executable, "-m", "worktogether", "--db", str(Path(self.temp.name) / "cli.sqlite3")]
@@ -254,12 +268,12 @@ class EngineTests(unittest.TestCase):
         self.complete()
         for _ in range(2):
             d = self.issue()
-            self.e.submit(self.t, self.fail(d))
+            self.e.submit(self.t, self.failure_report(d))
             self.assertEqual("FIX", self.complete()["kind"])
         verify = self.issue()
         other_analysis = self.issue()
         self.assertEqual("ANALYZE", other_analysis["kind"])
-        self.e.submit(self.t, self.fail(verify))
+        self.e.submit(self.t, self.failure_report(verify))
         with patch("worktogether.core.time.time", return_value=other_analysis["deadline"] + 1):
             self.e.expire(self.t)
         self.assertEqual("REPAIR_LIMIT", self.e.show(self.t)["block_reason"])

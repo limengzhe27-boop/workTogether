@@ -3,7 +3,7 @@ import unittest
 import threading
 from pathlib import Path
 from unittest.mock import patch
-from worktogether.core import Engine, CollabError
+from worktogether.core import Engine, CollabError, encode
 from worktogether.runtime import Runtime
 from worktogether.antigravity import AntigravityRuntime
 from worktogether.chat import ChatQueue
@@ -49,6 +49,7 @@ class ChatTests(unittest.TestCase):
         with self.assertRaises(CollabError): self.e.message_add(self.t, "m", "codex", "changed")
         self.q.once()
         self.assertEqual([], self.c.list(self.t)["runs"])
+        self.assertEqual("TASK_PAUSED", self.e.messages(self.t)[0]["wait_reason"])
         self.e.resume(self.t); self.q.once()
         self.assertEqual(1, len(self.c.list(self.t)["runs"]))
 
@@ -56,6 +57,7 @@ class ChatTests(unittest.TestCase):
         d = self.e.dispatch(self.t)["dispatch"]
         self.e.message_add(self.t, "m", "codex", "Wait, discuss first")
         self.q.once(); self.assertEqual([], self.c.list(self.t)["runs"])
+        self.assertEqual("DISPATCH_UNRESOLVED", self.e.messages(self.t)[0]["wait_reason"])
         self.c.run(self.t, d["id"]); self.q.once()
         self.assertEqual("PLAN_REVIEW", self.e.show(self.t)["phase"])
         self.assertEqual("DELIVERED", self.e.messages(self.t)[0]["status"])
@@ -73,6 +75,56 @@ class ChatTests(unittest.TestCase):
         self.q.once()
         self.assertEqual("BLOCKED", self.e.messages(self.t)[0]["status"])
         self.assertEqual(1, len(self.c.list(self.t)["runs"]))
+
+    def test_failed_chat_does_not_lock_other_task_or_retry_old_failure(self):
+        self.e.message_add(self.t, "old", "codex", "Old question")
+        dispatch = self.e.chat_dispatch(self.t)
+        missing = Runtime(self.e, str(Path(self.tmp.name) / "missing-codex"))
+        self.assertEqual("FAILED", missing.run(self.t, dispatch["id"])["status"])
+        old_state = self.e.show(self.t)
+        self.e.message_add(self.t, "queued-old", "codex", "Follow-up")
+        self.assertEqual("TASK_BLOCKED", self.e.messages(self.t)[1]["wait_reason"])
+        other = self.e.task_add(old_state["project_id"], "New", "Independent task")["id"]
+        self.e.message_add(other, "new", "both", "New question")
+        self.assertIsNone(self.e.messages(other)[0]["wait_reason"])
+        self.q.once(); self.q.once(); self.q.once()
+        self.assertEqual("DELIVERED", self.e.messages(other)[0]["status"])
+        self.assertEqual(["codex", "antigravity"], [r["role"] for r in self.e.messages(other)[0]["replies"]])
+        self.assertEqual(1, len(self.c.list(self.t)["runs"]))
+        self.assertEqual(old_state["dispatches"], self.e.show(self.t)["dispatches"])
+
+    def test_same_project_unknown_chat_is_isolated_but_never_replayed(self):
+        self.e.message_add(self.t, "old", "codex", "Old question")
+        self.e.chat_dispatch(self.t)
+        other = self.e.task_add(self.e.show(self.t)["project_id"], "New", "Independent task")["id"]
+        self.e.message_add(other, "new", "codex", "New question")
+        self.q.once()
+        self.assertEqual("DELIVERED", self.e.messages(other)[0]["status"])
+        self.assertEqual("RUNNING", self.e.messages(self.t)[0]["status"])
+        self.assertEqual([], self.c.list(self.t)["runs"])
+
+    def test_queue_reasons_are_live_and_not_written_into_messages(self):
+        self.e.message_add(self.t, "first", "codex", "First")
+        self.e.message_add(self.t, "second", "codex", "Second")
+        self.assertEqual("EARLIER_MESSAGE", self.e.messages(self.t)[1]["wait_reason"])
+        with self.e.transaction() as db:
+            db.execute("INSERT INTO runs VALUES(?,?,?,?)", ("unknown", self.t, "unknown-dispatch",
+                encode({"status": "PREPARED"})))
+        self.assertEqual("RUN_UNRESOLVED", self.e.messages(self.t)[0]["wait_reason"])
+        self.assertIsNone(self.e.chat_dispatch(self.t))
+        with self.e.transaction() as db:
+            self.assertNotIn("wait_reason", db.execute("SELECT body FROM messages WHERE id='first'").fetchone()[0])
+            db.execute("DELETE FROM runs WHERE id='unknown'")
+        self.assertIsNone(self.e.messages(self.t)[0]["wait_reason"])
+
+    def test_unavailable_recipient_waits_with_reason_without_dispatch(self):
+        self.e.message_add(self.t, "m", "codex", "Question")
+        with self.e.transaction() as db:
+            # Reproduce imported/legacy data with a now-disabled participant.
+            db.execute("UPDATE agents SET body=json_set(body,'$.enabled',json('false')) WHERE id='codex'")
+        self.assertEqual("AGENT_UNAVAILABLE", self.e.messages(self.t)[0]["wait_reason"])
+        self.assertIsNone(self.e.chat_dispatch(self.t))
+        self.assertEqual([], self.e.show(self.t)["dispatches"])
 
     def test_discussion_yields_to_queued_message(self):
         self.e.message_add(self.t, "m", "antigravity", "question")

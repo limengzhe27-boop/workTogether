@@ -943,6 +943,7 @@ export function Workspace() {
               <button style={{ minHeight: 28, padding: '2px 8px' }} onClick={() => setManagingAgents(false)}>✕ 关闭</button>
             </div>
             <p className="small muted">自定义 Agent 可通过 OpenAI 兼容接口参与任务讨论并接受只读分析步骤；不能修改项目代码或独立验收。分工须经能力校验和你的方案批准。密钥只从启动服务的环境变量读取。连接测试会发送一条不含任务内容的短消息，可能产生少量模型用量。</p>
+            <p className="small">DeepSeek API 是云端接口配置；DeepSeek Harness 是本机 CLI 接入，不是重复安装。本机 CLI 仍可能调用云端模型，并不表示离线运行。旧 ID deepseek-hermes 仅为保留历史消息，不代表 Harness。</p>
 
             <div className="agent-card-list">
               {agents.map(a => (
@@ -952,7 +953,7 @@ export function Workspace() {
                       <span style={{ fontSize: 18 }}>{a.avatar}</span>
                       <strong>{a.name}</strong>
                       <span className="small muted">({a.id})</span>
-                      <span className="badge" style={{ fontSize: 11 }}>{a.type}</span>
+                      <span className="badge" style={{ fontSize: 11 }}>{a.type === 'cli' ? '本机 CLI' : 'API 接口'}</span>
                     </div>
                     <p className="small" style={{ margin: '4px 0 0' }}>{a.description || '无描述'}</p>
                     {a.endpoint && <p className="small muted" style={{ margin: 0 }}>接口: {a.endpoint} ({a.model})</p>}

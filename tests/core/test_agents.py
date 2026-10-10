@@ -1,5 +1,6 @@
 """Tests for AgentRegistry and AgentConfig."""
 import os
+import json
 import tempfile
 import unittest
 
@@ -27,9 +28,35 @@ class AgentRegistryTests(unittest.TestCase):
     def test_get_agent(self):
         ag = self.registry.get("deepseek-hermes")
         self.assertIsNotNone(ag)
-        self.assertEqual(ag.name, "DeepSeek（API 模板）")
+        self.assertEqual(ag.name, "DeepSeek API（云端接口）")
         self.assertEqual(ag.type, "openai_compat")
         self.assertIn("chat", ag.roles)
+
+    def test_legacy_deepseek_label_migration_preserves_configuration(self):
+        with self.engine.transaction() as db:
+            data = json.loads(db.execute("SELECT body FROM agents WHERE id='deepseek-hermes'").fetchone()[0])
+            data.update(name="DeepSeek Hermes", enabled=False, api_key_env="MY_DEEPSEEK_KEY")
+            db.execute("UPDATE agents SET name=?,body=? WHERE id=?",
+                       (data["name"], json.dumps(data), data["id"]))
+        AgentRegistry(self.engine)
+        AgentRegistry(self.engine)  # Idempotent startup migration.
+        current = self.registry.get("deepseek-hermes")
+        self.assertEqual("DeepSeek API（云端接口）", current.name)
+        self.assertFalse(current.enabled)
+        self.assertEqual("MY_DEEPSEEK_KEY", current.api_key_env)
+        self.assertEqual(data["endpoint"], current.endpoint)
+        harness = self.registry.get("deepseek-harness")
+        self.assertEqual("DeepSeek Harness（本机 CLI）", harness.name)
+        self.assertFalse(harness.enabled)
+
+    def test_custom_deepseek_name_or_endpoint_is_not_overwritten(self):
+        for name, endpoint in (("My researcher", "https://api.deepseek.com/v1"),
+                               ("DeepSeek Hermes", "http://127.0.0.1:1234/v1")):
+            with self.subTest(name=name):
+                self.registry.register(dict(id="deepseek-hermes", name=name, type="openai_compat",
+                                            endpoint=endpoint, model="deepseek-chat"))
+                AgentRegistry(self.engine)
+                self.assertEqual(name, self.registry.get("deepseek-hermes").name)
 
     def test_register_custom_agent(self):
         custom = {

@@ -139,6 +139,16 @@ class ServerApiTests(unittest.TestCase):
             self.assertEqual(resolve_antigravity_executable("agy", candidate), str(candidate))
             self.assertEqual(resolve_antigravity_executable("/explicit/agy", candidate), "/explicit/agy")
 
+    def test_message_api_explains_wait_without_starting_a_run(self):
+        project = self.engine.project_add("Paused fixture", self.temp_dir.name)
+        task = self.engine.task_add(project["id"], "Question", "Question")["id"]
+        self.engine.pause(task)
+        self.engine.message_add(task, "message", "codex", "Explain the project")
+        status, data = execute_request(self.server, "GET", f"/api/tasks/{task}/messages")
+        self.assertEqual(200, status)
+        self.assertEqual("TASK_PAUSED", data["messages"][0]["wait_reason"])
+        self.assertEqual([], self.runtime.list(task)["runs"])
+
     def test_real_static_assets_packaging(self):
         real_static_dir = Path(__file__).resolve().parent.parent.parent / "worktogether" / "static"
         real_server = DummyServer(self.engine, self.runtime, str(real_static_dir))

@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -70,6 +71,16 @@ class TeamworkTests(unittest.TestCase):
 
     def test_manual_dispatch_cannot_skip_team_input(self):
         self.assertEqual("TEAM_ROUND_REQUIRED", self.engine.dispatch(self.task)["reason"])
+
+    def test_other_tasks_failed_chat_does_not_block_team_round(self):
+        other = self.engine.task_add(self.engine.show(self.task)["project_id"], "Old", "Old task")["id"]
+        self.engine.message_add(other, "old", "codex", "Old question")
+        dispatch = self.engine.chat_dispatch(other)
+        with patch.dict("os.environ", {"WT_FAKE_MODE": "exit"}):
+            self.codex.run(other, dispatch["id"])
+        self.assertEqual("BLOCKED", self.engine.show(other)["status"])
+        self.assertEqual({"codex", "antigravity"},
+                         {d["role"] for d in self.engine.team_round(self.task, "CONSULT")})
 
     def test_pause_and_revision_do_not_reuse_old_opinions(self):
         for d in self.engine.team_round(self.task, "CONSULT"):

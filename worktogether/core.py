@@ -287,8 +287,50 @@ class Engine:
 
     def messages(self, task_id):
         with self.transaction() as db:
-            self._task(db, task_id)
-            return [json.loads(r[0]) for r in db.execute("SELECT body FROM messages WHERE task_id=? ORDER BY rowid", (task_id,))]
+            task = self._task(db, task_id)
+            messages = [json.loads(r[0]) for r in db.execute("SELECT body FROM messages WHERE task_id=? ORDER BY rowid", (task_id,))]
+            queued = False
+            for message in messages:
+                if message["status"] == "QUEUED":
+                    message["wait_reason"] = (self._chat_wait_reason(db, task) or
+                        ("EARLIER_MESSAGE" if queued else self._chat_member_wait_reason(db, task, message)))
+                    queued = True
+            return messages
+
+    def _chat_wait_reason(self, db, task):
+        if task["status"] not in ("ACTIVE", "COMPLETED"):
+            return "TASK_PAUSED" if task["status"] == "PAUSED" else "TASK_BLOCKED"
+        if any(d["status"] == "ACTIVE" for d in task["dispatches"]):
+            return "DISPATCH_UNRESOLVED"
+        for table in ("planning_jobs", "team_jobs"):
+            if db.execute("SELECT name FROM sqlite_master WHERE name=?", (table,)).fetchone():
+                if any(json.loads(r[0])["status"] in ("QUEUED", "RUNNING") for r in db.execute(
+                        f"SELECT body FROM {table} WHERE task_id=?", (task["id"],))):
+                    return "WORKFLOW_RUNNING"
+        if db.execute("SELECT name FROM sqlite_master WHERE name='runs'").fetchone():
+            if any(json.loads(r[0])["status"] in ("PREPARED", "RUNNING", "EXITED") for r in db.execute(
+                    "SELECT body FROM runs WHERE task_id=?", (task["id"],))):
+                return "RUN_UNRESOLVED"
+        return None
+
+    @staticmethod
+    def _chat_roles(message):
+        return message.get("participants") or (["codex", "antigravity"]
+            if message["recipient"] in ("both", "all") else [message["recipient"]])
+
+    def _chat_member_wait_reason(self, db, task, message):
+        if message["revision"] != task.get("revision", 1):
+            return "REQUIREMENT_CHANGED"
+        roles = self._chat_roles(message)
+        if len(message["replies"]) < len(roles):
+            role = roles[len(message["replies"])]
+            from .agents import AgentConfig
+            row = db.execute("SELECT body FROM agents WHERE id=?", (role,)).fetchone()
+            if row is None or not AgentConfig(json.loads(row[0])).ready:
+                return "AGENT_UNAVAILABLE"
+            if self._busy(db, task, role):
+                return "MEMBER_UNRESOLVED"
+        return None
 
     def message_add(self, task_id, message_id, recipient, content):
         require(string(message_id) and len(message_id) <= 128 and string(recipient)
@@ -325,16 +367,8 @@ class Engine:
     def chat_dispatch(self, task_id):
         with self.transaction() as db:
             t = self._task(db, task_id)
-            if t["status"] not in ("ACTIVE", "COMPLETED") or any(d["status"] == "ACTIVE" for d in t["dispatches"]):
+            if self._chat_wait_reason(db, t):
                 return None
-            for table in ("planning_jobs", "team_jobs"):
-                if db.execute("SELECT name FROM sqlite_master WHERE name=?", (table,)).fetchone():
-                    if any(json.loads(r[0])["status"] in ("QUEUED", "RUNNING") for r in db.execute(
-                            f"SELECT body FROM {table} WHERE task_id=?", (task_id,))):
-                        return None
-            if db.execute("SELECT name FROM sqlite_master WHERE name='runs'").fetchone():
-                if any(json.loads(r[0])["status"] in ("PREPARED", "RUNNING", "EXITED") for r in db.execute("SELECT body FROM runs WHERE task_id=?", (task_id,))):
-                    return None
             messages = [json.loads(r[0]) for r in db.execute("SELECT body FROM messages WHERE task_id=? ORDER BY rowid", (task_id,))]
             m = next((m for m in messages if m["status"] == "QUEUED"), None)
             if m is None:
@@ -343,13 +377,13 @@ class Engine:
                 m["status"] = "NEEDS_REVIEW"
                 db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
                 return None
-            roles = m.get("participants") or (["codex", "antigravity"] if m["recipient"] in ("both", "all") else [m["recipient"]])
+            roles = self._chat_roles(m)
             if len(m["replies"]) >= len(roles):
                 m["status"] = "DELIVERED"
                 db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
                 return None
             role = roles[len(m["replies"])]
-            if self._busy(db, t, role):
+            if self._chat_member_wait_reason(db, t, m):
                 return None
             d = self._issue(t, "CHAT", role=role)
             brief = lambda replies: [{"role": r["role"], "content": r["content"][:2000]} for r in replies]
@@ -400,14 +434,11 @@ class Engine:
         return result
 
     def _busy(self, db, task, role):
-        if any(d["status"] in ("ACTIVE", "BLOCKED") and d["role"] == role for d in task["dispatches"]):
-            return True
-        if role == "codex":
-            for row in db.execute("SELECT body FROM tasks WHERE project_id=? AND id!=?", (task["project_id"], task["id"])):
-                other = json.loads(row["body"])
-                if any(d["role"] == role and d["status"] in ("ACTIVE", "BLOCKED") for d in other["dispatches"]):
-                    return True
-        return False
+        # Provider sessions belong to tasks, not projects. Keep unresolved work
+        # locked in its own task; CODE/FIX/VERIFY checkout safety is enforced
+        # separately by _workspace_busy for every provider.
+        return any(d["status"] in ("ACTIVE", "BLOCKED") and d["role"] == role
+                   for d in task["dispatches"])
 
     def _workspace_busy(self, db, task, kind, exclude_dispatch_id=None):
         # Without a pinned snapshot, CODE/FIX must not change the checkout

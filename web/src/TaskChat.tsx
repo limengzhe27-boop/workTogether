@@ -8,6 +8,7 @@ type Message = {
   recipient: string;
   status: string;
   error?: string;
+  wait_reason?: string | null;
   replies: { role: string; content: string; report?: { data?: { proposals?: {
     title: string; work_kind: 'code' | 'analysis'; assignee: string; reason: string;
   }[] } } }[];
@@ -19,6 +20,18 @@ const statusLabels: Record<string, string> = {
   DELIVERED: '✓ 已回复',
   BLOCKED: '⚠ 回复中断，需处理',
   NEEDS_REVIEW: '📝 需求已变更，需重新确认',
+};
+
+const waitLabels: Record<string, string> = {
+  TASK_PAUSED: '任务已暂停，恢复后才会发送。',
+  TASK_BLOCKED: '当前任务有未解决的问题，请先查看任务阻塞原因。',
+  DISPATCH_UNRESOLVED: '本任务已有派发尚未结束，请查看执行详情；不要重复发送。',
+  WORKFLOW_RUNNING: '正在等待本任务的团队流程让出会话。',
+  RUN_UNRESOLVED: '本任务有运行结果尚未确认，请检查执行详情。',
+  EARLIER_MESSAGE: '正在等待本任务较早的消息处理完毕。',
+  REQUIREMENT_CHANGED: '需求已变更，需要重新确认这条消息。',
+  AGENT_UNAVAILABLE: '下一位接收成员未就绪或已停用，请检查 Agent 配置。',
+  MEMBER_UNRESOLVED: '接收成员在本任务中有未解决的派发，请先检查失败记录。',
 };
 
 const PROMPT_SUGGESTIONS = [
@@ -162,6 +175,9 @@ export function TaskChat({
             </div>
             <p className="prose" style={{ marginTop: 8 }}>{m.content}</p>
             {m.error && <p className="error small" style={{ marginTop: 6 }}>{m.error}</p>}
+            {m.status === 'QUEUED' && m.wait_reason && (
+              <p className="small" role="status">等待原因：{waitLabels[m.wait_reason] || m.wait_reason}</p>
+            )}
 
             {/* Agent Replies Stream */}
             {m.replies.map((r, i) => {

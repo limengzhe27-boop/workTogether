@@ -20,11 +20,11 @@ DEFAULT_AGENTS = [
     {"id": "antigravity", "name": "Antigravity", "type": "cli", "executable": "agy",
      "roles": ["review", "verify", "chat", "analysis"], "color": "#10b981", "avatar": "🦅",
      "description": "方案挑战与独立验收", "enabled": True},
-    {"id": "deepseek-hermes", "name": "DeepSeek（API 模板）", "type": "openai_compat",
+    {"id": "deepseek-hermes", "name": "DeepSeek API（云端接口）", "type": "openai_compat",
      "endpoint": "https://api.deepseek.com/v1", "model": "deepseek-chat",
      "api_key_env": "DEEPSEEK_API_KEY", "roles": ["chat", "analysis"], "color": "#f59e0b",
      "avatar": "🧠", "description": "配置密钥后可参与任务讨论；不是本地 Harness", "enabled": True},
-    {"id": "deepseek-harness", "name": "DeepSeek Harness", "type": "cli", "executable": "dsh",
+    {"id": "deepseek-harness", "name": "DeepSeek Harness（本机 CLI）", "type": "cli", "executable": "dsh",
      "roles": ["code", "plan", "chat", "analysis", "review", "verify"], "color": "#2563eb",
      "avatar": "🐋", "description": "本地 Harness 后台适配器；需本机登录，真实模型闭环待验证", "enabled": False},
 ]
@@ -113,10 +113,26 @@ class AgentRegistry:
             # SQLite history/backups may retain old bytes, so operators should rotate.
             for row in db.execute("SELECT id,body FROM agents"):
                 data = json.loads(row["body"])
+                changed = False
                 if "api_key" in data:
                     del data["api_key"]
-                    db.execute("UPDATE agents SET body=? WHERE id=?",
-                               (json.dumps(data, ensure_ascii=False), row["id"]))
+                    changed = True
+                # Only migrate known default labels; preserve user names,
+                # endpoints, credentials, enabled state and historical IDs.
+                if (data.get("id") == "deepseek-hermes" and data.get("type") == "openai_compat"
+                        and data.get("name") in ("DeepSeek Hermes", "DeepSeek（API 模板）")
+                        and data.get("endpoint", "").rstrip("/") == "https://api.deepseek.com/v1"
+                        and data.get("model") == "deepseek-chat"):
+                    data["name"] = "DeepSeek API（云端接口）"
+                    data["description"] = "通过 API 分析与讨论；不是本地 Harness，不能直接改文件或运行测试"
+                    changed = True
+                if (data.get("id") == "deepseek-harness" and data.get("type") == "cli"
+                        and data.get("name") == "DeepSeek Harness"):
+                    data["name"] = "DeepSeek Harness（本机 CLI）"
+                    changed = True
+                if changed:
+                    db.execute("UPDATE agents SET name=?,body=? WHERE id=?",
+                               (data["name"], json.dumps(data, ensure_ascii=False), row["id"]))
 
     def list(self, enabled_only=False):
         with self.engine.transaction() as db:
