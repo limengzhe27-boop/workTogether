@@ -10,7 +10,7 @@ import re
 import shutil
 from urllib.parse import urlsplit
 
-from .core import CollabError, require, string
+from .core import CollabError, encode, require, string
 
 
 DEFAULT_AGENTS = [
@@ -106,7 +106,10 @@ class AgentRegistry:
     def __init__(self, engine):
         self.engine = engine
         with self.engine.transaction() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS removed_agents (id TEXT PRIMARY KEY)")
             for item in DEFAULT_AGENTS:
+                if db.execute("SELECT id FROM removed_agents WHERE id=?", (item["id"],)).fetchone():
+                    continue
                 db.execute("INSERT OR IGNORE INTO agents(id,name,type,body) VALUES(?,?,?,?)",
                            (item["id"], item["name"], item["type"], json.dumps(item, ensure_ascii=False)))
             # Older prototypes accepted plaintext keys. Remove them from live rows;
@@ -192,13 +195,32 @@ class AgentRegistry:
                 self._ensure_not_in_flight(db, agent_id)
             db.execute("INSERT OR REPLACE INTO agents VALUES(?,?,?,?)",
                        (agent_id, clean["name"], clean["type"], json.dumps(clean, ensure_ascii=False)))
+            db.execute("DELETE FROM removed_agents WHERE id=?", (agent_id,))
         return AgentConfig(clean).to_dict()
 
-    def remove(self, agent_id):
+    def remove(self, agent_id, cancel_queued=False):
         require(agent_id not in ("codex", "antigravity", "deepseek-harness"), "Built-in agents cannot be removed", "INVALID_INPUT")
+        require(type(cancel_queued) is bool, "cancel_queued must be boolean", "INVALID_INPUT")
         with self.engine.transaction() as db:
+            if cancel_queued:
+                # Explicit removal may cancel unsent, single-recipient messages.
+                # Never discard shared conversations, in-flight work or history.
+                for row in db.execute("SELECT body FROM messages").fetchall():
+                    message = json.loads(row[0])
+                    if (message["status"] == "QUEUED" and not message["replies"]
+                            and message["recipient"] == agent_id
+                            and self.engine._chat_roles(message) == [agent_id]):
+                        message.update(status="CANCELLED", error="接收 Agent 已移除，此消息未发送；历史记录已保留。")
+                        db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?",
+                                   (encode(message), message["task_id"], message["id"]))
+                        task = self.engine._task(db, message["task_id"])
+                        self.engine._save(db, task, "MESSAGE_CANCELLED", {
+                            "message_id": message["id"], "agent_id": agent_id, "reason": "AGENT_REMOVED"})
             self._ensure_not_in_flight(db, agent_id)
-            return db.execute("DELETE FROM agents WHERE id=?", (agent_id,)).rowcount > 0
+            removed = db.execute("DELETE FROM agents WHERE id=?", (agent_id,)).rowcount > 0
+            if removed:
+                db.execute("INSERT OR IGNORE INTO removed_agents VALUES(?)", (agent_id,))
+            return removed
 
     def set_enabled(self, agent_id, enabled):
         require(type(enabled) is bool, "enabled must be boolean", "INVALID_INPUT")

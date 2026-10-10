@@ -943,7 +943,8 @@ export function Workspace() {
               <button style={{ minHeight: 28, padding: '2px 8px' }} onClick={() => setManagingAgents(false)}>✕ 关闭</button>
             </div>
             <p className="small muted">自定义 Agent 可通过 OpenAI 兼容接口参与任务讨论并接受只读分析步骤；不能修改项目代码或独立验收。分工须经能力校验和你的方案批准。密钥只从启动服务的环境变量读取。连接测试会发送一条不含任务内容的短消息，可能产生少量模型用量。</p>
-            <p className="small">DeepSeek API 是云端接口配置；DeepSeek Harness 是本机 CLI 接入，不是重复安装。本机 CLI 仍可能调用云端模型，并不表示离线运行。旧 ID deepseek-hermes 仅为保留历史消息，不代表 Harness。</p>
+            <p className="small">DeepSeek Harness 是本机 CLI 接入；本机 CLI 仍可能调用云端模型，并不表示离线运行。</p>
+            {agents.some(a => a.id === 'deepseek-hermes') && <p className="small">DeepSeek API 是另一种云端接口配置，不是 Harness。旧 ID deepseek-hermes 仅为兼容历史消息。</p>}
 
             <div className="agent-card-list">
               {agents.map(a => (

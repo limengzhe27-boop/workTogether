@@ -3,6 +3,7 @@ import os
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from worktogether.core import Engine, CollabError
 from worktogether.agents import AgentRegistry, AgentConfig
@@ -87,9 +88,64 @@ class AgentRegistryTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(self.registry.get("temp-agent"))
 
+    def test_removed_default_stays_removed_until_explicit_registration(self):
+        original = self.registry.get("deepseek-hermes").to_dict()
+        self.assertTrue(self.registry.remove("deepseek-hermes"))
+        restarted = AgentRegistry(Engine(self.db_path))
+        self.assertIsNone(restarted.get("deepseek-hermes"))
+        self.assertIsNotNone(restarted.get("deepseek-harness"))
+        self.assertFalse(restarted.get("deepseek-harness").enabled)
+        self.assertFalse(restarted.remove("deepseek-hermes"))
+        restarted.register(original)
+        self.assertIsNotNone(AgentRegistry(self.engine).get("deepseek-hermes"))
+
+    def queued_cloud_message(self, key="direct", recipient="deepseek-hermes"):
+        project = self.engine.project_add("fixture", self.temp_dir.name)
+        task = self.engine.task_add(project["id"], "Task", "Requirement")["id"]
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fixture-not-a-real-key"}):
+            self.engine.message_add(task, key, recipient, "Unsent question")
+        return task
+
+    def test_explicit_removal_cancels_unsent_message_but_keeps_history(self):
+        task = self.queued_cloud_message()
+        with self.assertRaises(CollabError):
+            self.registry.remove("deepseek-hermes")
+        self.assertEqual("QUEUED", self.engine.messages(task)[0]["status"])
+        self.assertTrue(self.registry.remove("deepseek-hermes", cancel_queued=True))
+        message = self.engine.messages(task)[0]
+        self.assertEqual("CANCELLED", message["status"])
+        self.assertEqual("Unsent question", message["content"])
+        self.assertIsNone(self.engine.chat_dispatch(task))
+        self.assertEqual([], self.engine.show(task)["dispatches"])
+        self.assertEqual(1, len([e for e in self.engine.show(task)["events"]
+                                 if e["kind"] == "MESSAGE_CANCELLED"]))
+        self.assertIsNone(AgentRegistry(self.engine).get("deepseek-hermes"))
+
+    def test_remove_shared_conversation_rolls_back_other_cancellations(self):
+        direct = self.queued_cloud_message()
+        shared = self.queued_cloud_message("shared", "all")
+        with self.assertRaises(CollabError):
+            self.registry.remove("deepseek-hermes", cancel_queued=True)
+        self.assertEqual("QUEUED", self.engine.messages(direct)[0]["status"])
+        self.assertEqual("QUEUED", self.engine.messages(shared)[0]["status"])
+        self.assertIsNotNone(AgentRegistry(self.engine).get("deepseek-hermes"))
+        self.assertFalse(any(e["kind"] == "MESSAGE_CANCELLED" for e in self.engine.show(direct)["events"]))
+
+    def test_remove_never_cancels_running_message(self):
+        task = self.queued_cloud_message()
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fixture-not-a-real-key"}):
+            self.engine.chat_dispatch(task)
+            self.engine.message_add(task, "later", "deepseek-hermes", "Later question")
+        with self.assertRaises(CollabError):
+            self.registry.remove("deepseek-hermes", cancel_queued=True)
+        self.assertEqual(["RUNNING", "QUEUED"], [m["status"] for m in self.engine.messages(task)])
+        self.assertIsNotNone(self.registry.get("deepseek-hermes"))
+
     def test_built_in_protected(self):
         with self.assertRaises(CollabError):
             self.registry.remove("codex")
+        with self.assertRaises(CollabError):
+            self.registry.remove("deepseek-harness", cancel_queued=True)
         cfg = self.registry.get("codex")
         self.assertIsNotNone(cfg)
         self.assertTrue(cfg.enabled)

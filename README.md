@@ -36,6 +36,8 @@ Agent 管理页可由你主动点击“测试连接”：平台仅发送一条�
 
 如果看到两个 DeepSeek 条目：`DeepSeek API（云端接口）` 是使用 API 的讨论/分析配置，`DeepSeek Harness（本机 CLI）` 才是本机应用接入。本机 CLI 不等于离线模型。早期 API 模板曾误叫 `DeepSeek Hermes`，启动时仅纠正已知默认名称，保留旧 ID `deepseek-hermes` 以兼容历史消息；不改密钥、接口和启用状态，也不覆盖用户自定义名称。
 
+通过注册表移除 API Agent 后，默认条目不会在重启时重新出现；仍可主动重新注册。显式选择取消待发消息时，只取消尚未启动、只发给该 Agent 的消息，保留历史和审计记录；运行中、多人消息或未完成工作会阻止移除，且整次操作回滚。
+
 自定义 API Agent 的讨论与只读分析分工已通过本机假服务的真实 HTTP 闭环测试：三位 Agent 在同一任务中依次回复，API Agent 接收前序摘要；批准计划后它完成分析，Antigravity 验收，依赖步骤再交给 Codex。测试使用模拟 CLI 和假 HTTP 响应，**尚未**用真实 DeepSeek/Ollama 服务完成端到端试运行。Antigravity 对需要命令行工具权限的验收仍可能被阻断。并行修改代码、Claude Code/ZCode 编码适配器及隔离 worktree 尚未实现。
 
 ## 快速启动 Web 工作台

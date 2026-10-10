@@ -20,6 +20,7 @@ const statusLabels: Record<string, string> = {
   DELIVERED: '✓ 已回复',
   BLOCKED: '⚠ 回复中断，需处理',
   NEEDS_REVIEW: '📝 需求已变更，需重新确认',
+  CANCELLED: '已取消（保留记录）',
 };
 
 const waitLabels: Record<string, string> = {
