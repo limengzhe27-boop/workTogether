@@ -1,138 +1,71 @@
-# WorkTogether Web APP 设计决策说明书 (DESIGN.md)
+# WorkTogether 界面设计规范
+版本 2 · 2026-10-10 · 已获用户确认：浅色极简两栏、对话优先、底部输入、L1 轻动效。
 
-- **版本**: v1.0.0
-- **目标**: 交付可实际操作的本地网页工作台 (Python HTTP + React/TS 网页前端)，支持项目与任务管理、单步调度、运行记录、产物查看与手动交接。
+本次仅重排前端，不改变调度权限、Agent 配置或任务数据。旧版架构记录见 [design-legacy-v1.md](docs/design-legacy-v1.md)，接口以当前后端为准。
 
----
+## 1. Visual Theme & Atmosphere
+Minimal Pure：白色主区、浅灰导航、克制蓝色。让用户专注讨论和下一步，不是面对监控大屏。项目、任务、对话三层导航；技术信息按需展开。无渐变、文字阴影、装饰图片、彩虹标签或假在线状态。
 
-## 一、 核心架构原则
+## 2. Color Palette & Roles
+统一 CSS 变量：
+- --bg: #f7f8fa；--surface: #ffffff；--surface-alt: #f2f4f7；--surface-hover: #e8edf4。
+- --text: #202630；--secondary: #505b6b；--muted: #606d7e。
+- --border: #e5e8ed；--border-hover: #9aa7b8。
+- --accent: #245fc7；--accent-hover: #194b9e；--on-accent: #ffffff。
+- --error: #b02e38；--error-bg: #fff7f7。
+- --shadow-rgb: 32,38,48；--accent-rgb: 36,95,199。
 
-1. **权威数据源单一化**：
-   - 后端 Python (`worktogether.core.Engine` + `worktogether.runtime.Runtime`) 和 SQLite 是唯一的真理源与状态机。
-   - 前端不复制状态流转逻辑，所有按钮点击均触发后端对应 API 调用，并通过轮询（活跃期 2s，空闲期 5s，用户操作后立即刷新）同步权威状态。
-2. **零外部重型依赖与本地优先**：
-   - 服务端使用 Python 标准库 `http.server.ThreadingHTTPServer`，多线程非阻塞响应，支持并发长耗时后台任务。
-   - 本地服务默认仅监听 `127.0.0.1`。
-3. **安全性与沙箱隔离**：
-   - **防路径穿越**：日志和产物查看（`/api/runs/{id}/artifacts/{name}`）严格限定在服务管理的 `runs/{id}/` 目录白名单文件名，任何 `..` 或越界路径直接 403 拦截。
-   - **防 CSRF 篡改**：只允许来自 `127.0.0.1` 或 `localhost` 的同源写请求。
-   - **绝无任意命令执行**：后端不设通用 shell 执行接口；Codex 运行严格通过 `Runtime.run` 派发沙箱进程。
-   - **凭据零泄露**：不向前端下发任何系统/服务账号私钥或 Token。
-4. **诚实的可观测性与用量展示**：
-   - 缺失数据显示“暂无数据”，严禁伪造数字或盲目将累计 Token 与单次 Token 相加。
-   - 模拟执行任务（Demo）在界面醒目标记 `[SIMULATED]`。
+红色用于当前错误；历史失败收进详情，不宣称仍在失败。未配置或禁用的成员不伪装在线。
 
----
+## 3. Typography Rules
+中文优先字体栈：'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif。
+样式引用 https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap；离线回退本机字体，display=swap 避免文字等待。
+正文 15px / 1.75，字距 .02em；元数据 13px / 1.7；任务标题 18px / 1.5；首页标题 28px / 1.5。字重只用 400、500、600。正文不截断，代码可独立滚动；标题单行截断并提供完整 title。
 
-## 二、 界面布局与交互设计 (UI / UX)
+## 4. Component Stylings
+- 按钮：44px 最小点击高度、8px 圆角、默认白底细边；hover 浅灰、active 更深灰；主按钮蓝底，hover 深蓝；disabled 降透明度并禁止点击。
+- 焦点：focus-visible 2px 蓝色轮廓 + 3px 间隔；选中使用 aria-current 或 aria-pressed，不只靠颜色。
+- 输入：白底细边，聚焦蓝边；聊天固定 2–4 行高度，发送失败保留草稿。
+- 消息：用户浅灰气泡，Agent 开放式正文和中性首字头像，不重复多层卡片。
+- 详情：原生 details/summary，键盘可展开，明确标题。
+- 弹窗：原生 dialog 管理焦点锁定、Escape 与焦点返回；取消与有成本授权明确区分。
+- 图标：无需新图标依赖；文字与首字头像已能表达，避免无意义装饰。
 
-采用经典、高效的**双栏工作台布局**，专为专业开发者设计，中文原生文案：
+## 5. Layout Principles
+桌面 232px 左导航 + 剩余宽主区，移除第三栏。主区紧凑标题、一行真实进度和阶段操作，然后进入对话。
+对话正文单独滚动；输入区位于面板底部，用 flex 布局，不覆盖消息。内容最大宽 880px、横向留白 28px。
+默认「对话」，「详情」保留任务修改、授权连续执行、手动派发、报告交接、阻塞重试、恢复、历史记录、用量及日志。切换不卸载聊天，不丢草稿。
+首页只展示需求输入和默认不勾选的连续执行授权；Agent 管理集中在设置。
 
-```text
-+-----------------------------------------------------------------------------------+
-|  WorkTogether 本地协同工作台                   [项目: 我的项目 (git: clean)]  [状态]  |
-+----------------------+------------------------------------------------------------+
-| 导航侧边栏 (280px)   | 任务主舞台 (Main Stage)                                    |
-|                      |                                                            |
-| [项目列表]           | [任务标题] 优化视频进度持久化       [ACTIVE] [PLANNING]    |
-| + 添加本地项目       | 需求描述: 刷新页面后自动恢复播放位置...                    |
-| > 当前项目           |                                                            |
-|                      | [操作栏] [派发下一步] [运行 Codex] [暂停] [导入报告]       |
-| [任务列表]           |                                                            |
-| + 新建任务           | [标签页]                                                   |
-| - 视频进度优化 (RUN) |   [1. 协同时间线]   [2. 步骤与验收]   [3. 执行与用量]      |
-| - 样式重构 (DONE)    |                                                            |
-| - 缓存穿透修复 (BLK) | 时间线:                                                    |
-|                      |  Codex 提交 PLAN (v1) -> Antigravity 审查通过 -> ...       |
-|                      |                                                            |
-|                      | 证据与日志查看 (默认折叠长文本，支持格式化高亮)            |
-+----------------------+------------------------------------------------------------+
-```
+## 6. Depth & Elevation
+用空间与细边线划分层级。只有弹窗、移动导航、新消息提示有轻阴影。卡片 12px 圆角；弹窗 16px。不堆叠边框、阴影或背景装饰。
 
-### 1. 侧边栏 (Sidebar)
-- **项目管理**：展示项目名称、本地绝对路径、关联任务总数、Git 状态快速提示；支持快速输入路径添加本地项目。
-- **任务切换**：按项目严格筛选任务列表；每个任务项显示标题、当前 phase/status 状态胶囊、阻塞原因（若有）；切换项目时自动重置选中任务，绝不串线。
+## 7. Animation & Interaction
+L1：按钮颜色/边框 140ms，fadeIn 180ms，无滚动揭示、弹跳、假流式打字或常驻脉冲。prefers-reduced-motion: reduce 关闭全部动画和过渡。
+普通消息用于交流，不授权开发。讨论、审阅、执行按阶段出现，启动前说明调用上限、额度与必要上下文传输。暂停只停止后续工作，不杀死在途模型。
+聊天初次加载定位底部；仅在用户靠近底部时跟随新消息。向上阅读不抢滚动。CHAT 回复只显示一次；协作报告可从详情核查。
 
-### 2. 主舞台 (Main Stage)
-- **任务状态区**：
-  - 任务标题、项目标签、核心状态徽标（`ACTIVE`, `PAUSED`, `BLOCKED`, `COMPLETED`）。
-  - 遇到 `BLOCKED` 时，顶部弹出黄色/红色警告条，清晰展示阻塞原因（如 `REPAIR_LIMIT`、`TIMEOUT` 或外部环境不可用），并提供“重试 (Retry)”或“人工介入说明”。
-- **顶置控制栏 (Action Bar)**：
-  - **派发下一项 (Dispatch)**：请求调度器释放下一个符合 DAG 依赖的待办工单。
-  - **运行 Codex (Run Codex)**：当存在待运行的 Codex 派发时，一键触发后台子进程执行，按钮自动切换为“执行中 (Running...)”并禁用，防重复点击。
-  - **暂停 (Pause) / 继续 (Resume)**：在暂停期间，展示“已暂停（在途执行将保留入库）”。
-  - **手动交接辅助 (Manual Handoff)**：
-    - 一键复制 `handoff` 完整指令（包含上下文与输入数据）；
-    - 快速导入 `submit` 验收报告（提供带语法高亮和合法性预检的 JSON 弹窗）。
-- **主体内容标签页 (Tabs)**：
-  - **Tab 1: 协作时间线与看板 (Timeline)**：
-    - 步骤流程卡片展示（当前处于哪个 step，每个 step 的验收项、状态及修复轮次 `repair_count: x/2`）。
-    - 双方 Agent 的流转事件流（按时间倒序/正序，明确标注操作者 Codex / Antigravity / 系统）。
-  - **Tab 2: 交付物与验收详情 (Verification & Evidence)**：
-    - 展开展示验收结果、PASS/FAIL 状态、检查清单、失败复现步骤（Reproduction Steps）与证据引用。
-  - **Tab 3: 运行记录与用量统计 (Runs & Telemetry)**：
-    - 运行历史表格（Run ID、PID、Exit Code、Session ID、执行时长、创建时间）。
-    - 产物日志浏览器（查看 `prompt.txt`、`result.json`、`stderr.log`、`events.jsonl`，超过 20 行默认折叠）。
-    - 真实用量展示（保留 input_tokens, cached_tokens, output_tokens 原样字段，不臆造虚假费用）。
+## 8. Do’s / Don’ts
+Do：
+1. 把对话与发送作为日常核心。
+2. 只显示真实阶段和完成步骤数。
+3. 当前阻塞给出明确处理入口。
+4. 保留批准、重试、恢复与手动交接。
+5. 保存项目隔离、任务选择和草稿。
+6. 控件有可读名称，弹窗支持键盘。
 
----
+Don’t：
+1. 不把全部技术按钮堆在首屏。
+2. 不用历史失败代替当前状态。
+3. 不把发消息变成授权代码修改。
+4. 不默认勾选连续开发。
+5. 不自动启用或注册云端 Agent。
+6. 不制造假进度、假在线和假回复。
+7. 不扩大工具权限。
+8. 不让长对话挤走输入框。
+9. 不引入沉重 UI 或动效依赖。
+10. 不删除既有任务和后端功能。
 
-## 三、 接口设计规范 (HTTP API Contract)
-
-所有接口统一前缀 `/api`，响应均为 `application/json`，错误时统一返回 HTTP 4xx/5xx 及 `{"error": {"code": "...", "message": "..."}}`：
-
-| 方法 | 路径 | 功能说明 | 错误码示例 |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/api/health` | 探活与版本信息 | - |
-| `GET` | `/api/projects` | 获取所有已注册项目列表及任务数统计 | - |
-| `POST` | `/api/projects` | 添加本地项目目录 `{"name": "...", "path": "..."}` | `INVALID_INPUT` |
-| `GET` | `/api/projects/{id}` | 获取项目详情及 `doctor` 诊断（git 状态等） | `NOT_FOUND` |
-| `GET` | `/api/projects/{id}/tasks` | 获取指定项目下的所有任务列表（严格隔离） | `NOT_FOUND` |
-| `POST` | `/api/tasks` | 创建新任务 `{"project_id": "...", "title": "...", "requirement": "..."}` | `INVALID_INPUT` |
-| `GET` | `/api/tasks/{id}` | 获取任务完整聚合状态（含 steps, dispatches, events） | `NOT_FOUND` |
-| `POST` | `/api/tasks/{id}/dispatch` | 触发一次任务派发 | `NOT_FOUND` |
-| `POST` | `/api/tasks/{id}/submit` | 提交 Agent 报告 `{"report": {...}}` | `INVALID_REPORT`, `CONFLICT` |
-| `POST` | `/api/tasks/{id}/pause` | 暂停任务 | `INVALID_STATE` |
-| `POST` | `/api/tasks/{id}/resume` | 恢复任务 | `INVALID_STATE` |
-| `POST` | `/api/tasks/{id}/retry` | 重试阻塞的派发 `{"dispatch_id": "..."}` | `INVALID_STATE`, `REPAIR_LIMIT` |
-| `POST` | `/api/tasks/{id}/expire` | 检查并作废超时派发 | - |
-| `GET` | `/api/tasks/{id}/template/{dispatch_id}` | 获取指定派发的结果模板 JSON | `NOT_FOUND` |
-| `GET` | `/api/tasks/{id}/handoff/{dispatch_id}` | 获取供 Agent 使用的完整交接包 | `NOT_FOUND` |
-| `POST` | `/api/tasks/{id}/run` | 异步启动 Codex 执行 `{"dispatch_id": "...", "timeout": 300}` | `INVALID_STATE` |
-| `GET` | `/api/tasks/{id}/runs` | 获取任务关联的所有运行执行记录 | `NOT_FOUND` |
-| `GET` | `/api/runs/{run_id}/artifacts/{name}` | 安全读取运行产物文本内容 | `NOT_FOUND`, `FORBIDDEN` |
-| `POST` | `/api/demo` | 运行一次受控模拟全流程（明确标记 SIMULATED） | - |
-| `GET` | `/*` | 提供编译打包后的前端 SPA 静态页面及资源 | - |
-
----
-
-## 四、 前后端工程组织
-
-```text
-worktogether/
-├── core.py              # 现有状态机核心
-├── runtime.py           # 现有 Codex 运行管理
-├── server.py            # [NEW] 生产 HTTP Web 服务（ThreadingHTTPServer + API 路由 + 静态托管）
-└── static/              # [NEW] 前端静态资源发布目录 (index.html, app.js, app.css)
-
-web/                     # [NEW] 前端源码目录（React + TypeScript 标准工程）
-├── package.json
-├── tsconfig.json
-├── src/
-│   ├── index.html
-│   ├── main.tsx
-│   ├── App.tsx
-│   ├── types.ts
-│   ├── api.ts
-│   ├── components/
-│   │   ├── ProjectSidebar.tsx
-│   │   ├── TaskHeader.tsx
-│   │   ├── ActionBar.tsx
-│   │   ├── TimelineView.tsx
-│   │   ├── StepsView.tsx
-│   │   ├── RunsView.tsx
-│   │   ├── ReportModal.tsx
-│   │   └── ArtifactViewer.tsx
-│   └── styles/
-│       └── main.css
-```
+## 9. Responsive Behavior
+>=960px 双栏；601–959px 侧栏收为项目抽屉；<=600px 单列、标题收紧、弹窗留 12px 边距、表单单列。触控按钮与选择控件至少 44px。主容器 100dvh，正文承担滚动；短屏也保留输入区。
+验收：1046×653 桌面和 390×844 窄屏无横向溢出、输入与发送可见；长记录独立滚动；详情切换保留草稿；弹窗 Escape 关闭并归还焦点。新建、讨论、审批、错误处理入口均保留。构建与现有后端回归通过，验收不调用真实模型或修改真实任务。

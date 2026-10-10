@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api, request } from './api';
 import { TaskChat } from './TaskChat';
+import { Dialog } from './Dialog';
 import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentProbeResult, ReportEnvelope } from './types';
 
 type Detail = TaskDetail & { revision?: number; team?: { members: string[]; coordinator: string; reviewer: string } };
@@ -65,6 +66,7 @@ export function Workspace() {
   const [tick, setTick] = useState(0);
   const [navigation, setNavigation] = useState(false);
   const [tab, setTab] = useState('progress');
+  const [dialog, setDialog] = useState<'' | 'team' | 'plan' | 'authorize' | 'discuss' | 'execute'>('');
   const [composerRequest, setComposerRequest] = useState(0);
   const [chatPending, setChatPending] = useState(false);
   const [manualDispatchId, setManualDispatchId] = useState('');
@@ -74,6 +76,36 @@ export function Workspace() {
   const selected = useRef({ project, taskId });
   selected.current = { project, taskId };
   const currentProject = projects.find(p => p.id === project);
+
+  useEffect(() => {
+    if (!navigation) return;
+    const query = window.matchMedia('(max-width: 959px)');
+    if (!query.matches) return;
+    const sidebar = document.querySelector<HTMLElement>('.sidebar')!;
+    const main = document.querySelector<HTMLElement>('main')!;
+    const trigger = document.activeElement as HTMLElement | null;
+    main.setAttribute('inert', '');
+    const controls = () => Array.from(sidebar.querySelectorAll<HTMLElement>('button:not(:disabled),select:not(:disabled)'))
+      .filter(el => el.getClientRects().length > 0);
+    controls()[0]?.focus();
+    const keys = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); setNavigation(false); }
+      if (event.key !== 'Tab') return;
+      const items = controls();
+      const first = items[0], last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    };
+    const resized = () => { if (!query.matches) setNavigation(false); };
+    document.addEventListener('keydown', keys);
+    query.addEventListener('change', resized);
+    return () => {
+      main.removeAttribute('inert');
+      document.removeEventListener('keydown', keys);
+      query.removeEventListener('change', resized);
+      trigger?.focus();
+    };
+  }, [navigation]);
 
   // Multi-agent states
   const [agents, setAgents] = useState<AgentInfo[]>([]);
@@ -206,6 +238,9 @@ export function Workspace() {
     setHandoffText('');
     setReportText('');
     setNavigation(false);
+    setTab('progress');
+    setDialog('');
+    setChatPending(false);
   }
 
   function newTask() {
@@ -334,112 +369,61 @@ export function Workspace() {
     });
   }
 
+  const members = task?.team?.members || [];
+  const finishedSteps = task?.steps.filter(step => step.status === 'COMPLETED').length || 0;
+  const workflowReports = task?.dispatches.filter(d => d.report && d.kind !== 'CHAT' &&
+    (d.payload.requirement_revision || 1) === (task.revision || 1)) || [];
+  const latestReport = workflowReports[workflowReports.length - 1];
+  const running = inflight || planningBusy || executionBusy || teamBusy;
+  const progressText = task?.status === 'PAUSED' ? '已暂停后续工作' :
+    task?.status === 'BLOCKED' ? '需要处理' : running ? '团队工作中' :
+    chatPending ? '正在处理消息' : task?.phase === 'EXECUTING' && !approval?.approved ? '方案待你确认' :
+    task ? label(task.phase) : '';
+
   return (
     <div className="workspace">
+      {navigation && <button className="nav-scrim" tabIndex={-1} aria-label="关闭项目导航" onClick={() => setNavigation(false)} />}
       <aside className={'sidebar ' + (navigation ? 'visible' : '')} aria-label="项目与任务">
-        <div className="brand"><span className="brand-mark">W</span>WorkTogether</div>
+        <button className="mobile-nav nav-close" onClick={() => setNavigation(false)}>关闭导航</button>
+        <div className="brand"><span className="brand-mark">w.</span>WorkTogether</div>
         <label className="small" htmlFor="project">当前项目</label>
         <select id="project" value={project} disabled={busy} onChange={e => { setProject(e.target.value); setTasks([]); choose(''); }}>
           <option value="" disabled>选择项目</option>
           {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
-        <button className="new-task" disabled={!project || busy} onClick={newTask}>＋ 新任务</button>
-        <p className="small section-label">最近任务</p>
-        <nav>
-          {tasks.map(t => (
-            <button key={t.id} disabled={busy} aria-current={t.id === taskId ? 'page' : undefined} className="task-link" onClick={() => choose(t.id)}>
-              <span>{t.title}</span>
-              <small>{label(t.status)}</small>
-            </button>
-          ))}
+        <button className="new-task" disabled={!project || busy} onClick={newTask}>＋ 新建任务</button>
+        <p className="small section-label">最近任务 <span>{tasks.length}</span></p>
+        <nav aria-label="最近任务">
+          {tasks.map(t => <button key={t.id} disabled={busy} aria-current={t.id === taskId ? 'page' : undefined}
+            className="task-link" onClick={() => choose(t.id)}>
+            <span>{t.title}</span><small>{label(t.status)}</small>
+          </button>)}
+          {!tasks.length && <p className="small empty-nav">还没有任务，从一个想法开始。</p>}
         </nav>
         <div className="sidebar-bottom">
-          <button disabled={busy} onClick={() => { setAdding(!adding); setNavigation(false); }}>添加项目</button>
-      <p className="small">多 Agent 任务对话 · 本地受控工作区</p>
+          <button disabled={busy} onClick={() => { setAdding(true); setNavigation(false); }}>添加项目</button>
+          <button disabled={busy} onClick={() => { setManagingAgents(true); setNavigation(false); }}>Agent 设置</button>
+          <p className="small">本地工作区 · 项目独立</p>
         </div>
       </aside>
-
       <main className="main">
         <header className="topbar">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
-            <button className="mobile-nav" aria-expanded={navigation} onClick={() => setNavigation(!navigation)}>项目与任务</button>
-            <span>{currentProject?.name || '工作区'} <span className="muted">/ {task?.title || (taskId ? '加载任务' : '新任务')}</span></span>
+          <button className="mobile-nav" aria-expanded={navigation} onClick={() => setNavigation(!navigation)}>项目</button>
+          <div className="heading-copy">
+            <p className="small">{currentProject?.name || '工作区'}</p>
+            <h1 title={task?.title}>{task?.title || (taskId ? '正在加载…' : '新任务')}</h1>
           </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div className="agents-strip">
-              {agents.map(a => (
-                <span key={a.id} className={`agent-pill ${a.ready ? 'active' : ''}`} style={{ color: a.color }} title={a.description}>
-                  <span className="agent-avatar">{a.avatar}</span>
-                  <span>{a.name}</span>
-                </span>
-              ))}
-            </div>
-            <button
-              style={{ minHeight: 30, padding: '2px 10px', fontSize: 13, borderRadius: 6 }}
-              disabled={busy}
-              onClick={() => setManagingAgents(true)}
-            >
-              ⚙ 管理 Agent
-            </button>
-            <span className="badge">本地</span>
-          </div>
+          {task && <button className="team-button" onClick={() => setDialog('team')}>
+            团队{members.length > 0 ? ' · ' + members.length : ''}
+          </button>}
+          {!task && <button onClick={() => setManagingAgents(true)}>Agent 设置</button>}
         </header>
-
-        <div className="main-scroll">
-          <div className="reading page-enter">
-            {error && (
-              <div className="error" role="alert">
-                {error}
-                <button onClick={() => setError('')}>关闭提示</button>
-              </div>
-            )}
-
-            {providers && (providers.codex?.available === false || providers.antigravity?.available === false) && (
-              <div className="notice" role="status">
-                自动调用尚未就绪：{[
-                  providers.codex?.available === false ? 'Codex' : '',
-                  providers.antigravity?.available === false ? 'Antigravity' : '',
-                ].filter(Boolean).join('、')} 的命令行程序未找到。仍可用“手动派发下一项”和交接包推进；安装或指定路径后请重启服务。
-              </div>
-            )}
-
-            {!taskId && composerRequest > 0 && (
-              <p className="notice" role="status" key={composerRequest}>
-                新建任务：请在下方填写需求，再点击“创建任务”。已有草稿会保留。
-              </p>
-            )}
-
-            {adding && (
-              <form className="card stack" onSubmit={e => {
-                e.preventDefault();
-                act(async () => {
-                  const p = await api.addProject(name, path);
-                  const result = await api.getProjects();
-                  setProjects(result.projects);
-                  setProject(p.id);
-                  choose('');
-                  setAdding(false);
-                  setName('');
-                  setPath('');
-                });
-              }}>
-                <h2>添加本地项目</h2>
-                <label>项目名称<input required value={name} onChange={e => setName(e.target.value)} /></label>
-                <label>项目目录<input required placeholder="/Users/你的名字/projects/my-app" value={path} onChange={e => setPath(e.target.value)} /></label>
-                <p className="small">关联现有目录，不会自动创建文件或启动模型。</p>
-                <div className="actions">
-                  <button className="primary" disabled={busy}>添加项目</button>
-                  <button type="button" onClick={() => setAdding(false)}>取消</button>
-                </div>
-              </form>
-            )}
-
-            {!taskId ? (
+        {error && <div className="global-error error" role="alert">{error}<button onClick={() => setError('')}>关闭提示</button></div>}
+        {!taskId ? <div className="home-scroll"><div className="reading page-enter">
               <section className="home">
-                <p className="eyebrow">多 Agent 讨论 · 受控分工与验收</p>
-                <h1>这个项目，你想完成什么？</h1>
-                <p className="muted">说明目标和验收标准。创建后选择任务团队，按能力讨论与分工。你可以先审方案，也可以明确授权团队在当前需求范围内连续执行。</p>
+                <p className="eyebrow">一起把想法做出来</p>
+                <h1>今天想完成什么？</h1>
+                <p className="muted">说清目标，和你的 Agent 一起讨论、分工与完成。</p>
 
                 <form className="composer" onSubmit={e => {
                   e.preventDefault();
@@ -462,14 +446,14 @@ export function Workspace() {
                   <label htmlFor="requirement" className="small">任务需求</label>
                   <textarea
                     id="requirement"
-                    placeholder="例如：优化前端性能并重构架构。先多方讨论方案，再行分工实施…"
+                    placeholder="描述你想完成的事，以及怎样才算做好…"
                     value={draft}
                     onChange={e => {
                       setDraft(e.target.value);
                       save('wt:draft:' + project, e.target.value);
                     }}
                   />
-                  <label className="small">
+                  <label className="check-label small">
                     <input type="checkbox" checked={delegateOnCreate} disabled={busy}
                       onChange={e => setDelegateOnCreate(e.target.checked)} /> 创建后授权团队讨论、分工并执行当前需求
                   </label>
@@ -489,65 +473,73 @@ export function Workspace() {
 
                 {!project && <p className="notice">请先添加一个本地项目。</p>}
 
-                <div className="partners">
-                  {agents.map(a => (
-                    <div key={a.id}>
-                      <span className="avatar" style={{ color: a.color, borderColor: a.color, fontSize: 16 }}>
-                        {a.avatar}
-                      </span>
-                      <div>
-                        <strong style={{ color: a.color }}>{a.name}</strong>
-                        <p className="small">{a.description || a.type}</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <p className="small">点击右上角“管理 Agent”可接入 DeepSeek API 或其他 OpenAI 兼容接口，参与对话与只读分析。</p>
               </section>
-            ) : !task ? (
-              <p role="status">正在加载任务…</p>
-            ) : (
-              <>
-                <div className="title-row">
-                  <div>
-                    <p className="eyebrow">{label(task.phase)} · 需求版本 {task.revision || 1}</p>
-                    <h1>{task.title}</h1>
-                  </div>
-                  <span className="badge">{label(task.status)}</span>
-                </div>
 
-                {task.phase === 'PLANNING' && !revisionStarted && (
-                  <section className="card">
-                    <h2>任务团队</h2>
-                    <p className="muted">选择参与本任务的成员。规划与执行按能力分工；普通 API 不能修改代码或运行测试。可用配置不代表登录与配额已验证。</p>
-                    <div className="actions">
-                      {agents.filter(a => a.ready).map(a => {
-                        const members = teamChoice.taskId === taskId ? teamChoice.members : task.team?.members || ['codex', 'antigravity'];
-                        return <label key={a.id}>
-                          <input type="checkbox" disabled={locked} checked={members.includes(a.id)} onChange={e => setTeamChoice({
-                            taskId, members: e.target.checked ? [...members, a.id] : members.filter(id => id !== a.id),
-                          })} /> {a.name}
-                        </label>;
-                      })}
-                    </div>
-                    <button disabled={locked || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/team', {
-                      members: teamChoice.taskId === taskId ? teamChoice.members : task.team?.members || ['codex', 'antigravity'],
-                    }))}>保存团队与能力分工</button>
-                  </section>
+        </div></div> : !task ? <p className="empty" role="status">正在加载任务…</p> : (
+          <div className="task-layout">
+            <div className="task-toolbar">
+              <div className="progress-copy" role="status"><span className={'status-dot ' + (task.status === 'BLOCKED' ? 'attention' : '')} />
+                <span>{progressText}</span>
+                {task.steps.length > 0 && <span className="small">{finishedSteps}/{task.steps.length} 步骤完成</span>}
+              </div>
+              <div className="actions stage-actions">
+                {task.status === 'ACTIVE' && planning && !activeDispatch && !running && (
+                  <button className="primary" disabled={locked} onClick={() => setDialog('discuss')}>讨论方案</button>
                 )}
-                {task.team && <p className="muted">规划协调：{agentMap[task.team.coordinator]?.name || task.team.coordinator} · 方案复核：{agentMap[task.team.reviewer]?.name || task.team.reviewer} · 步骤执行与验收按能力另行分配</p>}
-
-                <div className="actions controls">
-                  {task.team && task.phase === 'PLANNING' && !revisionStarted && (
-                    <button className="primary" disabled={locked || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/delegate-team', { authorize_execution: true }))}>
-                      授权团队讨论并执行 · 最多 {2 * task.team.members.length + 15} 次调用
-                    </button>
-                  )}
-                  {planning && (
-                    <button className="primary" disabled={locked || !!activeDispatch || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/discuss'))}>
-                      {task.team ? '团队讨论与认领 · 两轮成员发言＋三次规划' : '开始方案讨论 · 最多三轮'}
-                    </button>
-                  )}
+                {task.phase === 'EXECUTING' && !approval?.approved && <button className="primary"
+                  disabled={!task.draft_plan} onClick={() => setDialog('plan')}>审阅方案</button>}
+                {task.phase === 'EXECUTING' && approval?.approved && !activeDispatch && !running && task.status === 'ACTIVE' && (
+                  <button className="primary" disabled={locked} onClick={() => setDialog('execute')}>开始执行</button>
+                )}
+                {activeDispatch && !running && task.status === 'ACTIVE' && <button className="primary"
+                  disabled={locked || (['CODE', 'ANALYZE', 'FIX', 'VERIFY'].includes(activeDispatch.kind) && !approval?.approved)}
+                  title={'调用 ' + (agentMap[activeDispatch.role]?.name || activeDispatch.role) + '，将消耗额度'}
+                  onClick={() => act(() => api.triggerRun(taskId, activeDispatch.id))}>执行当前项</button>}
+                {(running || task.status === 'PAUSED') && <button disabled={busy}
+                  title="暂停只停止后续派发，不会终止正在运行的模型"
+                  onClick={() => act(() => task.status === 'PAUSED' ? api.resumeTask(taskId) : api.pauseTask(taskId))}>
+                  {task.status === 'PAUSED' ? '恢复' : '暂停'}
+                </button>}
+              </div>
+            </div>
+            {task.status === 'BLOCKED' && <div className="attention-bar" role="alert">
+              当前任务需要处理：{task.block_reason || '请查看失败原因'}
+              <button onClick={() => setTab('details')}>查看并处理</button>
+            </div>}
+            {task.status === 'PAUSED' && <p className="inline-notice">已暂停后续派发；正在运行的模型仍会完成并保留结果。</p>}
+            <div className="view-tabs" aria-label="任务视图">
+              <button aria-pressed={tab === 'progress'} onClick={() => setTab('progress')}>对话</button>
+              <button aria-pressed={tab === 'details'} onClick={() => setTab('details')}>详情</button>
+              {task.draft_plan && <button className="plan-link" onClick={() => setDialog('plan')}>查看方案</button>}
+            </div>
+            <div className="conversation-panel" hidden={tab !== 'progress'}>
+              <TaskChat key={taskId} taskId={taskId}
+                agents={task.team ? agents.filter(a => members.includes(a.id)) : agents}
+                completed={task.status === 'COMPLETED'} onPending={setChatPending}
+                onDetails={() => setTab('details')} visible={tab === 'progress'}>
+                <details className="task-brief"><summary>任务需求 <span className="small">版本 {task.revision || 1}</span></summary>
+                  <p className="prose">{task.requirement}</p>
+                </details>
+                {latestReport && <section className="activity-note">
+                  <p className="small">最近协作 · {agentMap[latestReport.role]?.name || latestReport.role} · {label(latestReport.kind)}</p>
+                  <p>{latestReport.report!.summary.length > 180 ? latestReport.report!.summary.slice(0, 180) + '…' : latestReport.report!.summary}</p>
+                  <button onClick={() => setTab('details')}>查看协作记录</button>
+                </section>}
+              </TaskChat>
+            </div>
+            <div className="detail-scroll" hidden={tab !== 'details'}>
+              <div className="reading">
+                <div className="detail-heading"><h2>任务详情</h2><button onClick={() => setTab('progress')}>返回对话</button></div>
+                <p className="small">需求版本 {task.revision || 1} · {label(task.phase)} · {label(task.status)}</p>
+                <div className="actions">
+                  <button disabled={!canRevise} onClick={beginEdit}>修改需求</button>
+                  {task.status !== 'COMPLETED' && <button disabled={busy} onClick={() => act(() => task.status === 'PAUSED' ? api.resumeTask(taskId) : api.pauseTask(taskId))}>
+                    {task.status === 'PAUSED' ? '恢复后续工作' : '暂停后续工作'}</button>}
+                  {task.team && task.phase === 'PLANNING' && !revisionStarted && <button disabled={locked || task.status !== 'ACTIVE'}
+                    onClick={() => setDialog('authorize')}>授权团队连续执行</button>}
+                </div>
+                <p className="small">暂停不会终止已运行的模型。执行状态不明时，请先核对运行记录。</p>
+                <details className="card"><summary>手动派发与环境信息</summary>
                   {!activeDispatch && task.phase !== 'COMPLETED' && (
                     <button disabled={locked || task.status !== 'ACTIVE' || (task.phase === 'EXECUTING' && !approval?.approved)}
                       onClick={() => act(async () => {
@@ -559,40 +551,15 @@ export function Workspace() {
                           throw new Error('当前负责人已停用或未就绪，请检查 Agent 配置。');
                         }
                         if (!next.dispatch && next.reason === 'TEAM_ROUND_REQUIRED') {
-                          throw new Error('需要先完成团队意见或认领轮，请使用“团队讨论与认领”。');
+                          throw new Error('需要先完成团队意见或认领轮，请使用“讨论方案”。');
                         }
                       })}>
                       手动派发下一项（不调用模型）
                     </button>
                   )}
-                  {task.phase === 'EXECUTING' && !approval?.approved && (
-                    <button className="primary" disabled={locked || !approval || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/approve', { digest: approval!.digest }))}>
-                      批准下方方案
-                    </button>
-                  )}
-                  {task.phase === 'EXECUTING' && approval?.approved && !activeDispatch && (
-                    <button className="primary" disabled={locked || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/execute'))}>
-                      自动开发与验收 · 最多 6 次调用
-                    </button>
-                  )}
-                  {activeDispatch && (
-                    <button
-                      className="primary"
-                      disabled={locked || task.status !== 'ACTIVE' || (['CODE', 'ANALYZE', 'FIX', 'VERIFY'].includes(activeDispatch.kind) && !approval?.approved)}
-                      onClick={() => act(() => api.triggerRun(taskId, activeDispatch.id))}
-                    >
-                      执行当前项 · {agentMap[activeDispatch.role]?.name || activeDispatch.role}
-                    </button>
-                  )}
-                  {task.status !== 'COMPLETED' && (
-                    <button disabled={busy} onClick={() => act(() => task.status === 'PAUSED' ? api.resumeTask(taskId) : api.pauseTask(taskId))}>
-                      {task.status === 'PAUSED' ? '恢复后续工作' : '暂停后续工作'}
-                    </button>
-                  )}
-                  <button disabled={!canRevise} onClick={beginEdit}>修改需求</button>
-                </div>
-                <p className="small">暂停不会终止已运行的模型；执行状态不明时，请查看执行详情，不要重复启动。</p>
-                {task.team && !revisionStarted && <p className="small">“授权团队讨论并执行”允许团队在本需求范围内定稿后直接工作，不再逐步询问；仍受能力、独立验收、修复与调用预算限制。若要先审方案，请使用“团队讨论与认领”。</p>}
+
+                  {providers && <p className="small">本机入口：{Object.entries(providers).map(([key, value]) => key + (value.available ? ' 已找到' : ' 未找到')).join(' · ')}。未找到入口时可使用手动交接；配置后请重启服务。</p>}
+                </details>
                 {teamJobs.length > 0 && <section className="card">
                   <h2>团队自动协作</h2>
                   {teamJobs.map(j => <p key={j.id}>需求版本 {j.authorization?.revision || 1} · {j.result?.reason === 'COMPLETED' ? '全部步骤通过验收' : j.status === 'COMPLETED' ? '本轮已停止，任务未必完成' : label(j.status)} · {j.error || j.result?.reason || '讨论、认领、定稿后按授权执行'}{j.result?.reason === 'CALL_LIMIT' ? '（本轮预算已用完，不代表任务完成）' : ''}</p>)}
@@ -703,86 +670,13 @@ export function Workspace() {
                   </section>
                 )}
 
-                {edit && (
-                  <form className="card stack" onSubmit={e => {
-                    e.preventDefault();
-                    const id = taskId;
-                    act(async () => {
-                      await post('/tasks/' + id + '/revisions', {
-                        message_id: edit.id,
-                        expected_revision: edit.revision,
-                        requirement: edit.text,
-                      });
-                      save('wt:revision:' + id, '');
-                      if (selected.current.taskId === id) setEdit(null);
-                    });
-                  }}>
-                    <h2>修改完整需求</h2>
-                    <p className="small">保存后撤销旧批准，重新规划；保留已有代码与历史报告。</p>
-                    <textarea
-                      aria-label="完整新需求"
-                      value={edit.text}
-                      onChange={e => {
-                        const next = { ...edit, text: e.target.value, id: crypto.randomUUID() };
-                        setEdit(next);
-                        save('wt:revision:' + taskId, JSON.stringify(next));
-                      }}
-                    />
-                    <div className="actions">
-                      <button className="primary" disabled={!canRevise || !edit.text.trim()}>保存新版本</button>
-                      <button type="button" onClick={() => setEdit(null)}>收起（保留草稿）</button>
-                    </div>
-                  </form>
-                )}
 
-                <div className="tabs">
-                  <button aria-pressed={tab === 'progress'} onClick={() => setTab('progress')}>沟通与进展</button>
-                  <button aria-pressed={tab === 'details'} onClick={() => setTab('details')}>执行详情</button>
-                </div>
-
-                <div hidden={tab !== 'progress'}>
-                  <TaskChat key={taskId} taskId={taskId} agents={task.team ? agents.filter(a => task.team!.members.includes(a.id)) : agents} completed={task.status === 'COMPLETED'} onPending={setChatPending} />
-                </div>
-
-                {tab === 'progress' ? (
-                  <>
-                    <section className="message">
-                      <div className="message-heading">
-                        <span className="avatar">👤</span>
-                        <strong>当前需求</strong>
-                      </div>
-                      <p className="prose">{task.requirement}</p>
-                    </section>
-
-                    {task.draft_plan && (
-                      <section className="card">
-                        <h2>当前方案 <small className="muted">{approval?.approved ? '已批准' : '待审阅'}</small></h2>
-                        {task.draft_plan.steps.map(s => {
-                          const assignee = s.assignee ? agentMap[s.assignee] : agentMap['codex'];
-                          return (
-                            <div key={s.id} className="plan-step">
-                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                        <strong>{s.title} {s.work_kind === 'analysis' ? '· 分析' : '· 开发'}</strong>
-                                {assignee && (
-                                  <span className="agent-tag" style={{ background: assignee.color + '1a', color: assignee.color }}>
-                                    {assignee.avatar} {assignee.name}
-                                  </span>
-                                )}
-                              </div>
-                              {s.verifier && <p className="muted">独立验收：{agentMap[s.verifier]?.name || s.verifier}</p>}
-                              {s.assignment_reason && <p className="muted">分工依据：{s.assignment_reason}</p>}
-                              <ul>{s.acceptance.map(c => <li key={c}>{c}</li>)}</ul>
-                            </div>
-                          );
-                        })}
-                      </section>
-                    )}
-
-                    {task.dispatches.filter(d => d.report).map(d => {
+                <details className="card"><summary>协作记录 · {task.dispatches.filter(d => d.report && d.kind !== 'CHAT').length} 项</summary>
+                    {task.dispatches.filter(d => d.report && d.kind !== 'CHAT').map(d => {
                       const ag = agentMap[d.role];
-                      const avatar = ag?.avatar || (d.role === 'codex' ? '🤖' : '🦅');
+                      const avatar = (ag?.name || d.role).slice(0, 1).toUpperCase();
                       const name = ag?.name || d.role;
-                      const color = ag?.color || '#6366f1';
+                      const color = 'var(--secondary)';
                       return (
                         <section key={d.id} className="message">
                           <div className="message-heading">
@@ -809,14 +703,8 @@ export function Workspace() {
                       );
                     })}
 
-                    {!task.dispatches.length && (
-                      <div className="empty">
-                        需求已保存。开始讨论后，这里会显示各位 Agent 的真实方案与建议。
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <>
+
+                </details>
                     <h2>步骤与验收标准</h2>
                     {task.steps.map(s => {
                       const assignee = s.assignee ? agentMap[s.assignee] : agentMap['codex'];
@@ -825,8 +713,8 @@ export function Workspace() {
                           <summary style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                             <span>{s.title} · {label(s.status || '')}</span>
                             {assignee && (
-                              <span className="agent-tag" style={{ background: assignee.color + '1a', color: assignee.color }}>
-                                {assignee.avatar} {assignee.name}
+                              <span className="agent-tag">
+                                {assignee.name}
                               </span>
                             )}
                           </summary>
@@ -893,65 +781,165 @@ export function Workspace() {
                         <pre>{JSON.stringify(e.data, null, 2)}</pre>
                       </details>
                     ))}
-                  </>
-                )}
-              </>
-            )}
-          </div>
-        </div>
-      </main>
 
-      <aside className="inspector">
-        <h2>任务概览</h2>
-        <p className="small">一次只推进明确的下一步</p>
-        <div className="divider" />
-        <h3>协作方式</h3>
-        <p>多 Agent 有限接力讨论<br />返工最多两轮<br />开发前由你批准</p>
-        <div className="divider" />
-        <h3>步骤进度</h3>
-        {task?.steps.length ? (
-          task.steps.map(s => {
-            const assignee = s.assignee ? agentMap[s.assignee] : agentMap['codex'];
-            return (
-              <details key={s.id}>
-                <summary>
-                  {s.title}
-                  {assignee && (
-                    <small style={{ marginLeft: 6, color: assignee.color }}>
-                      ({assignee.name})
-                    </small>
-                  )}
-                </summary>
-                <p>{label(s.status || '')}</p>
-                <ul>{s.acceptance.map(c => <li key={c}>{c}</li>)}</ul>
-              </details>
-            );
-          })
-        ) : (
-          <p className="small">方案定稿后显示步骤。</p>
-        )}
-        <div className="divider" />
-        <p className="small">不共享其他项目的聊天。后台调用使用本任务绑定的独立会话。</p>
-      </aside>
-
-      {/* Agent Manager Modal */}
-      {managingAgents && (
-        <div className="modal-overlay" onClick={() => setManagingAgents(false)}>
-          <div className="modal-card" onClick={e => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h2>已接入的协作 Agent</h2>
-              <button style={{ minHeight: 28, padding: '2px 8px' }} onClick={() => setManagingAgents(false)}>✕ 关闭</button>
+              </div>
             </div>
+          </div>
+        )}
+      </main>
+            {adding && (
+              <Dialog title="添加本地项目" onClose={() => setAdding(false)}><form className="stack" onSubmit={e => {
+                e.preventDefault();
+                act(async () => {
+                  const p = await api.addProject(name, path);
+                  const result = await api.getProjects();
+                  setProjects(result.projects);
+                  setProject(p.id);
+                  choose('');
+                  setAdding(false);
+                  setName('');
+                  setPath('');
+                });
+              }}>
+                {error && <p className="error" role="alert">{error}</p>}
+                <label>项目名称<input required value={name} onChange={e => setName(e.target.value)} /></label>
+                <label>项目目录<input required placeholder="/Users/你的名字/projects/my-app" value={path} onChange={e => setPath(e.target.value)} /></label>
+                <p className="small">关联现有目录，不会自动创建文件或启动模型。</p>
+                <div className="actions">
+                  <button className="primary" disabled={busy}>添加项目</button>
+                  <button type="button" onClick={() => setAdding(false)}>取消</button>
+                </div>
+              </form></Dialog>
+            )}
+
+
+                {edit && task && (
+                  <Dialog title="修改需求" onClose={() => setEdit(null)}><form className="stack" onSubmit={e => {
+                    e.preventDefault();
+                    const id = taskId;
+                    act(async () => {
+                      await post('/tasks/' + id + '/revisions', {
+                        message_id: edit.id,
+                        expected_revision: edit.revision,
+                        requirement: edit.text,
+                      });
+                      save('wt:revision:' + id, '');
+                      if (selected.current.taskId === id) setEdit(null);
+                    });
+                  }}>
+                    {error && <p className="error" role="alert">{error}</p>}
+                    <p className="small">保存后撤销旧批准，重新规划；保留已有代码与历史报告。</p>
+                    <textarea
+                      aria-label="完整新需求"
+                      value={edit.text}
+                      onChange={e => {
+                        const next = { ...edit, text: e.target.value, id: crypto.randomUUID() };
+                        setEdit(next);
+                        save('wt:revision:' + taskId, JSON.stringify(next));
+                      }}
+                    />
+                    <div className="actions">
+                      <button className="primary" disabled={!canRevise || !edit.text.trim()}>保存新版本</button>
+                      <button type="button" onClick={() => setEdit(null)}>收起（保留草稿）</button>
+                    </div>
+                  </form></Dialog>
+                )}
+
+
+      {task && dialog === 'team' && <Dialog title="任务团队" onClose={() => setDialog('')}>
+        <p className="small">成员按能力参与讨论与分工。就绪表示配置可用，不代表登录或额度已经验证。</p>
+        <div className="team-list">{members.map(id => <div key={id} className="team-member">
+          <span className="avatar">{(agentMap[id]?.name || id).slice(0, 1).toUpperCase()}</span>
+          <span>{agentMap[id]?.name || id}</span><span className="small">{agentMap[id]?.ready ? '配置就绪' : '未就绪'}</span>
+        </div>)}</div>
+                {task.phase === 'PLANNING' && !revisionStarted && (
+                  <section className="card">
+                    <h2>任务团队</h2>
+                    <p className="muted">选择参与本任务的成员。规划与执行按能力分工；普通 API 不能修改代码或运行测试。可用配置不代表登录与配额已验证。</p>
+                    <div className="actions">
+                      {agents.filter(a => a.ready).map(a => {
+                        const members = teamChoice.taskId === taskId ? teamChoice.members : task.team?.members || ['codex', 'antigravity'];
+                        return <label key={a.id}>
+                          <input type="checkbox" disabled={locked} checked={members.includes(a.id)} onChange={e => setTeamChoice({
+                            taskId, members: e.target.checked ? [...members, a.id] : members.filter(id => id !== a.id),
+                          })} /> {a.name}
+                        </label>;
+                      })}
+                    </div>
+                    <button disabled={locked || task.status !== 'ACTIVE'} onClick={() => act(() => post(base + '/team', {
+                      members: teamChoice.taskId === taskId ? teamChoice.members : task.team?.members || ['codex', 'antigravity'],
+                    }))}>保存团队与能力分工</button>
+                  </section>
+                )}
+                {task.team && <p className="muted">规划协调：{agentMap[task.team.coordinator]?.name || task.team.coordinator} · 方案复核：{agentMap[task.team.reviewer]?.name || task.team.reviewer} · 步骤执行与验收按能力另行分配</p>}
+
+
+        {error && <p className="error" role="alert">{error}</p>}
+        <button onClick={() => { setDialog(''); setManagingAgents(true); }}>管理接入的 Agent</button>
+      </Dialog>}
+      {task && dialog === 'plan' && <Dialog title="任务方案" onClose={() => setDialog('')}>
+                    {task.draft_plan && (
+                      <section className="card">
+                        <h2>当前方案 <small className="muted">{approval?.approved ? '已批准' : '待审阅'}</small></h2>
+                        {task.draft_plan.steps.map(s => {
+                          const assignee = s.assignee ? agentMap[s.assignee] : agentMap['codex'];
+                          return (
+                            <div key={s.id} className="plan-step">
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <strong>{s.title} {s.work_kind === 'analysis' ? '· 分析' : '· 开发'}</strong>
+                                {assignee && (
+                                  <span className="agent-tag">
+                                    {assignee.name}
+                                  </span>
+                                )}
+                              </div>
+                              {s.verifier && <p className="muted">独立验收：{agentMap[s.verifier]?.name || s.verifier}</p>}
+                              {s.assignment_reason && <p className="muted">分工依据：{s.assignment_reason}</p>}
+                              <ul>{s.acceptance.map(c => <li key={c}>{c}</li>)}</ul>
+                            </div>
+                          );
+                        })}
+                      </section>
+                    )}
+
+
+        {error && <p className="error" role="alert">{error}</p>}
+        {task.phase === 'EXECUTING' && !approval?.approved && <>
+          <p className="small">批准当前版本后仍需点击“开始执行”。工具权限需另行确认；修改需求会撤销批准。</p>
+          <button className="primary" disabled={locked || !approval || task.status !== 'ACTIVE'} onClick={() => act(async () => {
+            await post(base + '/approve', { digest: approval!.digest }); setDialog('');
+          })}>批准此方案</button>
+        </>}
+      </Dialog>}
+      {task && ['discuss', 'execute', 'authorize'].includes(dialog) && <Dialog
+        title={dialog === 'discuss' ? '开始方案讨论' : dialog === 'execute' ? '开始开发与验收' : '授权团队连续执行'} onClose={() => setDialog('')}>
+        <p>{dialog === 'discuss' ? '团队将讨论需求、认领工作并形成方案；定稿后等待你审阅，不直接开始开发。' :
+          dialog === 'execute' ? '按已批准的方案推进开发和独立验收。本轮最多 6 次 Agent 调用。' :
+          '团队将在当前需求范围内讨论、分工并直接执行，定稿后不再逐步询问。'}</p>
+        <p className="small">{dialog === 'discuss' ? (task.team ? '两轮成员发言与三次规划，最多 ' + (2 * members.length + 3) + ' 次调用。' : '最多三轮。') :
+          dialog === 'authorize' ? '本轮最多 ' + (2 * members.length + 15) + ' 次调用。' : ''}
+          将消耗选定 Agent 额度，外部服务会收到必要任务信息。暂停仅停止后续派发，不终止在途模型。</p>
+        {dialog === 'authorize' && <p className="small">独立验收、修复次数和调用预算限制仍然生效；遇到失败或预算耗尽会停止。</p>}
+        {error && <p className="error" role="alert">{error}</p>}
+        <div className="actions"><button className="primary" disabled={locked || task.status !== 'ACTIVE'} onClick={() => act(async () => {
+          if (dialog === 'authorize') await post(base + '/delegate-team', { authorize_execution: true });
+          else await post(base + (dialog === 'execute' ? '/execute' : '/discuss'));
+          setDialog('');
+        })}>{dialog === 'authorize' ? '确认授权并执行' : '确认开始'}</button>
+        <button onClick={() => setDialog('')}>取消</button></div>
+      </Dialog>}
+      {managingAgents && <Dialog title="Agent 设置" onClose={() => setManagingAgents(false)}>
+        {error && <p className="error" role="alert">{error}</p>}
             <p className="small muted">自定义 Agent 可通过 OpenAI 兼容接口参与任务讨论并接受只读分析步骤；不能修改项目代码或独立验收。分工须经能力校验和你的方案批准。密钥只从启动服务的环境变量读取。连接测试会发送一条不含任务内容的短消息，可能产生少量模型用量。</p>
             <p className="small">DeepSeek Harness 是本机 CLI 接入；本机 CLI 仍可能调用云端模型，并不表示离线运行。</p>
             {agents.some(a => a.id === 'deepseek-hermes') && <p className="small">DeepSeek API 是另一种云端接口配置，不是 Harness。旧 ID deepseek-hermes 仅为兼容历史消息。</p>}
 
             <div className="agent-card-list">
               {agents.map(a => (
-                <div key={a.id} className="agent-card" style={{ borderLeft: `4px solid ${a.color}` }}>
+                <div key={a.id} className="agent-card">
                   <div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: 18 }}>{a.avatar}</span>
+                      <span className="avatar">{a.name.slice(0, 1).toUpperCase()}</span>
                       <strong>{a.name}</strong>
                       <span className="small muted">({a.id})</span>
                       <span className="badge" style={{ fontSize: 11 }}>{a.type === 'cli' ? '本机 CLI' : 'API 接口'}</span>
@@ -985,8 +973,7 @@ export function Workspace() {
               ))}
             </div>
 
-            <hr className="divider" />
-            <h3>添加 API Agent（如 DeepSeek、Qwen、Ollama 等）</h3>
+            <details className="advanced-registration"><summary>接入其他 Agent（高级）</summary>
             <form onSubmit={handleAddAgent} className="stack" style={{ marginTop: 12 }}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 <label>标识 ID (英文)<input required placeholder="如 qwen-coder" value={newAgent.id} onChange={e => setNewAgent({ ...newAgent, id: e.target.value.toLowerCase().replace(/\s+/g, '-') })} /></label>
@@ -1018,10 +1005,9 @@ export function Workspace() {
                 <button className="primary" type="submit" disabled={busy || !newAgent.id || !newAgent.name}>注册 Agent</button>
                 <button type="button" onClick={() => setManagingAgents(false)}>取消</button>
               </div>
-            </form>
-          </div>
-        </div>
-      )}
+            </form></details>
+
+      </Dialog>}
     </div>
   );
 }
