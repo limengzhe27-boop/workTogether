@@ -46,12 +46,12 @@ class ChatContextTests(unittest.TestCase):
         self.assertEqual("Maintain Python 3.9 compatibility.", self.dispatch_payload()["project_memory"])
 
     def test_allow_write_flows_into_the_dispatch_payload(self):
+        self.e.chat_config(self.t, {"allow_write": True})
         self.e.message_add(self.t, "m", "codex", "add a docstring", allow_write=True)
         self.assertTrue(self.dispatch_payload()["allow_write"])
 
-    def test_write_is_granted_by_default_and_only_to_one_agent(self):
-        # A session is writable by default; parallel discussion still serializes
-        # the write turn so two agents never edit the same checkout at once.
+    def test_explicit_session_write_is_granted_to_only_one_agent(self):
+        self.e.chat_config(self.t, {"allow_write": True})
         self.e.message_add(self.t, "m", "both", "please look at the code")
         issued = self.e.chat_dispatch_round(self.t)
         writers = [d["role"] for d in issued if d["payload"].get("allow_write")]

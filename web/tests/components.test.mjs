@@ -47,7 +47,7 @@ async function component(filename) {
 
 const { MessageContent } = await component('MessageContent.tsx');
 const { ProjectNavigation } = await component('ProjectNavigation.tsx');
-const { TaskChat } = await component('TaskChat.tsx');
+const { TaskChat, ChatScopeNotice } = await component('TaskChat.tsx');
 const { SecretStorageNotice } = await component('SecretStorageNotice.tsx');
 const renderMessage = text => renderToStaticMarkup(React.createElement(MessageContent, { text }));
 const noop = () => {};
@@ -163,6 +163,26 @@ test('chat composer does not grant project write before the session state loads'
   const html = renderChat({});
   const toggles = html.match(/<input type="checkbox"[^>]*>/g) || [];
   assert.ok(toggles.every(tag => !tag.includes('checked')), 'write grant must default to off in the UI');
+  assert.ok(toggles.every(tag => tag.includes('disabled')), 'cannot grant while authorization is unknown');
+  assert.match(html, /正在读取授权，暂不能发送/);
+});
+
+test('room notice names the selected audience and explains read-only delegation', () => {
+  const html = renderToStaticMarkup(React.createElement(ChatScopeNotice, {
+    names: ['Codex', 'Antigravity'], loaded: true, writable: false,
+  }));
+  assert.match(html, /本次房间：Codex、Antigravity/);
+  assert.match(html, /派活仅限这些成员/);
+  assert.match(html, /当前只读，派活也不会获得写权限/);
+});
+
+test('room notice explains revocation without pretending to kill active processes', () => {
+  const html = renderToStaticMarkup(React.createElement(ChatScopeNotice, {
+    names: ['Codex'], loaded: true, writable: true,
+  }));
+  assert.match(html, /每轮只有一位写者/);
+  assert.match(html, /重新打开不会恢复旧授权/);
+  assert.match(html, /已启动的进程不会被强行终止/);
 });
 
 test('chat composer marks an agent whose local CLI is missing', () => {

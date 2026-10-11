@@ -33,6 +33,8 @@ type Message = {
   round?: number;
   rounds?: number;
   allow_write?: boolean;
+  write_authorized?: boolean;
+  room_members?: string[];
   context_files?: string[];
   blocked_role?: string;
   blocked_roles?: string[];
@@ -49,6 +51,7 @@ type ChatState = {
   max_auto_rounds: number;
   auto_rounds_used: number;
   held: number;
+  available_members?: string[];
 };
 
 const intentLabels: Record<string, string> = {
@@ -77,6 +80,7 @@ const waitLabels: Record<string, string> = {
   REQUIREMENT_CHANGED: '上下文已更新，需要重新确认。',
   AGENT_UNAVAILABLE: '选中的 Agent 未就绪或已停用，请检查 Agent 设置。',
   MEMBER_UNRESOLVED: '该 Agent 有未解决的失败记录。',
+  ROOM_SCOPE_CHANGED: '这条消息的成员授权已失效或旧消息缺少范围。请跳过后重新选择成员发送。',
   AUTO_ROUND_BUDGET: '自动讨论已达上限，等你确认后继续。',
 };
 
@@ -94,6 +98,14 @@ function getAgentBadge(role: string, name: string): { code: string; color: strin
     code: name.slice(0, 2).toUpperCase(),
     color: '#38bdf8',
   };
+}
+
+export function ChatScopeNotice({ names, writable, loaded }: { names: string[]; writable: boolean; loaded: boolean }) {
+  return <div className="small compose-notice" aria-label="本次协作范围">
+    <p>本次房间：{names.length ? names.join('、') : '未选择成员'}。后续讨论和派活仅限这些成员；切换选择只影响新消息。</p>
+    <p>{!loaded ? '正在读取授权，暂不能发送。' : writable ? '允许新消息申请写入，每轮只有一位写者。' : '当前只读，派活也不会获得写权限。'}
+      关闭写入会撤销未启动的旧授权；重新打开不会恢复旧授权，已启动的进程不会被强行终止。</p>
+  </div>;
 }
 
 export function TaskChat({
@@ -148,8 +160,10 @@ export function TaskChat({
   const [fileFilter, setFileFilter] = useState('');
   const [resolving, setResolving] = useState('');
   const [releasing, setReleasing] = useState(false);
+  const [changingWrite, setChangingWrite] = useState(false);
 
-  const readyAgents = React.useMemo(() => agents.filter(a => a.enabled && a.ready), [agents]);
+  const readyAgents = React.useMemo(() => agents.filter(a => a.enabled && a.ready
+    && (!chat.available_members || chat.available_members.includes(a.id))), [agents, chat.available_members]);
   const readyIds = React.useMemo(() => readyAgents.map(a => a.id), [readyAgents]);
   const missingCli = React.useCallback((agent: AgentInfo) => {
     if (agent.type !== 'cli' || !providers) return '';
@@ -182,7 +196,7 @@ export function TaskChat({
 
   const recipientValue = React.useMemo(() => {
     if (activeAgentIds.length === 0) return '';
-    if (activeAgentIds.length === readyIds.length) return 'all';
+    // Send the explicit UI snapshot. A newly enabled Agent must not be silently added.
     if (activeAgentIds.length === 1) return activeAgentIds[0];
     return activeAgentIds.join(',');
   }, [activeAgentIds, readyIds]);
@@ -205,6 +219,7 @@ export function TaskChat({
         if (alive) {
           setMessages(data.messages);
           if (data.chat) setChat(data.chat);
+          setSelectedIds(current => current ?? data.chat?.available_members ?? []);
           setLoadError('');
           setLoaded(true);
           onPending(data.messages.some(m => ['QUEUED', 'RUNNING'].includes(m.status)));
@@ -224,11 +239,11 @@ export function TaskChat({
 
   async function send(e: React.FormEvent) {
     e.preventDefault();
-    if (sending || !text.trim() || !recipientValue) return;
+    if (!loaded || changingWrite || sending || !text.trim() || !recipientValue) return;
     setSending(true);
     setError('');
     try {
-      const payload: Record<string, unknown> = { message_id: id, recipient: recipientValue, content: text.trim() };
+      const payload: Record<string, unknown> = { message_id: id, recipient: recipientValue, content: text.trim(), allow_write: chat.allow_write };
       if (contextFiles.length > 0) payload.context_files = contextFiles;
       if (rounds === 2) payload.rounds = 2;
       await request(`/tasks/${taskId}/messages`, {
@@ -256,17 +271,23 @@ export function TaskChat({
   }
 
   async function toggleSessionWrite() {
+    if (!loaded || changingWrite) return;
+    const next = !chat.allow_write;
+    if (next && !window.confirm('允许随后发送的已选成员修改当前项目文件？开启不会立即调用模型，之前只读或已撤销的消息不会自动获得写权限。')) return;
+    setChangingWrite(true);
     setError('');
     try {
-      const next = !chat.allow_write;
       const state = await request<ChatState>(`/tasks/${taskId}/chat-config`, {
         method: 'POST',
         body: JSON.stringify({ allow_write: next }),
       });
       setChat(current => ({ ...current, ...state }));
+      setId(crypto.randomUUID());
       setTick(n => n + 1);
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setChangingWrite(false);
     }
   }
 
@@ -390,7 +411,8 @@ export function TaskChat({
                 <p className="prose">{m.content}</p>
                 <div className="user-message-meta">
                   {m.recipient !== 'all' && <span className="small">@{getRecipientLabel(m.recipient)}</span>}
-                  {m.allow_write && <span className="message-flag" title="本会话的 Agent 可以修改项目文件">可写入项目</span>}
+                  {m.allow_write && <span className="message-flag" title="仅对本条消息及其授权成员的后续派发生效">{m.write_authorized ? '已授权写入' : '旧写授权已失效'}</span>}
+                  {m.room_members && <span className="small" title="发送时固定，后续派活不能添加其他成员">房间：{m.room_members.map(role => agentMap[role]?.name || role).join('、')}</span>}
                   {!!m.rounds && m.rounds > 1 && <span className="message-flag">{m.rounds} 轮</span>}
                   {!!m.context_files?.length && <span className="message-flag" title={m.context_files.join('\n')}>
                     <Paperclip aria-hidden="true" />{m.context_files.length} 个文件
@@ -418,11 +440,11 @@ export function TaskChat({
               </div>
             )}
             {(m.status === 'BLOCKED' || (m.status === 'QUEUED'
-              && ['AGENT_UNAVAILABLE', 'MEMBER_UNRESOLVED'].includes(m.wait_reason || ''))) && (
+              && ['AGENT_UNAVAILABLE', 'MEMBER_UNRESOLVED', 'ROOM_SCOPE_CHANGED'].includes(m.wait_reason || ''))) && (
               <div className="message-recovery small">
                 <span>{m.blocked_role
                   ? `${agentMap[m.blocked_role]?.name || m.blocked_role} 的回复中断。`
-                  : m.status === 'BLOCKED' ? '回复中断。' : '这一条没有 Agent 能接。'}</span>
+                  : m.status === 'BLOCKED' ? '回复中断。' : waitLabels[m.wait_reason || ''] || '这一条没有 Agent 能接。'}</span>
                 {m.status === 'BLOCKED' && <button type="button" disabled={!!resolving} onClick={() => resolveMessage(m.id, 'retry')}>
                   <RefreshCw aria-hidden="true" />{resolving === m.id + 'retry' ? '重试中…' : '重试'}
                 </button>}
@@ -431,7 +453,7 @@ export function TaskChat({
                 </button>
               </div>
             )}
-            {m.status === 'QUEUED' && m.wait_reason && !['AGENT_UNAVAILABLE', 'MEMBER_UNRESOLVED'].includes(m.wait_reason) && (
+            {m.status === 'QUEUED' && m.wait_reason && !['AGENT_UNAVAILABLE', 'MEMBER_UNRESOLVED', 'ROOM_SCOPE_CHANGED'].includes(m.wait_reason) && (
               <p className="wait-note small" role="status">
                 {waitLabels[m.wait_reason] || m.wait_reason}
                 <button type="button" onClick={onDetails}>查看详情</button>
@@ -532,7 +554,7 @@ export function TaskChat({
       }}>有新动态 · 回到底部</button>}
       {chat.held > 0 && (
         <div className="held-banner" role="status">
-          <span>有 {chat.held} 条 Agent 之间的消息停在自动轮次上限（已用 {chat.auto_rounds_used}/{chat.max_auto_rounds} 轮）。</span>
+          <span>有 {chat.held} 条 Agent 消息等待你确认（自动派发已用 {chat.auto_rounds_used}/{chat.max_auto_rounds} 条）。继续不恢复已撤销的写权限。</span>
           <button type="button" disabled={releasing} onClick={releaseAgentMessages}>
             <RefreshCw aria-hidden="true" />{releasing ? '送达中…' : '让他们继续'}
           </button>
@@ -632,8 +654,8 @@ export function TaskChat({
                 <Paperclip aria-hidden="true" /><span>引用文件</span>
               </button>
               <label className={'composer-tool composer-toggle' + (chat.allow_write ? ' is-active' : '')}
-                title="会话级授权：开启后本会话的 Agent 可以直接读写项目；同一时刻只有一个 Agent 持有写入，其他 Agent 只读并行">
-                <input type="checkbox" checked={chat.allow_write} disabled={sending}
+                title="会话写入总开关：仅新发送的消息及其所选成员可继承；每轮单一写者；已撤销或只读的旧消息不会自动升级">
+                <input type="checkbox" checked={chat.allow_write} disabled={sending || changingWrite || !loaded}
                   onChange={toggleSessionWrite} />
                 <ShieldAlert aria-hidden="true" /><span>可在项目里工作</span>
               </label>
@@ -645,14 +667,15 @@ export function TaskChat({
                   <option value={2}>2</option>
                 </select>
               </label>
-              <button className="primary icon-button send-button" aria-label={sending ? '发送中' : '发送消息'} title="⌘ / Ctrl + Enter 发送" disabled={sending || !text.trim() || !recipientValue}>
+              <button className="primary icon-button send-button" aria-label={sending ? '发送中' : '发送消息'} title="⌘ / Ctrl + Enter 发送" disabled={!loaded || changingWrite || sending || !text.trim() || !recipientValue}>
                 <ArrowUp /><span className="sr-only">{sending ? '发送中…' : '发送消息'}</span>
               </button>
             </div>
           </div>
         </form>
+        <ChatScopeNotice names={activeAgentIds.map(role => agentMap[role]?.name || role)} writable={chat.allow_write} loaded={loaded} />
         {readyAgents.length > 0 && activeAgentIds.length === 0 && <p className="small compose-notice">请点击上方「全部」或单个 Agent 选择消息接收对象。</p>}
-        {!agents.some(a => a.ready) && <p className="small error">没有就绪成员，请先检查左下角 Agent 设置。</p>}
+        {!readyAgents.length && <p className="small error">没有就绪成员，请检查本任务团队和左下角 Agent 设置。</p>}
       </div>
     </section>
   );

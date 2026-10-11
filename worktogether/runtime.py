@@ -124,6 +124,7 @@ class Runtime:
         else:
             room.append("the message you are answering was written by the user")
         room.append(f"this is round {payload.get('round', 1)} of {payload.get('total_rounds', 1)}")
+        room.append("AUTHORIZED MEMBERS FOR THIS MESSAGE CHAIN: " + ", ".join(payload.get("room_members", [])))
         if payload.get("is_auto"):
             room.append("this turn was started by a peer agent, not by the user")
         peer_replies = payload.get("peer_replies") or []
@@ -195,7 +196,10 @@ class Runtime:
                     "proposals:[{title,work_kind:code|analysis,assignee,reason}] (max 3, advice for the user), "
                     "messages:[{to:peer-id-or-'all', intent:'ask'|'assign'|'claim'|'report', content:string}] "
                     "(max 3) to question a peer, hand work to a peer, claim work, or report to the room. "
-                    "Use assign when another agent should do work; the platform delivers it and lets that agent act. "
+                    "Address only payload.room_members; ask/assign require a named other member, never 'all'. "
+                    "Only claim/report may use 'all' as informational messages. Do not invite or launch other agents. "
+                    "Delegation cannot expand the user's original write grant; a read-only request stays read-only. "
+                    "Use assign for an authorized peer; if new write permission is needed, ask the user instead. "
                     "If unable, status:BLOCKED and data:{reason:string}.\n" + extra_context + "DISPATCH:\n" + encode(dispatch))
         if dispatch["kind"] == "ANALYZE":
             return ("Complete this assigned read-only analysis. Do not modify files or launch other agents. "
@@ -351,6 +355,7 @@ class Runtime:
                     require((t["status"] == "ACTIVE" or (t["status"] == "COMPLETED" and d["kind"] == "CHAT")) and current["status"] == "PREPARED"
                             and self.engine._get_dispatch(t, dispatch_id)["status"] == "ACTIVE",
                             "Task stopped before process launch", "INVALID_STATE")
+                    self.engine.validate_chat_launch(db, t, self.engine._get_dispatch(t, dispatch_id))
                     process = subprocess.Popen(args, cwd=run["cwd"], stdin=subprocess.PIPE,
                                                stdout=out, stderr=err, start_new_session=True)
                     run.update(status="RUNNING", pid=process.pid)

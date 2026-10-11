@@ -39,6 +39,7 @@ class HarnessTests(unittest.TestCase):
 
     def test_opt_in_resume_and_strict_policy(self):
         self.assertFalse(self.registry.get("deepseek-harness").enabled)
+        self.engine.chat_config(self.task, {"allow_write": True})
         first = self.chat()
         self.assertEqual("COMPLETED", first["status"])
         second = self.chat("second")

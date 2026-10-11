@@ -148,12 +148,15 @@ class RoomHttpContractTests(unittest.TestCase):
 
     def test_get_includes_chat_state_and_server_owned_message_fields(self):
         saved = self.post_message()
-        self.assertEqual(("user", 1, 1, True),
-                         (saved["sender"], saved["round"], saved["rounds"], saved["allow_write"]))
+        self.assertEqual(("user", 1, 1), (saved["sender"], saved["round"], saved["rounds"]))
+        self.assertFalse(saved.get("allow_write", False))
+        self.assertEqual(["codex"], saved["room_members"])
         response = self.request("GET", "/messages")
         self.assertEqual({"messages", "chat"}, set(response))
-        self.assertEqual({"allow_write": True, "max_auto_rounds": 2,
-                          "auto_rounds_used": 0, "held": 0}, response["chat"])
+        self.assertEqual({"allow_write": False, "max_auto_rounds": 2,
+                          "auto_rounds_used": 0, "held": 0,
+                          "available_members": response["chat"]["available_members"]}, response["chat"])
+        self.assertIn("codex", response["chat"]["available_members"])
         self.assertEqual(["codex"], response["messages"][0]["pending_roles"])
         self.assertEqual([], response["messages"][0]["failed_roles"])
 
@@ -184,16 +187,15 @@ class RoomHttpContractTests(unittest.TestCase):
             self.engine._save(db, task, "FIXTURE_LEGACY", {})
         config = self.request("POST", "/chat-config", {})
         self.assertEqual({"task_id", "allow_write", "max_auto_rounds", "auto_rounds_used"}, set(config))
-        # Current migration matches new writable sessions; record this explicitly,
-        # without granting anything to a real workspace or changing production.
-        self.assertTrue(config["allow_write"])
+        self.assertFalse(config["allow_write"])
         self.request("POST", "/chat-config", {"allow_write": False})
         self.assertFalse(self.request("POST", "/chat-config", {})["allow_write"])
 
     def test_auto_message_budget_and_explicit_release_response(self):
         self.request("POST", "/chat-config", {"max_auto_rounds": 0, "allow_write": False})
-        self.post_message()
-        dispatch = self.engine.chat_dispatch(self.task)
+        self.post_message(recipient="both")
+        dispatch, peer = self.engine.chat_dispatch_round(self.task)
+        self.engine.submit(self.task, chat_report(peer))
         self.engine.submit(self.task, chat_report(dispatch, data={"messages": [
             {"to": "antigravity", "intent": "ask", "content": "review?"}]}))
         response = self.request("GET", "/messages")
@@ -211,14 +213,16 @@ class RoomHttpContractTests(unittest.TestCase):
         self.assertEqual(0, released["chat"]["auto_rounds_used"])
         self.assertEqual({"runs": []}, self.request("GET", "/runs"))
 
-    def test_one_off_read_only_does_not_override_followup_session_grant(self):
-        self.post_message(allow_write=False)
-        dispatch = self.engine.chat_dispatch(self.task)
+    def test_one_off_read_only_cannot_be_escalated_by_delegation(self):
+        self.request("POST", "/chat-config", {"allow_write": True})
+        self.post_message(recipient="both", allow_write=False)
+        dispatch, peer = self.engine.chat_dispatch_round(self.task)
+        self.engine.submit(self.task, chat_report(peer))
         self.assertFalse(dispatch["payload"].get("allow_write", False))
         self.engine.submit(self.task, chat_report(dispatch, data={"messages": [
             {"to": "antigravity", "intent": "assign", "content": "next task"}]}))
         auto = self.request("GET", "/messages")["messages"][1]
-        self.assertTrue(auto["allow_write"])
+        self.assertFalse(auto.get("allow_write", False))
         self.assertEqual(1, self.request("GET", "/messages")["chat"]["auto_rounds_used"])
 
     def test_round_two_gets_only_bounded_previous_round_replies(self):

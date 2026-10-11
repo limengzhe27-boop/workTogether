@@ -37,6 +37,15 @@ class GroupRoomTests(unittest.TestCase):
         self.project = self.e.project_add("fixture", str(project_dir))
         self.task = self.e.task_add(self.project["id"], "room", "coordinate")["id"]
 
+    def start_selected_room(self, content, speaker="codex"):
+        """Both peers are explicitly selected; finish the non-speaking fixture peer."""
+        self.e.message_add(self.task, "m", "both", content)
+        issued = self.e.chat_dispatch_round(self.task)
+        for dispatch in issued:
+            if dispatch["role"] != speaker:
+                self.e.submit(self.task, chat_report(dispatch))
+        return next(d for d in issued if d["role"] == speaker)
+
     # ---- simultaneous broadcast -------------------------------------------------
     def test_round_one_is_a_simultaneous_broadcast(self):
         self.e.message_add(self.task, "m", "both", "status?")
@@ -77,8 +86,7 @@ class GroupRoomTests(unittest.TestCase):
 
     # ---- agent-to-agent ---------------------------------------------------------
     def test_agent_can_ask_a_peer_and_the_peer_answers(self):
-        self.e.message_add(self.task, "m", "codex", "你是谁")
-        dispatch = self.e.chat_dispatch(self.task)
+        dispatch = self.start_selected_room("你是谁")
         self.e.submit(self.task, chat_report(dispatch, data={
             "messages": [{"to": "antigravity", "intent": "ask", "content": "你验证一下这个结论？"}]}))
         messages = self.e.messages(self.task)
@@ -97,8 +105,7 @@ class GroupRoomTests(unittest.TestCase):
         self.assertTrue(follow[0]["payload"]["is_auto"])
 
     def test_assign_hands_work_to_a_named_peer(self):
-        self.e.message_add(self.task, "m", "codex", "改一下")
-        dispatch = self.e.chat_dispatch(self.task)
+        dispatch = self.start_selected_room("改一下")
         report = chat_report(dispatch, data={
             "messages": [{"to": "antigravity", "intent": "assign", "content": "请实现 X"}]})
         self.e.submit(self.task, report)
@@ -143,8 +150,7 @@ class GroupRoomTests(unittest.TestCase):
 
     def test_a_peer_that_becomes_unavailable_can_still_be_skipped(self):
         self.e.chat_config(self.task, {"max_auto_rounds": 4})
-        self.e.message_add(self.task, "m", "codex", "开始")
-        dispatch = self.e.chat_dispatch(self.task)
+        dispatch = self.start_selected_room("开始")
         self.e.submit(self.task, chat_report(dispatch, data={
             "messages": [{"to": "antigravity", "intent": "ask", "content": "请复核"}]}))
         # The addressed peer is disabled before the room can hand it the turn.
@@ -167,8 +173,7 @@ class GroupRoomTests(unittest.TestCase):
     # ---- automatic round budget -------------------------------------------------
     def test_automatic_back_and_forth_stops_at_the_budget(self):
         self.e.chat_config(self.task, {"max_auto_rounds": 1})
-        self.e.message_add(self.task, "m", "codex", "开始")
-        dispatch = self.e.chat_dispatch(self.task)
+        dispatch = self.start_selected_room("开始")
         self.e.submit(self.task, chat_report(dispatch, data={
             "messages": [{"to": "antigravity", "intent": "ask", "content": "第一轮"}]}))
         follow = self.e.chat_dispatch_round(self.task)[0]
@@ -205,6 +210,7 @@ class GroupRoomTests(unittest.TestCase):
 
     # ---- write serialization ----------------------------------------------------
     def test_only_the_capable_coder_holds_the_write_turn(self):
+        self.e.chat_config(self.task, {"allow_write": True})
         self.e.message_add(self.task, "m", "both", "实现它")
         issued = self.e.chat_dispatch_round(self.task)
         writers = [d["role"] for d in issued if d["payload"].get("allow_write")]
@@ -213,6 +219,7 @@ class GroupRoomTests(unittest.TestCase):
         self.assertEqual(["antigravity"], readers)
 
     def test_a_writable_agent_gets_the_turn_when_it_is_the_only_one_addressed(self):
+        self.e.chat_config(self.task, {"allow_write": True})
         # Every local CLI adapter can write now, so an explicit hand-off to a
         # non-coder must actually grant that agent the turn.
         self.e.message_add(self.task, "m", "antigravity", "改一下")
@@ -221,17 +228,16 @@ class GroupRoomTests(unittest.TestCase):
         self.assertTrue(issued[0]["payload"].get("allow_write"))
 
     def test_a_discussion_round_still_writes_through_the_coder(self):
+        self.e.chat_config(self.task, {"allow_write": True})
         self.e.message_add(self.task, "m", "both", "一起看看")
         issued = self.e.chat_dispatch_round(self.task)
         writers = [d["role"] for d in issued if d["payload"].get("allow_write")]
         self.assertEqual(["codex"], writers)
 
-    def test_an_assignment_inherits_the_session_write_grant(self):
-        # Without this an `assign` could never be carried out by its recipient.
-        self.e.message_add(self.task, "m", "antigravity", "先看看这个项目")
-        first = self.e.chat_dispatch_round(self.task)
-        self.assertEqual(["antigravity"], [d["role"] for d in first])
-        self.e.submit(self.task, chat_report(first[0], data={
+    def test_an_assignment_inherits_the_authorized_chain_write_grant(self):
+        self.e.chat_config(self.task, {"allow_write": True})
+        speaker = self.start_selected_room("先看看这个项目", speaker="antigravity")
+        self.e.submit(self.task, chat_report(speaker, data={
             "messages": [{"to": "codex", "intent": "assign", "content": "请把占位测试换成真实测试"}]}))
         auto = [m for m in self.e.messages(self.task) if m.get("auto")][-1]
         self.assertEqual("assign", auto["intent"])
@@ -242,10 +248,9 @@ class GroupRoomTests(unittest.TestCase):
 
     def test_an_assignment_stays_read_only_when_the_session_forbids_writes(self):
         self.e.chat_config(self.task, {"allow_write": False})
-        self.e.message_add(self.task, "m", "antigravity", "先看看")
-        first = self.e.chat_dispatch_round(self.task)
-        self.assertFalse(first[0]["payload"].get("allow_write"))
-        self.e.submit(self.task, chat_report(first[0], data={
+        speaker = self.start_selected_room("先看看", speaker="antigravity")
+        self.assertFalse(speaker["payload"].get("allow_write"))
+        self.e.submit(self.task, chat_report(speaker, data={
             "messages": [{"to": "codex", "intent": "assign", "content": "请改"}]}))
         auto = [m for m in self.e.messages(self.task) if m.get("auto")][-1]
         self.assertFalse(auto.get("allow_write"))
@@ -255,6 +260,8 @@ class GroupRoomTests(unittest.TestCase):
 
     def test_a_second_task_in_the_same_project_stays_read_only_while_one_writes(self):
         other = self.e.task_add(self.project["id"], "other", "parallel")["id"]
+        self.e.chat_config(self.task, {"allow_write": True})
+        self.e.chat_config(other, {"allow_write": True})
         self.e.message_add(self.task, "m1", "codex", "先动手")
         first = self.e.chat_dispatch_round(self.task)
         self.assertTrue(first[0]["payload"].get("allow_write"))
@@ -265,6 +272,8 @@ class GroupRoomTests(unittest.TestCase):
         self.assertFalse(second[0]["payload"].get("allow_write"))
 
     def test_session_write_grant_is_configurable(self):
+        self.assertFalse(self.e.chat_state(self.task)["allow_write"])
+        self.e.chat_config(self.task, {"allow_write": True})
         self.assertTrue(self.e.chat_state(self.task)["allow_write"])
         self.e.chat_config(self.task, {"allow_write": False})
         self.assertFalse(self.e.chat_state(self.task)["allow_write"])
@@ -273,18 +282,17 @@ class GroupRoomTests(unittest.TestCase):
         with self.assertRaises(CollabError):
             self.e.chat_config(self.task, {"max_auto_rounds": 99})
 
-    def test_sessions_created_before_the_room_are_writable_too(self):
-        # A task stored without the new config keys still behaves like a new one.
+    def test_sessions_missing_write_config_do_not_acquire_permission(self):
         with self.e.transaction() as db:
             t = self.e._task(db, self.task)
             t["config"] = {"max_repairs": 2, "timeout_seconds": 1800}
             self.e._save(db, t, "LEGACY_FIXTURE", {})
         state = self.e.chat_state(self.task)
-        self.assertTrue(state["allow_write"])
+        self.assertFalse(state["allow_write"])
         self.assertEqual(2, state["max_auto_rounds"])
         self.e.message_add(self.task, "m", "both", "写吧")
         issued = self.e.chat_dispatch_round(self.task)
-        self.assertEqual(["codex"], [d["role"] for d in issued if d["payload"].get("allow_write")])
+        self.assertEqual([], [d["role"] for d in issued if d["payload"].get("allow_write")])
 
 
 if __name__ == "__main__":

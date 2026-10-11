@@ -38,6 +38,7 @@ class ChangeAttributionTests(unittest.TestCase):
             changed_files(before, file_digests(self.project)))
 
     def test_a_write_turn_reports_the_files_it_touched(self):
+        self.e.chat_config(self.task, {"allow_write": True})
         self.e.message_add(self.task, "m", "codex", "改一下 README")
         with patch.dict("os.environ", {"WT_FAKE_MODE": "write"}):
             dispatch = self.e.chat_dispatch_round(self.task)[0]

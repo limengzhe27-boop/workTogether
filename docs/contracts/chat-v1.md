@@ -15,14 +15,16 @@ HTTP 总表与错误见 [v1.md](v1.md)。群聊与“讨论方案 → 审批 →
 | `recipient` | 必填：单个 Agent ID、逗号分隔的 ID、both 或 all |
 | `content` | 必填，非空字符串，≤20000 字符 |
 | `rounds` | 可选，整数 1 或 2（不接受布尔值），默认 1；本条用户消息的发言轮数 |
-| `allow_write` | 可选布尔；省略或 null 继承会话配置，false 仅使本条用户消息只读 |
+| `allow_write` | 可选布尔；省略或 null 继承会话配置，false 使本条及其全部后续委派只读；会话关闭时请求 true 返回 APPROVAL_REQUIRED |
 | `context_files` | 可选，最多 10 个非空文件路径字符串 |
 | `referenced_task_ids` | 可选，最多 5 个非空任务 ID 字符串；仅注入同项目引用 |
 
-拒绝额外字段，包括伪造 sender、intent、round、auto、held。
+拒绝额外字段，包括伪造 sender、intent、round、auto、held、room_members、write_epoch、write_authorized。
 both 指 Codex 和 Antigravity，两者均须就绪；all 指当前就绪成员，与已配置团队
 取交集；显式收件人不得超出团队。人数须为 1–12，不包括停用/未就绪 Agent。
-就绪判断不检查真实登录、额度和全部权限。
+就绪判断不检查真实登录、额度和全部权限。首次发送时将解析后的收件人固定为
+room_members；之后的提问/派活只能在这个集合内流转，不能因启用新 Agent 而扩大。
+前端发送明确的 ID 清单，而非动态 all，避免点击发送时加入用户尚未见到的新成员。
 
 相同任务、相同 ID、相同 recipient/content 返回原消息；二者任一不同返回 409。
 当前幂等比较**不包含** rounds / allow_write / 引用字段，修改它们不会覆盖原消息。
@@ -31,7 +33,9 @@ both 指 Codex 和 Antigravity，两者均须就绪；all 指当前就绪成员�
 ## 消息与会话响应
 
 `GET /api/tasks/{task_id}/messages` 返回 `{messages:[...],chat:{...}}`。
-chat 为 `{allow_write,max_auto_rounds,auto_rounds_used,held}`，held 是等待释放的消息数。
+chat 为 `{allow_write,max_auto_rounds,auto_rounds_used,held,available_members}`。
+held 是等待释放的消息数；available_members 是本任务可选择的就绪成员（若有团队则取交集），
+不是旧消息可以扩展到的新房间。输入框展示本次所选房间与写入状态。
 两者分别读取，不承诺并发更新期间的原子快照。
 
 消息基本字段：id、task_id、sender、recipient、content、participants、revision、
@@ -45,6 +49,9 @@ status、round、rounds、replies、created_at（Unix 秒）。字段语义如�
 | `auto` / `parent_message_id` | Agent 衍生消息标记及来源消息 ID |
 | `held` | 超预算消息的 true 标记；释放后移除，并非每条消息都有 false |
 | `allow_write` | 请求写入时保存 true；缺省表示此消息未请求写入，不保证每位接收者可写 |
+| `room_members` | 发送时确定的成员范围；后续 Agent 消息继承并可缩小，不能添加其他成员 |
+| `write_epoch` | 服务端内部授权代次，随消息保存；不得作为客户端申请扩权的字段 |
+| `write_authorized` | GET 时派生的当前有效写入授权；与历史请求 allow_write 区分，撤销后为 false |
 | `context_files` / `referenced_task_ids` | 用户选择的上下文引用（非空时保存） |
 | `pending_roles` / `failed_roles` | GET 派生字段：当前轮待回复 / 失败成员 |
 | `active_roles` / `active_since` / `write_role` | 运行中的派发成员、开始时间及获写授权成员（如有） |
@@ -69,10 +76,17 @@ README 前 3000 字符和最多 120 个路径。引用文件单个 ≤12000 字�
 任务引用取同项目最近两条消息的回复摘要（各 600 字符），无回复则取需求摘要；
 不存在或跨项目引用不会注入。这不是共享其它桌面聊天窗口。
 
-新任务会话 allow_write:true、max_auto_rounds:2、auto_rounds_used:0。当前读取逻辑也为
-缺少 allow_write 的旧任务补 true；已明确保存的 false 不变。旧会话迁移的授权提示
-仍需安全复核，不能把“缺省字段”理解成只读。每轮仅一个可写 CLI 成员获写入派发，优先
-具备编码能力者；其余并行只读。跨任务检查同项目已有 CODE/FIX 或持写 CHAT。
+新任务会话 allow_write:false、max_auto_rounds:2、auto_rounds_used:0。缺少 allow_write
+的旧任务按 false 处理；已有明确保存的 true / false 保留。前端先读取授权再允许发送，
+打开写入需要用户确认；关闭不需要确认。每轮仅一个可写 CLI 成员获写入派发，优先
+具备编码能力者，其余并行只读。CODE/FIX/VERIFY 与持写 CHAT 在项目内互斥；
+ACTIVE / BLOCKED 的占用都须先解决，正式执行也不能绕过未结束的群聊写者。
+
+关闭写入会递增授权代次，旧消息的写授权永久失效：重新打开、显式重试或释放 HELD
+均不会恢复它。未签发的旧消息可继续只读讨论；已经签发可写派发但尚未启动的进程，
+在启动锁内复核失败后保存 PERMISSION_REVOKED / BLOCKED，必须显式处理，不自动重放。
+需要重新写入时，开启会话写入并发送**新消息**。已经启动的进程不会被强杀；关闭开关
+不承诺回收它已持有的操作系统权限，但其后续委派不能再使用被撤销的授权。
 这不是 worktree 隔离或防外部编辑锁。API Agent 无本地工具，只能使用传入材料。
 写入仍受 CLI 沙箱/权限约束。Antigravity 写模式保留 sandbox，真实写入边界待独立验收。
 
@@ -87,14 +101,16 @@ data 可为空，或包含 proposals / messages。proposals 是分工建议，�
 每条为 `{title,work_kind,assignee,reason}`，最多三条。
 messages 最多三条，每条为 `{to,intent,content}`，content 非空且 ≤4000 字符。
 
-- ask / assign 必须点名另一位就绪房间成员，生成后续调用。当前 to:all 虽可通过
-  报告形状校验，但不会生成这两种派发，不能用来广播派活。
+- ask / assign 必须点名另一位就绪房间成员；to:all 被拒绝，不能广播派活。
 - claim / report 是告知型，保存为 DELIVERED，participants 为空，不调用或计预算。
 - sender、ID、parent_message_id 由平台生成，不执行模型提供的命令字符串。
-- 房间成员 = 团队 ∩ 就绪；无团队时为全部就绪 Agent，**不等于输入框本次收件人**。
-  因此被点名者可以交给另一位房间成员。显式房间范围 UX 仍是 P0-4。
-- 衍生消息继承**当前会话**写入授权，不继承父消息的 false。只使一条用户消息只读
-  不能保证后续委派只读；整段交流只读需先关闭会话写入开关。
+- 后续房间范围 = 原消息的所选成员 ∩ 当前团队允许的就绪成员。单独点名 Codex 后，
+  它不能邀请未选中的 Antigravity；要它们合作，请在发送前同时选择两者。
+- 衍生写授权 = 父消息仍有效的授权 ∩ 当前会话开关。用户单条只读限制不能通过派活
+  绕过；原本可写的请求中，暂时只读的同伴仍可向房间内另一位成员交接写工作。
+- 旧用户消息缺少 room_members 时仅使用其已保存的收件人；旧自动消息缺少范围时
+  保守停在 ROOM_SCOPE_CHANGED，提供“跳过后重新选择成员发送”的恢复入口。
+- 派发时和启动进程前都重新检查成员范围；变更不能使一个不在授权范围内的 Agent 启动。
 
 max_auto_rounds 名称沿用历史，实际按每条入队的自动 ask/assign 消息计数，
 不是模型内部轮次、Token 或总费用上限。每条消耗一次，超限进入 HELD。
@@ -103,7 +119,7 @@ max_auto_rounds 名称沿用历史，实际按每条入队的自动 ask/assign �
 
 `POST .../chat-release` 使用 `{}`，将**所有** HELD 消息放回 QUEUED；有释放才把
 已用计数归零。释放本身不调用模型，但后台消费者随后会处理并可能产生用量。
-可以反复释放，所以预算不是整个会话的硬费用封顶。
+释放不改变房间范围或授权代次。可以反复释放，所以预算不是整个会话的硬费用封顶。
 
 ## 显式恢复与验证边界
 
@@ -113,6 +129,7 @@ BLOCKED / RUNNING / QUEUED。PREPARED/RUNNING 进程须先确认已停止。
 旧派发成为 SUPERSEDED；skip 保存占位，retry 重新排队，已成功结果保留。
 不会自动重放失败成员，也不以恢复绕过权限。
 
-确定性覆盖：test_group_chat.py、test_server_context.py、test_contracts.py。
+确定性覆盖：test_group_chat.py、test_server_context.py、test_contracts.py、test_room_authorization.py。
+新增模拟 CLI 的 HTTP 两轮讨论与同伴跟进闭环，不是实际模型验收。
 真实证据以 [group-room 验收记录](../../qa/group-room/acceptance.md) 为准。
 本次契约对齐未调用真实模型，未验证 Antigravity 写权限、长会话成本或并行写隔离。

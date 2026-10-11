@@ -137,11 +137,11 @@ class Engine:
         row = db.execute("SELECT body FROM tasks WHERE id=?", (task,)).fetchone()
         require(row is not None, "Unknown task", "NOT_FOUND")
         t = json.loads(row["body"])
-        # Sessions created before the group room default to the same behaviour
-        # as new ones: writable, with a bounded automatic back-and-forth.
+        # Missing permission is not consent. Preserve an explicitly saved value.
         config = t.setdefault("config", {})
-        config.setdefault("allow_write", True)
+        config.setdefault("allow_write", False)
         config.setdefault("max_auto_rounds", 2)
+        config.setdefault("write_epoch", 0)
         return t
 
     def _save(self, db, task, kind, detail):
@@ -201,9 +201,9 @@ class Engine:
                     "revision": 1, "revisions": [],
                     "status": "ACTIVE", "phase": "PLANNING", "block_reason": None,
                     "config": {"max_repairs": 2, "timeout_seconds": 1800,
-                               # A session is writable by default: choosing a project means
-                               # the agents may work in it. Writes stay serialized per project.
-                               "allow_write": True, "max_auto_rounds": 2},
+                               # Choosing recipients is not a write grant. The user enables
+                               # writes explicitly; grants remain serialized per project.
+                               "allow_write": False, "max_auto_rounds": 2, "write_epoch": 0},
                     "draft_plan": None, "plan_review": None, "steps": [], "dispatches": [],
                     "auto_rounds_used": 0, "created_at": time.time()}
             db.execute("INSERT INTO tasks VALUES(?,?,?)", (task["id"], project, encode(task)))
@@ -367,6 +367,7 @@ class Engine:
                 round_no = message.get("round", 1)
                 _, _, answered, failed_roles, pending = self._round_state(task, message)
                 message.setdefault("sender", "user")
+                message["write_authorized"] = self._message_can_write(task, message)
                 message["pending_roles"] = pending
                 message["failed_roles"] = sorted(failed_roles)
                 if message["status"] == "QUEUED":
@@ -404,6 +405,7 @@ class Engine:
                 "max_auto_rounds": config.get("max_auto_rounds", 2),
                 "auto_rounds_used": task.get("auto_rounds_used", 0),
                 "held": held,
+                "available_members": self._available_room_members(db, task),
             }
 
     def _chat_wait_reason(self, db, task):
@@ -424,7 +426,9 @@ class Engine:
 
     @staticmethod
     def _chat_roles(message):
-        return message.get("participants") or (["codex", "antigravity"]
+        if "participants" in message:
+            return message["participants"]
+        return (["codex", "antigravity"]
             if message["recipient"] in ("both", "all") else [message["recipient"]])
 
     def _chat_member_wait_reason(self, db, task, message, role=None):
@@ -448,6 +452,8 @@ class Engine:
                 stored_secret = ""
         if row is None or not AgentConfig(json.loads(row[0]), stored_secret=stored_secret).ready:
             return "AGENT_UNAVAILABLE"
+        if role not in self._room_members(db, task, message):
+            return "ROOM_SCOPE_CHANGED"
         if self._busy(db, task, role):
             return "MEMBER_UNRESOLVED"
         return None
@@ -480,11 +486,44 @@ class Engine:
                 ready.add(row["id"])
         return ready
 
-    def _room_members(self, db, task):
+    def _available_room_members(self, db, task):
         ready = self._ready_agent_ids(db)
         if task.get("team"):
             return sorted(ready & set(task["team"]["members"]))
         return sorted(ready)
+
+    def _room_members(self, db, task, message):
+        # A root user message freezes the selected recipients for its whole chain.
+        # Old user messages can safely fall back to their recorded recipients;
+        # unscoped legacy automatic messages need human review, not a wider room.
+        scope = message.get("room_members")
+        if scope is None:
+            scope = [] if message.get("auto") else self._chat_roles(message)
+        return sorted(set(scope) & set(self._available_room_members(db, task)))
+
+    @staticmethod
+    def _message_can_write(task, message):
+        config = task.get("config", {})
+        return (config.get("allow_write") is True and message.get("allow_write") is True
+                and message.get("write_epoch", 0) == config.get("write_epoch", 0))
+
+    def validate_chat_launch(self, db, task, dispatch):
+        """Recheck grants under the same transaction as process launch."""
+        if dispatch["kind"] != "CHAT":
+            return
+        row = db.execute("SELECT body FROM messages WHERE task_id=? AND id=?",
+                         (task["id"], dispatch["payload"].get("message_id"))).fetchone()
+        require(row is not None, "Chat message no longer exists", "ROOM_SCOPE_CHANGED")
+        message = json.loads(row[0])
+        require(dispatch["role"] in self._room_members(db, task, message),
+                "Room membership changed; review or skip this message", "ROOM_SCOPE_CHANGED")
+        if dispatch["payload"].get("allow_write"):
+            require(self._message_can_write(task, message)
+                    and dispatch["payload"].get("write_epoch", 0) == task["config"].get("write_epoch", 0),
+                    "Write permission was revoked; skip or explicitly retry read-only, or send a new authorized message",
+                    "PERMISSION_REVOKED")
+            require(self._project_write_owner(db, task["project_id"], exclude_dispatch=dispatch["id"]) is None,
+                    "Another unresolved writer or verifier owns this project", "INVALID_STATE")
 
     def _round_state(self, task, message):
         """Who still owes this round an answer, and who already failed it.
@@ -520,14 +559,11 @@ class Engine:
         automatic back-and-forth is bounded by config.max_auto_rounds; beyond
         that the messages are held until the user asks to continue.
         """
-        from .agents import AgentConfig
         entries = (report.get("data") or {}).get("messages")
         if not isinstance(entries, list) or not entries:
             return
         members = task.get("team", {}).get("members") if task.get("team") else None
-        room = set(self._room_members(db, task))
-        agents = {a.id: a for a in (AgentConfig(json.loads(r[0]))
-                  for r in db.execute("SELECT body FROM agents"))}
+        room = set(self._room_members(db, task, message)) & set(dispatch["payload"].get("room_members", []))
         sender = dispatch["role"]
         budget = task.setdefault("config", {}).setdefault("max_auto_rounds", 2)
         used = task.get("auto_rounds_used", 0)
@@ -541,25 +577,23 @@ class Engine:
                 continue
             if not (string(to) and string(content) and len(content) <= 4000):
                 continue
-            if intent in ("ask", "assign") and (to == sender or to not in room):
+            if to != "all" and to not in room:
+                continue
+            if intent in ("ask", "assign") and (to in (sender, "all") or to not in room):
                 continue
             if members and to not in ("all", sender) and to not in members:
                 continue
             informative = intent in ("claim", "report")
-            if informative:
-                targets = []
-            elif to == "all":
-                targets = [key for key in (members or sorted(room)) if key != sender and key in room]
-            else:
-                targets = [to]
+            targets = [] if informative else [to]
             auto = {"id": uid(), "task_id": task["id"], "sender": sender, "intent": intent,
                     "recipient": to, "content": content, "participants": targets,
                     "revision": task.get("revision", 1), "round": 1, "rounds": 1,
                     "replies": [], "created_at": time.time(), "auto": True,
                     "parent_message_id": message["id"]}
-            # An agent-to-agent message inherits the session's write grant, or an
-            # `assign` could never be carried out by the agent that receives it.
-            if task.get("config", {}).get("allow_write"):
+            auto["room_members"] = sorted(room)
+            auto["write_epoch"] = message.get("write_epoch", 0)
+            # Delegation may narrow, never enlarge, the user's original grant.
+            if self._message_can_write(task, message):
                 auto["allow_write"] = True
             if targets and used >= budget:
                 auto["status"] = "HELD"
@@ -583,9 +617,9 @@ class Engine:
             if other["id"] == exclude_task:
                 continue
             for d in other["dispatches"]:
-                if d["status"] != "ACTIVE" or d["id"] == exclude_dispatch:
+                if d["status"] not in ("ACTIVE", "BLOCKED") or d["id"] == exclude_dispatch:
                     continue
-                if d["kind"] in ("CODE", "FIX"):
+                if d["kind"] in ("CODE", "FIX", "VERIFY"):
                     return d["role"]
                 if d["kind"] == "CHAT" and d["payload"].get("allow_write"):
                     return d["role"]
@@ -594,8 +628,8 @@ class Engine:
             row = db.execute("SELECT body FROM tasks WHERE id=?", (exclude_task,)).fetchone()
             if row:
                 for d in json.loads(row[0])["dispatches"]:
-                    if d["status"] == "ACTIVE" and d["id"] != exclude_dispatch \
-                            and (d["kind"] in ("CODE", "FIX")
+                    if d["status"] in ("ACTIVE", "BLOCKED") and d["id"] != exclude_dispatch \
+                            and (d["kind"] in ("CODE", "FIX", "VERIFY")
                                  or (d["kind"] == "CHAT" and d["payload"].get("allow_write"))):
                         return d["role"]
         return None
@@ -609,7 +643,7 @@ class Engine:
         the turn even if it is not the team's coder. Only an adapter that can
         really write is ever offered the grant.
         """
-        if not message.get("allow_write"):
+        if not self._message_can_write(task, message):
             return None
         if self._project_write_owner(db, task["project_id"], exclude_task=task["id"]):
             return None
@@ -678,6 +712,10 @@ class Engine:
                  "content": content, "participants": participants, "revision": t.get("revision", 1),
                  "status": "QUEUED", "round": 1, "rounds": rounds, "replies": [], "created_at": time.time()}
             writable = t.get("config", {}).get("allow_write", False) if allow_write is None else allow_write
+            require(not writable or t["config"].get("allow_write") is True,
+                    "Enable session writing before requesting a writable message", "APPROVAL_REQUIRED")
+            m["room_members"] = list(participants)
+            m["write_epoch"] = t["config"].get("write_epoch", 0)
             if writable:
                 m["allow_write"] = True
             if context_files:
@@ -700,6 +738,9 @@ class Engine:
                         "Only allow_write and max_auto_rounds can be changed", "INVALID_INPUT")
                 if "allow_write" in patch:
                     require(type(patch["allow_write"]) is bool, "allow_write must be boolean", "INVALID_INPUT")
+                    if config["allow_write"] and not patch["allow_write"]:
+                        # Re-enabling must not revive queued/held/in-flight old grants.
+                        config["write_epoch"] = config.get("write_epoch", 0) + 1
                     config["allow_write"] = patch["allow_write"]
                 if "max_auto_rounds" in patch:
                     require(type(patch["max_auto_rounds"]) is int and 0 <= patch["max_auto_rounds"] <= 8,
@@ -817,7 +858,7 @@ class Engine:
                 db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
                 return []
             writer = self._pick_writer(db, t, m, pending)
-            room_members = self._room_members(db, t)
+            room_members = self._room_members(db, t, m)
             brief = lambda replies: [{"role": r["role"], "content": r["content"][:2000]}
                                      for r in replies if not r.get("skipped")]
             # Round 1 is simultaneous: nobody sees a peer before answering.
@@ -836,6 +877,7 @@ class Engine:
                                     round=round_no, total_rounds=m.get("rounds", 1),
                                     peer_replies=peer_replies, recent_messages=recent,
                                     room_members=room_members,
+                                    write_epoch=m.get("write_epoch", 0),
                                     is_auto=bool(m.get("auto")))
                 if writer == role:
                     d["payload"]["allow_write"] = True
@@ -940,7 +982,8 @@ class Engine:
         for row in db.execute("SELECT body FROM tasks WHERE project_id=?", (task["project_id"],)):
             other = json.loads(row[0])
             if any(d["id"] != exclude_dispatch_id and d["status"] in ("ACTIVE", "BLOCKED")
-                   and d["kind"] in ("CODE", "FIX", "VERIFY")
+                   and (d["kind"] in ("CODE", "FIX", "VERIFY")
+                        or (d["kind"] == "CHAT" and d["payload"].get("allow_write")))
                    for d in other["dispatches"]):
                 return True
         return False
@@ -1150,7 +1193,8 @@ class Engine:
                                 and string(item["content"]) and len(item["content"]) <= 4000,
                                 "Invalid peer message")
                         require(item["to"] != d["role"], "An agent cannot address itself")
-                        require(item["to"] == "all" or not room or item["to"] in room,
+                        require((item["to"] == "all" and item["intent"] in ("claim", "report"))
+                                or (item["to"] != "all" and item["to"] in room),
                                 "Peer message target is not in this room")
                 require(len(report["suggestions"]) <= 3, "Chat allows at most 3 suggestions")
             elif kind == "ANALYZE":
