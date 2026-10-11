@@ -419,7 +419,10 @@ class Runtime:
             require(run["exit_code"] == 0, "Provider exited unsuccessfully", "PROVIDER_FAILED")
             root = Path(run["artifact_dir"])
             require(run["provider"] == self.provider, "Wrong collector for provider", "UNSUPPORTED_PROVIDER")
-            session, completed, report, usage = self.read_result(root)
+            with self.engine.transaction() as db:
+                task = self.engine._task(db, run["task_id"])
+                dispatch = self.engine._get_dispatch(task, run["dispatch_id"])
+            session, completed, report, usage = self.read_result(root, dispatch)
             run["usage"] = usage
             require(completed and isinstance(session, str) and session.strip(), "Missing completion/session event", "INVALID_SESSION")
             require(run["session_id"] in (None, session), "Resumed session mismatch", "INVALID_SESSION")
@@ -432,8 +435,7 @@ class Runtime:
                 run["session_id"] = session
                 self._save(db, run)
             with self.engine.transaction() as db:
-                task = self.engine._task(db, run["task_id"])
-                dispatch = self.engine._get_dispatch(task, run["dispatch_id"])
+                self._save(db, run)
             if dispatch["kind"] == "CHAT":
                 report = normalize_chat_report(report, dispatch)
                 (root / "result.json").write_text(encode(report), encoding="utf-8")
@@ -453,7 +455,7 @@ class Runtime:
             self._fail(run)
             return run
 
-    def read_result(self, root):
+    def read_result(self, root, dispatch=None):
         session, completed, usage = None, False, None
         with (root / "events.jsonl").open(encoding="utf-8") as stream:
             for line in stream:

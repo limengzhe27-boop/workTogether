@@ -212,6 +212,37 @@ class GroupRoomTests(unittest.TestCase):
         readers = [d["role"] for d in issued if not d["payload"].get("allow_write")]
         self.assertEqual(["antigravity"], readers)
 
+    def test_a_read_only_adapter_is_never_offered_the_write_turn(self):
+        # Antigravity's adapter always runs in read-only plan mode, so a room of
+        # just Antigravity must not be told it holds a write turn.
+        self.e.message_add(self.task, "m", "antigravity", "改一下")
+        issued = self.e.chat_dispatch_round(self.task)
+        self.assertEqual(["antigravity"], [d["role"] for d in issued])
+        self.assertFalse(issued[0]["payload"].get("allow_write"))
+
+    def test_an_assignment_inherits_the_session_write_grant(self):
+        # Without this an `assign` could never be carried out by its recipient.
+        self.e.message_add(self.task, "m", "antigravity", "先看看")
+        first = self.e.chat_dispatch_round(self.task)
+        self.assertFalse(first[0]["payload"].get("allow_write"))
+        self.e.submit(self.task, chat_report(first[0], data={
+            "messages": [{"to": "codex", "intent": "assign", "content": "请把占位测试换成真实测试"}]}))
+        auto = self.e.messages(self.task)[1]
+        self.assertTrue(auto.get("allow_write"))
+        follow = self.e.chat_dispatch_round(self.task)
+        self.assertEqual(["codex"], [d["role"] for d in follow])
+        self.assertTrue(follow[0]["payload"].get("allow_write"))
+
+    def test_an_assignment_stays_read_only_when_the_session_forbids_writes(self):
+        self.e.chat_config(self.task, {"allow_write": False})
+        self.e.message_add(self.task, "m", "antigravity", "先看看")
+        first = self.e.chat_dispatch_round(self.task)
+        self.e.submit(self.task, chat_report(first[0], data={
+            "messages": [{"to": "codex", "intent": "assign", "content": "请改"}]}))
+        follow = self.e.chat_dispatch_round(self.task)
+        self.assertEqual(["codex"], [d["role"] for d in follow])
+        self.assertFalse(follow[0]["payload"].get("allow_write"))
+
     def test_a_second_task_in_the_same_project_stays_read_only_while_one_writes(self):
         other = self.e.task_add(self.project["id"], "other", "parallel")["id"]
         self.e.message_add(self.task, "m1", "codex", "先动手")

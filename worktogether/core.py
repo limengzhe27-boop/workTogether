@@ -551,6 +551,10 @@ class Engine:
                     "revision": task.get("revision", 1), "round": 1, "rounds": 1,
                     "replies": [], "created_at": time.time(), "auto": True,
                     "parent_message_id": message["id"]}
+            # An agent-to-agent message inherits the session's write grant, or an
+            # `assign` could never be carried out by the agent that receives it.
+            if task.get("config", {}).get("allow_write"):
+                auto["allow_write"] = True
             if targets and used >= budget:
                 auto["status"] = "HELD"
                 auto["held"] = True
@@ -594,20 +598,30 @@ class Engine:
         """At most one agent per round may actually change files.
 
         The first capable coder in the caller's selection order writes; the rest
-        take part read-only and can hand work over with an `assign` message.
+        take part read-only and can hand work over with an `assign` message. Only
+        an adapter that can really write is ever offered the grant, so the room
+        never tells an agent it holds a write turn it cannot use.
         """
         if not message.get("allow_write"):
             return None
         if self._project_write_owner(db, task["project_id"], exclude_task=task["id"]):
             return None
         from .agents import AgentConfig
+        secrets_file = Path(self.path).parent / "secrets.json"
+        stored = {}
+        if secrets_file.is_file():
+            try:
+                stored = json.loads(secrets_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                stored = {}
         for role in pending:
             row = db.execute("SELECT body FROM agents WHERE id=?", (role,)).fetchone()
             if row is None:
                 continue
-            if "code" in AgentConfig(json.loads(row[0])).roles:
+            config = AgentConfig(json.loads(row[0]), stored_secret=stored.get(role, ""))
+            if "code" in config.roles and config.writable:
                 return role
-        return pending[0] if pending else None
+        return None
 
 
     def message_add(self, task_id, message_id, recipient, content, allow_write=None,

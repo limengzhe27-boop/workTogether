@@ -40,3 +40,40 @@ class DeniedResultTests(unittest.TestCase):
                     AntigravityRuntime.read_result(None, root)
                 self.assertEqual(code, error.exception.code)
                 self.assertFalse((root / 'result.json').exists())
+
+    def _denied_run(self, root, dispatch_kind):
+        """Write an events file where a command was denied but the model answered."""
+        result = {'conversation_id': 'fixture', 'status': 'SUCCESS',
+                  'response': json.dumps({"summary": "我的判断", "basis": ["读到的文件"]}),
+                  'denied_actions': [{'action': 'command'}]}
+        (root / 'events.jsonl').write_text('\n'.join(json.dumps(event) for event in [
+            {'event': 'init', 'conversation_id': 'fixture'}, {'event': 'result', 'result': result}]))
+        return AntigravityRuntime.read_result(None, root, {"kind": dispatch_kind})
+
+    def test_a_denied_command_does_not_discard_a_usable_chat_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session, completed, report, usage = self._denied_run(root, 'CHAT')
+            self.assertEqual('fixture', session)
+            # The answer survives, and the denial is disclosed rather than hidden.
+            self.assertIn('我的判断', report['summary'])
+            self.assertIn('权限拒绝', report['summary'])
+            self.assertTrue((root / 'result.json').exists())
+
+    def test_a_denied_command_still_fails_a_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(CollabError) as error:
+                self._denied_run(root, 'VERIFY')
+            self.assertEqual('PERMISSION_DENIED', error.exception.code)
+
+    def test_chat_is_steered_away_from_shell_commands(self):
+        from worktogether.core import Engine
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = AntigravityRuntime(Engine(Path(tmp) / 'state.sqlite3'), 'agy')
+            dispatch = {"kind": "CHAT", "task_id": "t", "id": "d", "role": "antigravity",
+                        "attempt": 1, "payload": {}}
+            prompt = runtime._prompt(dispatch)
+            self.assertIn('read-only file tools', prompt)
+            self.assertIn('normally denied here', prompt)
+            self.assertIn('list_dir', prompt)

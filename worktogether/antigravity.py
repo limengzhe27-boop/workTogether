@@ -34,9 +34,18 @@ class AntigravityRuntime(Runtime):
                     "instead of run_command. Run a command only when the acceptance criterion actually requires "
                     "executing code or tests and permission is available. If required permission is denied, "
                     "report BLOCKED; never treat a partial tool result as a passing check.\n\n" + prompt)
+        if dispatch["kind"] == "CHAT":
+            # This adapter runs AGY read-only in plan mode: shell commands are
+            # routinely denied, while its file tools work. Say so, or the agent
+            # spends the turn on `ls` and returns nothing.
+            return ("This session runs you in read-only plan mode. Inspect the project with your read-only file "
+                    "tools (for example list_dir and view_file) instead of shell commands such as ls or cat; those "
+                    "are normally denied here. If a command is denied, carry on with what you can read and answer "
+                    "from that. You cannot change files in this mode: if a change is needed, say exactly what to "
+                    "change so the agent holding the write turn can make it.\n\n" + prompt)
         return prompt
 
-    def read_result(self, root):
+    def read_result(self, root, dispatch=None):
         initial, result = None, None
         denied_commands = []
         with (root / "events.jsonl").open(encoding="utf-8") as stream:
@@ -61,7 +70,11 @@ class AntigravityRuntime(Runtime):
                 elif event.get("event") == "error":
                     require(False, "AGY reported a stream error", "PROVIDER_FAILED")
         require(isinstance(result, dict), "AGY did not return a terminal result", "PROVIDER_FAILED")
-        if result.get("denied_actions"):
+        denied = bool(result.get("denied_actions"))
+        kind = (dispatch or {}).get("kind")
+        usable = (isinstance(result.get("structured_output"), dict)
+                  or bool(str(result.get("response") or "").strip()))
+        if denied and not (kind == "CHAT" and usable):
             error = CollabError("PERMISSION_DENIED", "Antigravity permission denied: verification was not completed. "
                                 "Review permissions explicitly; do not bypass or automatically retry.")
             error.details = {"denied_commands": denied_commands[:10], "retry_allowed": False}
@@ -80,5 +93,14 @@ class AntigravityRuntime(Runtime):
             except ValueError:
                 report = {"__raw_markdown__": result["response"].strip()}
         require(isinstance(report, dict), "AGY report must be JSON object")
+        if denied:
+            # A denied command is not a verification claim in chat, but the user
+            # must still see that part of the work was blocked.
+            note = ("⚠️ 有命令被权限拒绝，以下回答基于可读取的内容："
+                    + "；".join(denied_commands[:3]) + "\n\n")
+            if "__raw_markdown__" in report:
+                report["__raw_markdown__"] = note + report["__raw_markdown__"]
+            else:
+                report["summary"] = note + str(report.get("summary", ""))
         (root / "result.json").write_text(encode(report), encoding="utf-8")
         return session, True, report, result.get("usage")

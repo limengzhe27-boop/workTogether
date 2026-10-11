@@ -15,7 +15,8 @@ from unittest.mock import MagicMock, patch
 from worktogether.adapters import MockAdapter
 from worktogether.core import Engine
 from worktogether.runtime import Runtime
-from worktogether.server import WorkTogetherHandler, resolve_antigravity_executable
+from worktogether.server import (WorkTogetherHandler, resolve_antigravity_executable,
+                                 resolve_codex_executable)
 
 
 class DummyServer:
@@ -139,6 +140,20 @@ class ServerApiTests(unittest.TestCase):
             candidate.chmod(0o700)
             self.assertEqual(resolve_antigravity_executable("agy", candidate), str(candidate))
             self.assertEqual(resolve_antigravity_executable("/explicit/agy", candidate), "/explicit/agy")
+
+    def test_codex_is_discovered_from_the_chatgpt_app_only_as_a_fallback(self):
+        candidate = Path(self.temp_dir.name) / "codex"
+        candidate.write_text("fixture", encoding="utf-8")
+        with patch("worktogether.server.shutil.which", return_value=None):
+            # Not executable yet: nothing to fall back to.
+            self.assertEqual(resolve_codex_executable("codex", (str(candidate),)), "codex")
+            candidate.chmod(0o700)
+            self.assertEqual(resolve_codex_executable("codex", (str(candidate),)), str(candidate))
+            # An explicit path the user gave always wins.
+            self.assertEqual(resolve_codex_executable("/explicit/codex", (str(candidate),)), "/explicit/codex")
+        with patch("worktogether.server.shutil.which", return_value="/usr/local/bin/codex"):
+            # A real PATH install is preferred over the bundled copy.
+            self.assertEqual(resolve_codex_executable("codex", (str(candidate),)), "codex")
 
     def test_message_api_explains_wait_without_starting_a_run(self):
         project = self.engine.project_add("Paused fixture", self.temp_dir.name)

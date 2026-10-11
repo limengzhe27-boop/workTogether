@@ -56,6 +56,24 @@
 
 另外补上了**回合分隔**：同一轮里第 1 轮回复标为“第 1 轮 · 各自独立回答”，第 2 轮标为“第 2 轮 · 看过同伴后回应”，这样“他们先各自表态、再互相回应”在界面上是看得见的。
 
+## 真实模型端到端（2026-10-11，Codex 0.162 + Antigravity 1.2.8）
+
+用 ChatGPT 桌面应用自带的 Codex CLI（已用 ChatGPT 账号登录）和本机 Antigravity 做了一次真实闭环，项目是临时目录里的一个小 Python 服务：
+
+1. **项目上下文对真实模型生效**：问 Codex「这个项目用什么方式存数据？有什么硬性规矩？」，它从注入的 README 答出「普通 JSON 文件，不使用数据库」「改 JSON 结构必须提供迁移」。
+2. **并行群聊**：一次广播给两位，各自独立作答，都指出 `tests/test_app.py` 的 `assertTrue(True)` 是恒真占位测试。
+3. **真实第 2 轮互相回应**：Antigravity 回复「**我完全同意 codex 的意见**：当前项目最应优先改进的是补全真实的单元测试」——它读到的是同伴上一轮的实际发言。
+4. **派活并真的改代码**：让只读的 Antigravity 去修占位测试，它分析后通过 `data.messages` 以 `assign` 把任务交给 Codex；平台生成 `[antigravity -> codex] intent=assign write=True`；Codex 拿到写入回合后改写 `tests/test_app.py` 并自己跑了 `python3 -m unittest`（Ran 2 tests, OK）。事后在磁盘上核对：`git diff` 确实改了该文件，测试独立复跑通过。
+
+### 这一轮暴露并修掉的真实缺陷
+
+| 缺陷 | 证据 | 处理 |
+| --- | --- | --- |
+| Codex 明明随 ChatGPT 应用安装，平台却报「未找到」 | PATH 无 `codex`，实际二进制在 `ChatGPT.app/Contents/Resources/codex-cli/`；`codex login status` 显示已用 ChatGPT 登录 | 新增 `resolve_codex_executable`：PATH 优先，其次探测应用自带副本，显式路径始终优先 |
+| **Agent 之间的 `assign` 永远拿不到写权限** | 真实运行中两个 Agent 都回报「本轮只读，待取得写权限后实施」——`_record_agent_messages` 创建的消息没有 `allow_write`，`_pick_writer` 直接返回 None | 自动消息继承会话写入授权 |
+| 平台会把写入回合授予根本不能写的适配器 | Antigravity 适配器固定 `--sandbox --mode plan`，却可能被选为唯一写者 | 新增 `AgentConfig.writable`；`_pick_writer` 只考虑「有 code 能力且适配器可写」的成员，否则不给写权限，而不是给一个用不了的授权 |
+| Antigravity 在对话里执行 `ls` 被权限拒绝，整轮丢弃 | `denied_commands: ["ls -la …/proj"]`，33k token 白烧 | CHAT 提示明确要求使用只读文件工具（list_dir/view_file）、命令被拒就用手上能读到的内容继续；并且**命令被拒不再丢弃可用回答**，改为在回答开头如实标注「⚠️ 有命令被权限拒绝」，仅 VERIFY 保持严格失败 |
+
 ## 边界
 
 - 写入串行是平台内调度保证，不是文件系统锁：在编辑器里手动改同一个文件仍可能冲突；也没有隔离工作树与固定被测提交。

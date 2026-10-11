@@ -108,6 +108,20 @@ class AgentConfig:
         return self._stored_secret or ""
 
     @property
+    def writable(self):
+        """Whether this adapter can actually change files when granted the write turn.
+
+        The Antigravity adapter always runs in read-only plan mode and an
+        OpenAI-compatible agent has no filesystem access at all, so the platform
+        must not hand either of them a write grant it cannot use.
+        """
+        if not self.enabled:
+            return False
+        if self.type != "cli":
+            return False
+        return (self.base_agent or self.id) in ("codex", "deepseek-harness")
+
+    @property
     def ready(self):
         if not self.enabled:
             return False
@@ -129,6 +143,7 @@ class AgentConfig:
                 "system_prompt": self.system_prompt,
                 "enabled": self.enabled,
                 "ready": self.ready,
+                "writable": self.writable,
                 "has_key": self.has_key,
                 "has_stored_key": bool(self._stored_secret)}
 
@@ -370,14 +385,14 @@ class AgentRegistry:
         from .runtime import Runtime
         from .antigravity import AntigravityRuntime
         from .openai_runtime import OpenAICompatibleRuntime
-        from .server import resolve_antigravity_executable
+        from .server import resolve_antigravity_executable, resolve_codex_executable
         cfg = self.get(agent_id)
         require(cfg is not None and cfg.enabled, "Agent is not enabled", "UNSUPPORTED_PROVIDER")
         target_cli = cfg.base_agent or cfg.id
         if cfg.type == "cli":
             if target_cli == "codex":
                 exe = (custom_executables or {}).get(agent_id) or (custom_executables or {}).get("codex") or cfg.executable
-                rt = Runtime(self.engine, executable=exe)
+                rt = Runtime(self.engine, executable=resolve_codex_executable(exe))
                 rt.role = cfg.id
                 rt.system_prompt = cfg.system_prompt
                 return rt

@@ -51,6 +51,20 @@
 
 验证：`python3 -m unittest discover -s tests -q` 256 项通过（新增群聊、互发、预算、写入串行与归一化用例）；`cd web && npm test` 12 项通过；真实浏览器（1046×653）+ 本机桩 CLI 端到端跑通：一条广播 → 两位同时作答 → Codex 向 Antigravity 提问并收到回答 → 预算耗尽后消息进入“等待你确认”并可由“让他们继续”释放。全程未调用任何真实模型。
 
+## 2026-10-11 补记三：接上真实模型，并修掉"派活拿不到写权限"
+
+用户指出 Codex 随 ChatGPT 订阅提供。核实后确认：Codex CLI 0.162 就在 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/`，且 `codex login status` 显示已用 ChatGPT 登录，只是不在 PATH 上（应用启动时创建 PATH 别名被系统拒绝）。已加入自动探测：PATH 优先，其次应用自带副本，显式路径始终优先。
+
+随后用真实 Codex + 真实 Antigravity 跑通了完整闭环（细节见 [qa/group-room/acceptance.md](../qa/group-room/acceptance.md)）：项目上下文对真实模型生效；两位并行作答；第 2 轮 Antigravity 明确回应了 Codex 上一轮的发言；让只读的 Antigravity 派活给 Codex 后，Codex 真的改写了 `tests/test_app.py` 并跑通测试，事后在磁盘上独立复核。
+
+真实运行也暴露了三个只有真模型才会碰到的问题，均已修复：
+
+1. **`assign` 永远拿不到写权限**：Agent 发起的群消息没有继承会话写入授权，`_pick_writer` 直接放弃，于是两个真实 Agent 都回报"本轮只读，等拿到写权限再实施"。现改为继承会话授权。
+2. **写入回合会被授予不能写的适配器**：Antigravity 适配器固定只读 plan 模式，却可能被选为唯一写者，得到一句做不到的授权。新增 `AgentConfig.writable`，`_pick_writer` 只考虑"有 code 能力且适配器可写"的成员；没有合适人选就不给写权限，而不是给一个假的。
+3. **Antigravity 在对话里跑 `ls` 被拒，整轮作废**：33k token 白烧且回答被丢弃。现在 CHAT 提示明确要求用只读文件工具、命令被拒就用手上内容继续；并且命令被拒不再丢弃可用回答，改为在回答开头如实标注被拒命令，只有 VERIFY 仍严格失败。
+
+尚未验证：真实模型下的长会话、多任务并发与 Token 成本对照。
+
 ## 尚未达到的预期
 
 1. **真实项目的无人值守闭环**：隔离样例已通过，但 Antigravity 的工具权限拒绝仍可能让需要运行命令的验收停止。平台提供手动交接与报告提交，不绕过权限，也不把隔离样例当作真实项目验收。

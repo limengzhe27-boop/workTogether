@@ -37,6 +37,25 @@ def resolve_antigravity_executable(executable, private_cli=None):
     return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else executable
 
 
+# The ChatGPT desktop app ships the Codex CLI without putting it on PATH. Codex
+# is part of a ChatGPT subscription, so a user who has the app has Codex; look
+# there before telling them it is missing. An explicit path always wins.
+CODEX_APP_CANDIDATES = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+)
+
+
+def resolve_codex_executable(executable="codex", candidates=CODEX_APP_CANDIDATES):
+    if executable != "codex" or shutil.which("codex") is not None:
+        return executable
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return executable
+
+
 class WorkTogetherHandler(BaseHTTPRequestHandler):
     server_version = "WorkTogetherServer/1.1"
 
@@ -620,6 +639,7 @@ def create_server(db_path, host="127.0.0.1", port=8765, static_dir=None, executa
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise CollabError("INVALID_INPUT", "Only loopback binding is supported")
     antigravity_executable = resolve_antigravity_executable(antigravity_executable)
+    executable = resolve_codex_executable(executable)
     engine = Engine(db_path)
     from .agents import AgentRegistry
     registry = AgentRegistry(engine)

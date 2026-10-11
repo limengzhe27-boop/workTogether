@@ -51,7 +51,7 @@ class HarnessRuntime(Runtime):
             args.extend(["--session-id", run["session_id"]])
         return args + ["-"]
 
-    def read_result(self, root):
+    def read_result(self, root, dispatch=None):
         session, final, ended = None, None, False
         totals, usage_complete, steps = {}, True, 0
         expected = json.loads((root / "harness-policy.json").read_text(encoding="utf-8"))[0]["config"]["workspaceRoot"]

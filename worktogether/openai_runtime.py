@@ -224,7 +224,7 @@ class OpenAICompatibleRuntime(Runtime):
 
         return self.collect(run["id"])
 
-    def read_result(self, root):
+    def read_result(self, root, dispatch=None):
         session, usage = None, None
         with (root / "events.jsonl").open(encoding="utf-8") as stream:
             for line in stream:
