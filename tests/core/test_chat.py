@@ -93,9 +93,11 @@ class ChatTests(unittest.TestCase):
         other = self.e.task_add(old_state["project_id"], "New", "Independent task")["id"]
         self.e.message_add(other, "new", "both", "New question")
         self.assertIsNone(self.e.messages(other)[0]["wait_reason"])
-        self.q.once(); self.q.once(); self.q.once()
+        self.q.once()
         self.assertEqual("DELIVERED", self.e.messages(other)[0]["status"])
-        self.assertEqual(["codex", "antigravity"], [r["role"] for r in self.e.messages(other)[0]["replies"]])
+        # Parallel replies land in completion order, so compare as a set.
+        self.assertEqual({"codex", "antigravity"},
+                         {r["role"] for r in self.e.messages(other)[0]["replies"]})
         self.assertEqual(1, len(self.c.list(self.t)["runs"]))
         self.assertEqual(old_state["dispatches"], self.e.show(self.t)["dispatches"])
 

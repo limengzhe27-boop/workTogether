@@ -136,7 +136,13 @@ class Engine:
     def _task(self, db, task):
         row = db.execute("SELECT body FROM tasks WHERE id=?", (task,)).fetchone()
         require(row is not None, "Unknown task", "NOT_FOUND")
-        return json.loads(row["body"])
+        t = json.loads(row["body"])
+        # Sessions created before the group room default to the same behaviour
+        # as new ones: writable, with a bounded automatic back-and-forth.
+        config = t.setdefault("config", {})
+        config.setdefault("allow_write", True)
+        config.setdefault("max_auto_rounds", 2)
+        return t
 
     def _save(self, db, task, kind, detail):
         task["updated_at"] = time.time()

@@ -192,6 +192,19 @@ class GroupRoomTests(unittest.TestCase):
         with self.assertRaises(CollabError):
             self.e.chat_config(self.task, {"max_auto_rounds": 99})
 
+    def test_sessions_created_before_the_room_are_writable_too(self):
+        # A task stored without the new config keys still behaves like a new one.
+        with self.e.transaction() as db:
+            t = self.e._task(db, self.task)
+            t["config"] = {"max_repairs": 2, "timeout_seconds": 1800}
+            self.e._save(db, t, "LEGACY_FIXTURE", {})
+        state = self.e.chat_state(self.task)
+        self.assertTrue(state["allow_write"])
+        self.assertEqual(2, state["max_auto_rounds"])
+        self.e.message_add(self.task, "m", "both", "写吧")
+        issued = self.e.chat_dispatch_round(self.task)
+        self.assertEqual(["codex"], [d["role"] for d in issued if d["payload"].get("allow_write")])
+
 
 if __name__ == "__main__":
     unittest.main()
