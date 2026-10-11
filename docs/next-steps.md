@@ -14,11 +14,11 @@
 - 验收：配额恢复后，单独点名 Antigravity 让它创建 `IMPROVEMENTS.md`，确认①文件落盘 ②回复带上"改了 N 个文件"归因 ③若被拒，`denied_commands` 要如实反映。
 - 若 `--sandbox` 导致写不了：不要默认去掉沙箱。应改为**Agent 级显式开关**（默认关，UI 标注风险），而不是静默扩权。
 
-### 2. `docs/contracts/v1.md` 与实现脱节
-- 现状：契约文档没有覆盖本轮新增的接口与字段（已核对）。
-- 待补路由：`GET /api/projects/{id}/memory`、`GET /api/projects/{id}/file?path=`、`POST /api/tasks/{id}/chat-config`、`POST /api/tasks/{id}/chat-release`、`POST /api/tasks/{id}/messages/{mid}/resolve`、`POST /api/agents/{id}/profile`、`POST /api/agents/{id}/delete`、`POST /api/projects/{id}/delete`、`POST /api/tasks/{id}/rename|delete`、`GET /api/projects/{id}/files|diff`。
-- 待补字段：消息体的 `sender`/`intent`/`round`/`rounds`/`auto`/`held`/`allow_write`/`context_files`/`referenced_task_ids`；`/messages` 现在同时返回 `chat` 状态；`/files` 返回 `{path,size}`；`/health` 的 `features` 与 `providers`。
-- 验收：契约文档与 `server.py` 路由一一对应，可写一个测试断言路由清单不漂移。
+### 2. 契约与实现对齐（已补齐，见文末验证记录）
+- [v1.md](contracts/v1.md) 列出完整 GET/POST 路由、输入与返回摘要、错误映射和破坏性操作边界。
+- [chat-v1.md](contracts/chat-v1.md) 区分可提交字段与服务端生成字段，说明并行、写授权、房间范围、幂等、预算与恢复的实际语义。
+- `tests/core/test_contracts.py` 从 handler 的 AST 提取路由并与文档双向比对，另覆盖 HTTP 群聊字段及关键边界；不调用真实模型。
+- 检查范围是路由清单与所测行为，不是所有字段的完整 Schema 证明；其它历史文档统一仍在 P2-14。
 
 ### 3. `secrets.json` 明文
 - 现状：API Key 可选存到状态库同目录的 `secrets.json`（权限 600，环境变量优先），README 已提示。
@@ -27,6 +27,7 @@
 ### 4. 群聊的越权面
 - 现状：房间成员 = 团队 ∩ 就绪；无团队时 = 全部就绪 Agent。这意味着 **Agent 可能给一个你没有在输入框里选中的 Agent 派活**（只要它在房间内）。
 - 建议：把"房间成员"显式化——要么固定为本次会话选中的收件人集合，要么在 UI 上明确展示"本房间成员"。
+- 契约核对另发现：缺失 `allow_write` 的旧会话读取时补为 true；Agent 衍生消息继承会话授权，不继承父消息的单次 false。需一起复核迁移提示与授权范围。本轮只记录既有行为，没有放宽或改动权限。
 
 ---
 
@@ -97,4 +98,6 @@
 - 改动归因：每个会改文件的回合记录 M/A/D 清单并显示"改了 N 个文件"。
 - Codex 自动发现（ChatGPT.app 自带 CLI）、`--db` 参数修复、CLI 缺失与只读能力在 UI 上如实标注。
 - 消息解析扩展（Markdown 回复归一化、跳过/重试）、Agent 档案与密钥管理。
-- 测试：后端 281 项、前端 12 项；`qa/` 下有 project-context 与 group-room 两份验收记录。
+- 契约对齐：53 条 GET/POST 路由清单与实现双向比对，消息输入字段表与允许字段集合比对；新增 15 项无模型测试覆盖消息响应、伪造字段拦截、幂等、预算释放、显式恢复、上下文截断及既有写入默认值。
+- 最新验证（2026-10-11，P0-2）：后端 296 项全部通过、前端 12 项全部通过、生产构建通过。首次受限环境运行跳过本机回环测试，获准后完整重跑 296 项无跳过；只用临时数据与模拟 Agent，没有真实模型用量。静态包重建后与仓库一致，无需额外产物变更。
+- 本批未修改生产逻辑、真实 `.collab/state.sqlite3` 或安全边界；P0-1 仍需先获用户同意再消耗真实额度，P0-3 / P0-4 待独立批次处理。`qa/` 下已有 project-context 与 group-room 的历史验收记录，本批不冒充新的真实验收。

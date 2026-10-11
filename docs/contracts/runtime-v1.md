@@ -1,5 +1,12 @@
 # Runtime contract v1 (additive to core v1)
 
+> Historical baseline. For the current HTTP/provider inventory and writable CHAT
+> behavior, use [v1.md](v1.md) and [chat-v1.md](chat-v1.md). Harness and custom
+> adapters, web discussion, explicit job recovery and bounded execution now exist.
+> Antigravity write CHAT uses sandbox + accept-edits, not always plan mode; its
+> real write boundary remains unverified. The original milestone notes below
+> are not a current capability checklist.
+
 Providers: `codex` and `antigravity`. Role must match provider; no silent fallback.
 All commands use the same `--db PATH` as the core.
 
