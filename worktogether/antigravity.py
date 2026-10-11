@@ -22,10 +22,12 @@ class AntigravityRuntime(Runtime):
     def command(self, run, dispatch):
         args = [self.executable, "--input-format", "stream-json", "--output-format", "stream-json"]
         if self.writable(dispatch):
-            # There is no human at the prompt in headless mode, so tool requests
-            # must be pre-approved; the platform's own gate is the room's single
-            # write turn, not this flag.
-            args.extend(["--mode", "accept-edits", "--dangerously-skip-permissions"])
+            # Headless writes need pre-approved tool requests: there is no human
+            # at the prompt. Keep the sandbox and name the workspace explicitly so
+            # the boundary matches Codex (workspace-write) and Harness
+            # (sandbox-policy.workspaceRoot): one project, not the whole machine.
+            args.extend(["--sandbox", "--mode", "accept-edits",
+                         "--add-dir", run["cwd"], "--dangerously-skip-permissions"])
         else:
             # Read-only plan mode also sandboxes the terminal, which is why a
             # chat turn must not try `ls` (see _prompt).

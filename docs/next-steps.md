@@ -1,0 +1,100 @@
+# 下一步清单（截至 2026-10-11）
+
+本文档是交接用的**未完成项与改进项**清单，按优先级排列，每条尽量给出证据与验收方式。已完成的部分见文末"已经做完的事"与 [roadmap.md](roadmap.md)、[qa/group-room/acceptance.md](../qa/group-room/acceptance.md)。
+
+约定：改完任何一条都要跑 `python3 -m unittest discover -s tests -q`、`cd web && npm test`、`cd web && npm run build`，并在 README/roadmap 里如实更新"可用"与"边界"，**没有端到端证据的能力不得写成已可用**。
+
+---
+
+## P0：安全与正确性（必须先做）
+
+### 1. Antigravity 写模式的边界未经实测
+- 现状：写入回合用 `--sandbox --mode accept-edits --add-dir <cwd> --dangerously-skip-permissions`；只读回合用 `--sandbox --mode plan`。
+- 问题：`--dangerously-skip-permissions` 会自动批准工具请求（无头模式必须如此），但**该组合能否真正写入、沙箱是否会连累编辑工具，都没有实测过**。上一次实测被 `RESOURCE_EXHAUSTED 429`（配额用尽）中断。
+- 验收：配额恢复后，单独点名 Antigravity 让它创建 `IMPROVEMENTS.md`，确认①文件落盘 ②回复带上"改了 N 个文件"归因 ③若被拒，`denied_commands` 要如实反映。
+- 若 `--sandbox` 导致写不了：不要默认去掉沙箱。应改为**Agent 级显式开关**（默认关，UI 标注风险），而不是静默扩权。
+
+### 2. `docs/contracts/v1.md` 与实现脱节
+- 现状：契约文档没有覆盖本轮新增的接口与字段（已核对）。
+- 待补路由：`GET /api/projects/{id}/memory`、`GET /api/projects/{id}/file?path=`、`POST /api/tasks/{id}/chat-config`、`POST /api/tasks/{id}/chat-release`、`POST /api/tasks/{id}/messages/{mid}/resolve`、`POST /api/agents/{id}/profile`、`POST /api/agents/{id}/delete`、`POST /api/projects/{id}/delete`、`POST /api/tasks/{id}/rename|delete`、`GET /api/projects/{id}/files|diff`。
+- 待补字段：消息体的 `sender`/`intent`/`round`/`rounds`/`auto`/`held`/`allow_write`/`context_files`/`referenced_task_ids`；`/messages` 现在同时返回 `chat` 状态；`/files` 返回 `{path,size}`；`/health` 的 `features` 与 `providers`。
+- 验收：契约文档与 `server.py` 路由一一对应，可写一个测试断言路由清单不漂移。
+
+### 3. `secrets.json` 明文
+- 现状：API Key 可选存到状态库同目录的 `secrets.json`（权限 600，环境变量优先），README 已提示。
+- 建议：至少加"文件权限被改动时告警"；更进一步可接系统钥匙串。
+
+### 4. 群聊的越权面
+- 现状：房间成员 = 团队 ∩ 就绪；无团队时 = 全部就绪 Agent。这意味着 **Agent 可能给一个你没有在输入框里选中的 Agent 派活**（只要它在房间内）。
+- 建议：把"房间成员"显式化——要么固定为本次会话选中的收件人集合，要么在 UI 上明确展示"本房间成员"。
+
+---
+
+## P1：用户原始期望里仍未完成的部分
+
+### 5. DeepSeek API Agent 仍然只能聊天（**最大的功能缺口**）
+- 现状：`openai_compat` 适配器只发 HTTP，没有文件系统接口，`AgentConfig.writable` 对它返回 False，UI 标注"仅只读"。
+- 目标：给它加**本地工具回路**——模型请求 `read_file`/`write_file`/`list_files`/`run_command` → 平台在本机执行 → 结果回灌 → 直到模型给出最终答复。
+- 约束：工具调用受会话写开关、工作区边界、单写者串行、命令超时与输出上限约束；命令执行要与其它的沙箱口径一致，不得比 CLI 适配器更宽。
+- 验收：用本机假 HTTP 服务（参考 `tests/core/test_loopback_openai.py`）跑通"读文件 → 改文件 → 跑测试 → 报告"，并断言越界路径被拒。**不需要真实额度**。
+
+### 6. 真实并行写 / 版本隔离
+- 现状：同一项目同一时刻只有一个写者（这是用户当初选定的策略），"多个 Agent 同时改代码"仍未实现。
+- 目标：每个写回合一个 git worktree + 固定被测提交 + 合并/审查流程 + 冲突处理 + UI 评审入口。
+- 验收：两个 Agent 同时改不同文件互不干扰；同一文件改动可对比合并；非 Git 项目要明确降级行为。
+
+### 7. 真实模型的完整协作验收与成本结论
+- 现状：roadmap 第 4 条——没有单 Agent 与多 Agent 的同题对照数据。
+- 已知的真实用量（可作起点）：Codex 对话单轮输入 ≈1.7 万 token（第二次起大量命中缓存）；一次项目改写输入 55k/输出 500；DeepSeek Harness 读 5098/733、写 1802/725；Antigravity 一次失败前已消耗 3.3 万 token。
+- 目标：同题对照（单 Codex vs 群聊协作），记录任务质量、Token、总耗时、人工介入次数、误报率。
+- 验收：可复现的记录 + README 结论，不承诺节省。
+
+### 8. 其它 CLI 适配器
+- Claude Code、ZCode 等未实现；也没有"任意 CLI 的统一接入协议"。当前自定义 Agent 只能克隆本机已支持的三种 CLI，或接 OpenAI 兼容接口。
+
+---
+
+## P2：工程质量与体验
+
+### 9. 没有 CI
+- 现状：全部靠手动 `python3 -m unittest`、`npm test`、`npm run build`。
+- 目标：提交即跑三件事；并校验 `worktogether/static/` 与 `web/src/` 同步（现在只靠约定"发布前重建并一起提交"）。
+
+### 10. CLI 认证探测
+- 现状：`AgentConfig.ready` 对 CLI 是乐观的（只判断可执行文件存在），登录状态只有运行时才知道；UI 用启动探测的 `provider_status` 兜底。
+- 目标：像 `probe` 那样提供一个**显式**的"检查登录"动作（不自动调用模型），并在 Agent 卡片显示。
+
+### 11. 性能
+- `file_digests` 每轮拍两次快照（每次跑 `git ls-files` + 读最多 800 个文件头）；`_room_members` 每个 round 重读 agents 表与 secrets.json；`_project_write_owner` 每次 `_pick_writer` 扫描项目内所有 task 的 dispatches（O(tasks×dispatches)）。
+- 目标：大项目/长会话下量化并优化（缓存、增量、按需）。
+
+### 12. 群聊的边界情形
+- `held` 释放会把预算重置为 0，可以无限点"让他们继续"；需要上限提示或计数。
+- 任务里存在未解决的失败会阻塞后续消息（实测撞到过），UI 有说明但没有"一键全部跳过"。
+- 房间内无人可写时，UI 没有提示"本轮没人能改文件"。
+
+### 13. 适配器硬编码
+- `max_parallel_agents = 4`、`max_parallel_tasks = 4`、`HASH_HEAD_BYTES`、`file_digests(limit=800)` 都是硬编码，不可配置。
+
+### 14. 文档一致性
+- README「多 Agent 对话（当前边界）」、`docs/multi-agent-delegation.md`、`docs/team-workflow.md`、`docs/handoff-web-v1.md`、`qa/antigravity/adapter-capabilities.md` 仍有旧描述（尤其"并行只用于只读讨论和认领""Antigravity 只能只读验收"）。
+- 两套心理模型仍并存：**群聊**（默认）与**方案审批 → 执行**的团队流程；需要说明何时用哪一个。
+
+### 15. 并发安全
+- 删除项目时检查了在途 run，但没有检查正在运行的 chat worker；`message_resolve` 与并行 submit 的交互需要压力测试。
+
+---
+
+## 已经做完的事（不要重复做）
+
+- 项目群聊：一轮内并行广播（第 1 轮互不可见）、第 2 轮互相回应、回合分隔、并行状态可见。
+- Agent 互发消息：`ask`/`assign`/`claim`/`report`，经房间成员与预算校验后成为真实群消息。
+- 自动轮次预算（默认 2，可配 0–8），超出进入 HELD，由"让他们继续"显式释放。
+- 会话级写入授权（默认开），**读/讨论全并行、写操作串行**；写入者优先编码成员，单独点名时可写成员直接持有。
+- 三个本机 CLI 适配器都能写：Codex、DeepSeek Harness（真实验证过创建文件）、Antigravity（参数已被接受，待配额恢复实测）。
+- 项目上下文自动注入（README 前 3000 字 + 最多 120 个文件路径），真实模型据此作答。
+- 项目记忆、@引用文件（≤10 个）、变更 diff 与逐文件还原、项目/任务删除与重命名。
+- 改动归因：每个会改文件的回合记录 M/A/D 清单并显示"改了 N 个文件"。
+- Codex 自动发现（ChatGPT.app 自带 CLI）、`--db` 参数修复、CLI 缺失与只读能力在 UI 上如实标注。
+- 消息解析扩展（Markdown 回复归一化、跳过/重试）、Agent 档案与密钥管理。
+- 测试：后端 281 项、前端 12 项；`qa/` 下有 project-context 与 group-room 两份验收记录。

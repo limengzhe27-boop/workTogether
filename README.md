@@ -165,3 +165,4 @@ npm run dev
 - 项目群聊验收：[qa/group-room/acceptance.md](qa/group-room/acceptance.md)
 - 界面验收记录：[qa/ui-simplification/codex-reference.md](qa/ui-simplification/codex-reference.md)
 - 演进路线：[docs/roadmap.md](docs/roadmap.md)
+- 未完成项与下一步清单（交接用）：[docs/next-steps.md](docs/next-steps.md)

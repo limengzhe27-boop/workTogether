@@ -31,10 +31,14 @@ class AdapterWriteModeTests(unittest.TestCase):
     # ---- Antigravity ------------------------------------------------------------
     def test_antigravity_edits_only_when_the_turn_may_write(self):
         runtime = AntigravityRuntime(self.engine, "agy")
-        writing = runtime.command(self.run_dict(), dispatch("CHAT", allow_write=True))
+        run = self.run_dict()
+        writing = runtime.command(run, dispatch("CHAT", allow_write=True))
         self.assertIn("accept-edits", writing)
         self.assertIn("--dangerously-skip-permissions", writing)
-        self.assertNotIn("--sandbox", writing)
+        # The write turn keeps the sandbox and names its workspace, so the
+        # boundary matches the other adapters instead of the whole machine.
+        self.assertIn("--sandbox", writing)
+        self.assertIn(run["cwd"], writing)
 
         reading = runtime.command(self.run_dict(), dispatch("CHAT", allow_write=False))
         self.assertIn("plan", reading)
