@@ -116,6 +116,12 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertEqual(["npm ci --ignore-scripts --no-audit --no-fund", "npm test", "npm run build",
                           "python3 scripts/check_static.py"], commands)
 
+    def test_native_isolation_is_required_on_a_dedicated_macos_job(self):
+        job = self.workflow["jobs"]["native-isolation"]
+        self.assertEqual("macos-15", job["runs-on"])
+        self.assertEqual("1", job["env"]["WT_REQUIRE_ISOLATION_TESTS"])
+        self.assertIn("python3 -m unittest tests.core.test_isolation -q", [s.get("run") for s in job["steps"]])
+
     def test_required_loopback_check_fails_in_ci_instead_of_silently_skipping(self):
         case = test_loopback_openai.LoopbackOpenAITransportTests("test_probe_discussion_and_delegated_analysis_over_real_http")
         for required in ("0", "1"):

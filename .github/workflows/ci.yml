@@ -33,6 +33,28 @@
         }
       ]
     },
+    "native-isolation": {
+      "name": "Native macOS isolation (offline canaries)",
+      "runs-on": "macos-15",
+      "timeout-minutes": 10,
+      "env": {"WT_REQUIRE_ISOLATION_TESTS": "1"},
+      "steps": [
+        {
+          "name": "Check out source (checkout v7.0.1)",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {"persist-credentials": false}
+        },
+        {
+          "name": "Set up Python (setup-python v7.0.0)",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {"python-version": "3.13"}
+        },
+        {
+          "name": "Require real OS denials without calling Agents",
+          "run": "python3 -m unittest tests.core.test_isolation -q"
+        }
+      ]
+    },
     "frontend": {
       "name": "Frontend and shipped assets",
       "runs-on": "ubuntu-24.04",

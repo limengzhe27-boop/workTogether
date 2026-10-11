@@ -165,19 +165,37 @@ npm run dev
 
 前端渲染与安全回归运行 `npm test`；发布前运行 `npm run build`，并一起提交更新的 `worktogether/static/`。本次 Codex 截图对齐的验证范围见 [界面验收记录](qa/ui-simplification/codex-reference.md)。
 
+## 离线隔离执行（实验性；尚未接入 Agent）
+
+已增加仅供显式调用的 macOS Python 执行器：把你选中的文件复制到临时目录，脚本只能修改副本；禁用网络和子进程，不回写项目。每次运行前用假文件验证越界读写、链接绕出、网络和子进程确实被拒；失败即 `BLOCKED`，**不会退回无沙箱执行**。不创建/迁移状态库，也不启动 Agent。
+
+```bash
+# 仅做离线隔离自检，不消耗模型额度
+python3 -m worktogether isolation-check
+
+# 显式选择一个 Python 测试入口及它需要的本地文件；不会自动复制整个项目
+python3 -m worktogether isolated-python --project-path /absolute/project \
+  --file test_example.py --file example.py --entry test_example.py --timeout 10
+```
+
+仅支持标准库和选中的 UTF-8 文件（最多 10 个、每个 ≤1 MiB），默认 10 秒、最多 30 秒，输出合计上限 64 KiB。系统库与专用 Python 运行时仍可读；不会传入宿主环境变量或额外文件句柄。该后端使用已弃用的 `sandbox-exec`，**不是 VM，也没有内存/总磁盘硬配额**，不适合恶意或重负载代码。自检不是完整安全证明；其它系统默认拒绝执行。
+
+本机已用实际 OS 沙箱和临时脚本验证运行、拒绝访问、资源限制及原文件不变；没有调用真实模型。API 写入/测试工具、工作区合并、完整依赖与多 Agent 隔离开发仍未接通。完整约束见 [隔离执行说明](docs/execution-v1.md#离线隔离执行第一阶段2026-10-12)。
+
 ## 自动回归检查
 
 [GitHub Actions 工作流](.github/workflows/ci.yml) 已配置为在 push、pull request 或手动触发时检查：
 
 - Ubuntu 上的 Python 3.9 / 3.13 完整后端测试；用临时数据、模拟 CLI 和本机假 HTTP 服务，不调用真实模型。
 - Node 24 下按锁文件安装依赖、运行前端测试和生产构建；禁用依赖安装脚本。
+- 独立 macOS 作业强制运行原生隔离测试；Linux 后端作业跳过这组原生检查，不将模拟测试冒充 OS 沙箱验证。
 - 重建后的静态包与 Git 索引一致，包含新增、删除、修改、忽略文件及符号链接检查，防止漏提交新生成的资源。
 
 本地构建后，检查并暂存准备提交的静态包，再在仓库根目录运行 `python3 scripts/check_static.py`。该脚本只检查、不构建、不修改文件；必须先构建，不能单靠它判断源码是否同步。CI 的干净检出会以该次提交为基准检查。
 
-工作流仅申请只读仓库权限，不保留 Git 凭据、不配置模型密钥；官方 Actions 固定到提交版本，每个任务限时 10 分钟。CI 设置 `WT_REQUIRE_LOOPBACK_TESTS=1`，假 HTTP 测试无法绑定本机端口时直接失败，不以跳过冒充通过；仅探测 macOS 本机 Harness 安装的测试在 Linux 可跳过。
+工作流仅申请只读仓库权限，不保留 Git 凭据、不配置模型密钥；官方 Actions 固定到提交版本，每个任务限时 10 分钟。CI 设置 `WT_REQUIRE_LOOPBACK_TESTS=1`，假 HTTP 测试无法绑定本机端口时直接失败；macOS 作业设置 `WT_REQUIRE_ISOLATION_TESTS=1`，不能跳过原生隔离检查。探测 macOS 本机 Harness 安装的测试在 Linux 可跳过。
 
-本地已通过后端 362 项、前端 18 项、构建和干净依赖安装验证（macOS / Python 3.9 / Node 26）。**远端工作流尚未运行验证**，需推送后且仓库启用 Actions；未配置分支保护或自动发布，也未证明 Linux / Python 3.13 / Node 24 的实际运行结果。
+最新本地验证为后端 388 项（原生隔离/假 HTTP 均强制执行）、前端 18 项及构建通过（macOS / Python 3.9 / Node 26）。此前 CI 批次还验证了干净依赖安装后的构建一致性。**远端工作流尚未运行验证**，需推送后且仓库启用 Actions；未配置分支保护或自动发布，也未证明 CI 的 Linux/macOS / Python 3.13 / Node 24 组合的实际运行结果。
 
 ## 开发交接与文档
 

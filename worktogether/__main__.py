@@ -40,6 +40,12 @@ def parser():
     a.add_argument("--expected-revision", type=int, required=True)
     a.add_argument("--requirement", required=True)
     sub.add_parser("demo")
+    sub.add_parser("isolation-check", help="Offline macOS isolation canary; never calls Agents")
+    a = sub.add_parser("isolated-python", help="Run an explicit Python file in a disposable offline snapshot")
+    a.add_argument("--project-path", required=True)
+    a.add_argument("--file", action="append", required=True, dest="files")
+    a.add_argument("--entry", required=True)
+    a.add_argument("--timeout", type=float, default=10)
     a = sub.add_parser("run")
     a.add_argument("--task", required=True)
     a.add_argument("--dispatch", required=True)
@@ -87,8 +93,17 @@ def parser():
 
 def run(args):
     db_path = getattr(args, "db", None) or ".collab/state.sqlite3"
-    engine = Engine(db_path)
     cmd = args.command
+    # Isolation checks must not create/migrate the user's database or register
+    # Agents as a side effect. The db path only excludes state from snapshots.
+    if cmd == "isolation-check":
+        from .isolation import check_isolation
+        return check_isolation()
+    if cmd == "isolated-python":
+        from .isolation import run_isolated_python
+        return run_isolated_python(args.project_path, args.files, args.entry,
+                                   state_db=db_path, timeout=args.timeout)
+    engine = Engine(db_path)
     if cmd == "approval":
         return Runtime(engine).approval(args.task)
     if cmd == "execute":
@@ -185,9 +200,12 @@ def run(args):
 
 def main():
     try:
-        result = run(parser().parse_args())
+        args = parser().parse_args()
+        result = run(args)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
-        return 3 if isinstance(result, dict) and result.get("status") == "FAILED" else 0
+        failed = isinstance(result, dict) and (result.get("status") == "FAILED" or (
+            args.command in ("isolation-check", "isolated-python") and result.get("status") == "BLOCKED"))
+        return 3 if failed else 0
     except CollabError as exc:
         error = {"code": exc.code, "message": str(exc)}
     except (OSError, ValueError, sqlite3.Error) as exc:
