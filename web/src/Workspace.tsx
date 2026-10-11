@@ -1339,6 +1339,11 @@ export function Workspace() {
                         : missingExecutable(a, providers) ? '本机 CLI 未找到'
                         : a.type === 'openai_compat' ? '配置就绪 · 未验证连接' : '内置 Agent · 调用时验证'}
                     </span>
+                    <span className="badge" title={a.writable
+                      ? '拿到写入回合时可以直接修改项目文件'
+                      : '没有文件系统权限：只能讨论、复核与分析传入材料'}>
+                      {a.writable ? '可写入项目' : '仅只读'}
+                    </span>
                     {a.type === 'openai_compat' && (
                       <button type="button" disabled={!a.ready || !!probingAgent}
                         onClick={() => testAgentConnection(a.id)}>

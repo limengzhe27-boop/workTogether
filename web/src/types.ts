@@ -26,6 +26,7 @@ export interface AgentInfo {
   system_prompt?: string;
   enabled: boolean;
   ready?: boolean;
+  writable?: boolean;
   has_key?: boolean;
   has_secret_file?: boolean;
   secret_key?: string;
