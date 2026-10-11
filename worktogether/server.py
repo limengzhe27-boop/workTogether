@@ -153,7 +153,8 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
             if path == "/api/agents":
                 from .agents import AgentRegistry
                 reg = getattr(self.server, "registry", None) or AgentRegistry(self.engine)
-                return self._send_json(HTTPStatus.OK, {"agents": reg.list()})
+                return self._send_json(HTTPStatus.OK, {"agents": reg.list(),
+                                                       "secret_storage": reg.secret_storage_status()})
             m_messages = re.fullmatch(r"/api/tasks/([^/]+)/messages", path)
             if m_messages:
                 return self._send_json(200, {"messages": self.engine.messages(m_messages.group(1)),

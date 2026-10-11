@@ -11,6 +11,7 @@ import {
   RunRecord,
   HandoffBundle,
   AgentInfo,
+  AgentList,
   AgentProbeResult,
   RunArtifactPreview,
   ProjectFiles,
@@ -51,7 +52,7 @@ export const api = {
   getHealth: () => request<{ status: string; version: string; providers?: Record<string, { available: boolean; executable: string }> }>('/health'),
 
   // Agents
-  getAgents: () => request<{ agents: AgentInfo[] }>('/agents'),
+  getAgents: () => request<AgentList>('/agents'),
   addAgent: (agent: Partial<AgentInfo>) =>
     request<AgentInfo>('/agents', {
       method: 'POST',

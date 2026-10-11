@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -181,6 +182,35 @@ class AgentRegistry:
                 if changed:
                     db.execute("UPDATE agents SET name=?,body=? WHERE id=?",
                                (data["name"], json.dumps(data, ensure_ascii=False), row["id"]))
+
+    def secret_storage_status(self):
+        """Inspect metadata only; never return keys, follow links, or chmod on read."""
+        result = {"status": "missing", "mode": None, "warnings": []}
+        try:
+            info = self._secrets_file.lstat()
+        except FileNotFoundError:
+            return result
+        except OSError:
+            return {"status": "unknown", "mode": None, "warnings": [
+                {"code": "CHECK_FAILED", "message": "无法检查密钥文件权限，请检查文件访问权限。"}]}
+        warnings = result["warnings"]
+        if stat.S_ISLNK(info.st_mode):
+            warnings.append({"code": "SYMLINK", "message": "secrets.json 是符号链接，请确认密钥实际保存位置与权限。"})
+        elif not stat.S_ISREG(info.st_mode):
+            warnings.append({"code": "NOT_REGULAR", "message": "secrets.json 不是普通文件，请检查本机密钥存储。"})
+        elif os.name != "posix":
+            return {"status": "unknown", "mode": None, "warnings": [
+                {"code": "UNSUPPORTED", "message": "当前系统无法按 POSIX 权限位检查，请手动确认仅本人可访问密钥。"}]}
+        else:
+            mode = stat.S_IMODE(info.st_mode)
+            result["mode"] = format(mode, "04o")
+            if mode != 0o600:
+                warnings.append({"code": "UNEXPECTED_MODE", "message":
+                    "密钥文件权限不是 0600；请确认仅文件所有者可读写，其他用户不可访问。"})
+            if info.st_uid != os.getuid():
+                warnings.append({"code": "OTHER_OWNER", "message": "密钥文件不属于当前服务用户，请核对文件所有者。"})
+        result["status"] = "warning" if warnings else "owner_only"
+        return result
 
     def _load_secrets(self):
         if not self._secrets_file.is_file():

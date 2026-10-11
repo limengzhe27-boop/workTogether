@@ -48,8 +48,29 @@ async function component(filename) {
 const { MessageContent } = await component('MessageContent.tsx');
 const { ProjectNavigation } = await component('ProjectNavigation.tsx');
 const { TaskChat } = await component('TaskChat.tsx');
+const { SecretStorageNotice } = await component('SecretStorageNotice.tsx');
 const renderMessage = text => renderToStaticMarkup(React.createElement(MessageContent, { text }));
 const noop = () => {};
+
+test('secret permission warning explains risk and manual recovery without exposing a key', () => {
+  const html = renderToStaticMarkup(React.createElement(SecretStorageNotice, { storage: {
+    status: 'warning', mode: '0644', warnings: [{ code: 'UNEXPECTED_MODE', message: '权限不是 0600' }],
+  } }));
+  assert.match(html, /role="alert"/);
+  assert.match(html, /0644/);
+  assert.match(html, /不会自动修改权限/);
+  assert.match(html, /不调用模型/);
+});
+
+test('secret permission states distinguish unchecked from owner-only and missing', () => {
+  const render = storage => renderToStaticMarkup(React.createElement(SecretStorageNotice, { storage }));
+  assert.match(render(null), /尚未检查/);
+  assert.match(render({ status: 'unknown', mode: null, warnings: [] }), /role="alert"/);
+  const safe = render({ status: 'owner_only', mode: '0600', warnings: [] });
+  assert.match(safe, /仍为明文存储，未检查 ACL/);
+  assert.doesNotMatch(safe, /role="alert"/);
+  assert.match(render({ status: 'missing', mode: null, warnings: [] }), /未保存本机密钥文件/);
+});
 const navigationProps = {
   projects: [{ id: 'p1', name: 'Project One', path: '/p1' }, { id: 'p2', name: 'Project Two', path: '/p2' }],
   project: 'p1', taskId: 't1', busy: false,

@@ -28,7 +28,7 @@ export interface AgentInfo {
   ready?: boolean;
   writable?: boolean;
   has_key?: boolean;
-  has_secret_file?: boolean;
+  has_stored_key?: boolean;
   secret_key?: string;
 }
 
@@ -38,6 +38,17 @@ export interface AgentProbeResult {
   code: string;
   message: string;
   usage?: Record<string, number> | null;
+}
+
+export interface SecretStorageStatus {
+  status: 'missing' | 'owner_only' | 'warning' | 'unknown';
+  mode: string | null;
+  warnings: { code: string; message: string }[];
+}
+
+export interface AgentList {
+  agents: AgentInfo[];
+  secret_storage?: SecretStorageStatus;
 }
 
 export interface Project {

@@ -3,8 +3,9 @@ import { api, request } from './api';
 import { TaskChat } from './TaskChat';
 import { Dialog } from './Dialog';
 import { ProjectNavigation } from './ProjectNavigation';
+import { SecretStorageNotice } from './SecretStorageNotice';
 import { ArrowUp, Folder, PanelLeft, Users, Search, ClipboardList, MessageSquare, FileDiff, Save, RotateCcw, Trash2, Pencil, RefreshCw, Layers } from 'lucide-react';
-import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentProbeResult, ReportEnvelope, ProjectDiff, ProjectFileEntry } from './types';
+import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentList, SecretStorageStatus, AgentProbeResult, ReportEnvelope, ProjectDiff, ProjectFileEntry } from './types';
 
 type Detail = TaskDetail & { revision?: number; team?: { members: string[]; coordinator: string; reviewer: string } };
 type Job = { id: string; status: string; error: string | null; authorization?: { revision: number }; result?: { reason?: string } };
@@ -127,6 +128,11 @@ export function Workspace() {
 
   // Multi-agent states
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [secretStorage, setSecretStorage] = useState<SecretStorageStatus | null>(null);
+  function acceptAgentList(result: AgentList) {
+    setAgents(result.agents);
+    setSecretStorage(result.secret_storage || null);
+  }
   const [homeSelectedIds, setHomeSelectedIds] = useState<string[] | null>(null);
   const [teamChoice, setTeamChoice] = useState<{ taskId: string; members: string[] }>({ taskId: '', members: [] });
   const [providers, setProviders] = useState<ProviderStatus | null>(null);
@@ -197,12 +203,31 @@ export function Workspace() {
       .catch(e => setError(e.message));
 
     api.getAgents()
-      .then(r => setAgents(r.agents))
+      .then(acceptAgentList)
       .catch(() => {});
     api.getHealth()
       .then(r => setProviders(r.providers || {}))
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!managingAgents) return;
+    let valid = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const result = await api.getAgents();
+        if (valid) acceptAgentList(result);
+      } catch {
+        if (valid) setSecretStorage({ status: 'unknown', mode: null,
+          warnings: [{ code: 'UNAVAILABLE', message: '无法获取最新权限检查结果，请确认服务仍在运行。' }] });
+      } finally {
+        if (valid) timer = setTimeout(refresh, 5000);
+      }
+    };
+    void refresh();
+    return () => { valid = false; clearTimeout(timer); };
+  }, [managingAgents]);
 
   useEffect(() => { if (project) save('wt:selected-project', project); }, [project]);
   useEffect(() => { setDraft(stored('wt:draft:' + project)); }, [project]);
@@ -242,7 +267,7 @@ export function Workspace() {
             setTask(t);
             setRuns(r.runs);
             setJobs(j.jobs);
-            setAgents(ag.agents);
+            acceptAgentList(ag);
             setApproval(a.requirement === t.requirement && JSON.stringify(a.plan) === JSON.stringify(t.draft_plan) ? a : null);
           }
         }
@@ -327,7 +352,7 @@ export function Workspace() {
     await act(async () => {
       await api.addAgent(payload);
       const res = await api.getAgents();
-      setAgents(res.agents);
+      acceptAgentList(res);
       setProbeResults(current => {
         const next = { ...current };
         delete next[newAgent.id];
@@ -498,7 +523,7 @@ export function Workspace() {
       if (profileDraft.model) patch.model = profileDraft.model;
       if (profileDraft.secret_key) patch.secret_key = profileDraft.secret_key;
       await api.updateAgentProfile(profileDraft.id, patch);
-      setAgents((await api.getAgents()).agents);
+      acceptAgentList(await api.getAgents());
       setProfileDraft(null);
     } catch (err) {
       setError((err as Error).message);
@@ -511,7 +536,7 @@ export function Workspace() {
     setError('');
     try {
       await api.updateAgentProfile(agentId, { secret_key: '' });
-      setAgents((await api.getAgents()).agents);
+      acceptAgentList(await api.getAgents());
     } catch (err) {
       setError((err as Error).message);
     }
@@ -521,7 +546,7 @@ export function Workspace() {
     if (!window.confirm(`移除 Agent「${agent.name}」？仅影响尚未启动、只发给它的消息，历史记录会保留。`)) return;
     await act(async () => {
       await api.deleteAgent(agent.id);
-      setAgents((await api.getAgents()).agents);
+      acceptAgentList(await api.getAgents());
       setProfileDraft(null);
     });
   }
@@ -1294,6 +1319,7 @@ export function Workspace() {
       </Dialog>}
       {managingAgents && <Dialog title="Agent 设置" onClose={() => setManagingAgents(false)}>
         {error && <p className="error" role="alert">{error}</p>}
+            <SecretStorageNotice storage={secretStorage} />
             <p className="small muted">自定义 Agent 有两种接法：OpenAI 兼容接口只能讨论、复核方案和做只读分析；克隆本机 CLI 可继承对应的编码或验收能力。
               密钥优先读启动服务的环境变量，其次读本机 secrets.json（可选，权限 600，不写入注册数据库）。分工仍须经能力校验和你的方案批准。
               连接测试会发送一条不含任务内容的短消息，可能产生少量模型用量。</p>
@@ -1315,7 +1341,7 @@ export function Workspace() {
                     {a.endpoint && <p className="small muted" style={{ margin: 0 }}>接口: {a.endpoint} ({a.model})</p>}
                     {a.system_prompt && <p className="small muted" style={{ margin: 0 }}>系统提示：{a.system_prompt.slice(0, 80)}{a.system_prompt.length > 80 ? '…' : ''}</p>}
                     {a.type === 'openai_compat' && <p className="small muted" style={{ margin: 0 }}>
-                      {a.has_key ? (a.has_secret_file ? '已配置密钥（本机 secrets.json，可覆盖）' : '已从环境变量读取密钥') : '未配置密钥'}
+                      {a.has_key ? (a.has_stored_key ? '已保存本机密钥；若同时配置环境变量则优先使用环境变量' : '已从环境变量读取密钥') : '未配置密钥'}
                     </p>}
                     {missingExecutable(a, providers) && <p className="small agent-warning" role="status">
                       本机 PATH 未找到 {missingExecutable(a, providers)}：发送消息会立即失败。请先安装，或改用 <code>--codex-executable</code> / <code>--antigravity-executable</code> 指定路径后重启服务。
@@ -1324,7 +1350,7 @@ export function Workspace() {
                   <div className="agent-card-actions">
                     <button type="button" disabled={busy} onClick={() => act(async () => {
                       await post(`/agents/${a.id}/enabled`, { enabled: !a.enabled });
-                      setAgents((await api.getAgents()).agents);
+                      acceptAgentList(await api.getAgents());
                     })}>{a.enabled ? '停用' : '启用（不会立即调用模型）'}</button>
                     <button type="button" disabled={busy} onClick={() => beginProfile(a)}>
                       <Pencil aria-hidden="true" />编辑档案
@@ -1377,7 +1403,7 @@ export function Workspace() {
                       {a.type === 'openai_compat' && (
                         <label>API Key（留空表示不修改）
                           <input type="password" autoComplete="off" value={profileDraft.secret_key}
-                            placeholder={a.has_secret_file ? '已保存本机密钥' : '粘贴后保存到本机 secrets.json'}
+                            placeholder={a.has_stored_key ? '已保存本机密钥' : '粘贴后保存到本机 secrets.json'}
                             onChange={e => setProfileDraft({ ...profileDraft, secret_key: e.target.value })} />
                         </label>
                       )}
@@ -1385,7 +1411,7 @@ export function Workspace() {
                         <button className="primary" type="submit" disabled={savingProfile || !profileDraft.name.trim()}>
                           {savingProfile ? '保存中…' : '保存档案'}
                         </button>
-                        {a.type === 'openai_compat' && a.has_secret_file && (
+                        {a.type === 'openai_compat' && a.has_stored_key && (
                           <button type="button" disabled={savingProfile}
                             onClick={() => clearStoredKey(a.id)}>清除本机密钥</button>
                         )}

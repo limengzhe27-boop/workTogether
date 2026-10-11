@@ -6,9 +6,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from worktogether.agents import AgentRegistry
 from worktogether.core import CollabError, Engine
+from worktogether.runtime import Runtime
+from tests.core.test_server import DummyServer, execute_request
 
 
 class AgentProfileTests(unittest.TestCase):
@@ -63,6 +66,60 @@ class AgentProfileTests(unittest.TestCase):
                                 "endpoint": "http://127.0.0.1:9/v1", "model": "m", "secret_key": "sk"})
         mode = stat.S_IMODE(self.secrets_path.stat().st_mode)
         self.assertEqual(0o600, mode)
+
+    def test_permission_status_missing_then_safe_and_changed(self):
+        self.assertEqual({"status": "missing", "mode": None, "warnings": []},
+                         self.registry.secret_storage_status())
+        self.registry.set_secret("codex", "fixture-secret")
+        self.assertEqual({"status": "owner_only", "mode": "0600", "warnings": []},
+                         self.registry.secret_storage_status())
+        self.secrets_path.chmod(0o644)
+        status = self.registry.secret_storage_status()
+        self.assertEqual("warning", status["status"])
+        self.assertEqual("0644", status["mode"])
+        self.assertEqual(["UNEXPECTED_MODE"], [w["code"] for w in status["warnings"]])
+        # Merely opening the settings must not silently fix or rewrite the file.
+        self.assertEqual(0o644, stat.S_IMODE(self.secrets_path.stat().st_mode))
+        self.assertNotIn("fixture-secret", json.dumps(status))
+        self.secrets_path.chmod(0o600)
+        self.assertEqual("owner_only", self.registry.secret_storage_status()["status"])
+
+    def test_permission_check_warns_on_links_without_following_them(self):
+        self.secrets_path.symlink_to(Path(self.tmp.name) / "missing-target")
+        with patch.object(Path, "read_text", side_effect=AssertionError("must not read a secret")):
+            status = self.registry.secret_storage_status()
+        self.assertEqual("warning", status["status"])
+        self.assertEqual("SYMLINK", status["warnings"][0]["code"])
+
+    def test_permission_check_warns_on_non_regular_files(self):
+        self.secrets_path.mkdir()
+        self.assertEqual("NOT_REGULAR", self.registry.secret_storage_status()["warnings"][0]["code"])
+
+    def test_permission_check_failure_is_unknown_not_safe(self):
+        with patch.object(Path, "lstat", side_effect=PermissionError("private exception detail")):
+            status = self.registry.secret_storage_status()
+        self.assertEqual("unknown", status["status"])
+        self.assertEqual("CHECK_FAILED", status["warnings"][0]["code"])
+        self.assertNotIn("private exception detail", json.dumps(status))
+
+    def test_permission_check_checks_owner_not_only_mode(self):
+        with patch.object(Path, "lstat", return_value=SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o600, st_uid=os.getuid() + 1)):
+            status = self.registry.secret_storage_status()
+        self.assertEqual("OTHER_OWNER", status["warnings"][0]["code"])
+
+    def test_agents_http_returns_fresh_warning_without_keys(self):
+        self.registry.set_secret("codex", "private-test-value")
+        server = DummyServer(self.engine, Runtime(self.engine), self.tmp.name)
+        self.secrets_path.chmod(0o644)
+        code, data = execute_request(server, "GET", "/api/agents")
+        self.assertEqual(200, code)
+        self.assertEqual({"agents", "secret_storage"}, set(data))
+        self.assertEqual("warning", data["secret_storage"]["status"])
+        self.assertNotIn("private-test-value", json.dumps(data))
+        self.secrets_path.chmod(0o600)
+        _, data = execute_request(server, "GET", "/api/agents")
+        self.assertEqual("owner_only", data["secret_storage"]["status"])
 
     def test_environment_variable_takes_precedence_over_stored_secret(self):
         self.registry.register({"id": "local-api", "name": "Local API", "type": "openai_compat",
