@@ -14,10 +14,24 @@ class AntigravityRuntime(Runtime):
         super().__init__(engine, executable)
         self.model = model
 
+    def writable(self, dispatch):
+        """AGY can edit files, but only in accept-edits mode without a prompt."""
+        return dispatch["kind"] in ("CODE", "FIX") or bool(
+            dispatch.get("payload", {}).get("allow_write"))
+
     def command(self, run, dispatch):
-        args = [self.executable, "--input-format", "stream-json", "--output-format", "stream-json",
-                "--sandbox", "--mode", "plan", "--effort", "high",
-                "--print-timeout", str(max(1, int(run["timeout"]))) + "s"]
+        args = [self.executable, "--input-format", "stream-json", "--output-format", "stream-json"]
+        if self.writable(dispatch):
+            # There is no human at the prompt in headless mode, so tool requests
+            # must be pre-approved; the platform's own gate is the room's single
+            # write turn, not this flag.
+            args.extend(["--mode", "accept-edits", "--dangerously-skip-permissions"])
+        else:
+            # Read-only plan mode also sandboxes the terminal, which is why a
+            # chat turn must not try `ls` (see _prompt).
+            args.extend(["--sandbox", "--mode", "plan"])
+        args.extend(["--effort", "high",
+                     "--print-timeout", str(max(1, int(run["timeout"]))) + "s"])
         if run["session_id"]:
             args.extend(["--conversation", run["session_id"]])
         if self.model:
@@ -34,7 +48,7 @@ class AntigravityRuntime(Runtime):
                     "instead of run_command. Run a command only when the acceptance criterion actually requires "
                     "executing code or tests and permission is available. If required permission is denied, "
                     "report BLOCKED; never treat a partial tool result as a passing check.\n\n" + prompt)
-        if dispatch["kind"] == "CHAT":
+        if dispatch["kind"] == "CHAT" and not self.writable(dispatch):
             # This adapter runs AGY read-only in plan mode: shell commands are
             # routinely denied, while its file tools work. Say so, or the agent
             # spends the turn on `ls` and returns nothing.

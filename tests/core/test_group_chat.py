@@ -212,22 +212,29 @@ class GroupRoomTests(unittest.TestCase):
         readers = [d["role"] for d in issued if not d["payload"].get("allow_write")]
         self.assertEqual(["antigravity"], readers)
 
-    def test_a_read_only_adapter_is_never_offered_the_write_turn(self):
-        # Antigravity's adapter always runs in read-only plan mode, so a room of
-        # just Antigravity must not be told it holds a write turn.
+    def test_a_writable_agent_gets_the_turn_when_it_is_the_only_one_addressed(self):
+        # Every local CLI adapter can write now, so an explicit hand-off to a
+        # non-coder must actually grant that agent the turn.
         self.e.message_add(self.task, "m", "antigravity", "改一下")
         issued = self.e.chat_dispatch_round(self.task)
         self.assertEqual(["antigravity"], [d["role"] for d in issued])
-        self.assertFalse(issued[0]["payload"].get("allow_write"))
+        self.assertTrue(issued[0]["payload"].get("allow_write"))
+
+    def test_a_discussion_round_still_writes_through_the_coder(self):
+        self.e.message_add(self.task, "m", "both", "一起看看")
+        issued = self.e.chat_dispatch_round(self.task)
+        writers = [d["role"] for d in issued if d["payload"].get("allow_write")]
+        self.assertEqual(["codex"], writers)
 
     def test_an_assignment_inherits_the_session_write_grant(self):
         # Without this an `assign` could never be carried out by its recipient.
-        self.e.message_add(self.task, "m", "antigravity", "先看看")
+        self.e.message_add(self.task, "m", "antigravity", "先看看这个项目")
         first = self.e.chat_dispatch_round(self.task)
-        self.assertFalse(first[0]["payload"].get("allow_write"))
+        self.assertEqual(["antigravity"], [d["role"] for d in first])
         self.e.submit(self.task, chat_report(first[0], data={
             "messages": [{"to": "codex", "intent": "assign", "content": "请把占位测试换成真实测试"}]}))
-        auto = self.e.messages(self.task)[1]
+        auto = [m for m in self.e.messages(self.task) if m.get("auto")][-1]
+        self.assertEqual("assign", auto["intent"])
         self.assertTrue(auto.get("allow_write"))
         follow = self.e.chat_dispatch_round(self.task)
         self.assertEqual(["codex"], [d["role"] for d in follow])
@@ -237,8 +244,11 @@ class GroupRoomTests(unittest.TestCase):
         self.e.chat_config(self.task, {"allow_write": False})
         self.e.message_add(self.task, "m", "antigravity", "先看看")
         first = self.e.chat_dispatch_round(self.task)
+        self.assertFalse(first[0]["payload"].get("allow_write"))
         self.e.submit(self.task, chat_report(first[0], data={
             "messages": [{"to": "codex", "intent": "assign", "content": "请改"}]}))
+        auto = [m for m in self.e.messages(self.task) if m.get("auto")][-1]
+        self.assertFalse(auto.get("allow_write"))
         follow = self.e.chat_dispatch_round(self.task)
         self.assertEqual(["codex"], [d["role"] for d in follow])
         self.assertFalse(follow[0]["payload"].get("allow_write"))

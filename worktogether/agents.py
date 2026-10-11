@@ -111,15 +111,13 @@ class AgentConfig:
     def writable(self):
         """Whether this adapter can actually change files when granted the write turn.
 
-        The Antigravity adapter always runs in read-only plan mode and an
-        OpenAI-compatible agent has no filesystem access at all, so the platform
-        must not hand either of them a write grant it cannot use.
+        Codex, DeepSeek Harness and Antigravity are local CLI coding agents and
+        can write. An OpenAI-compatible agent has no filesystem access at all, so
+        the platform must not hand it a write grant it cannot use.
         """
-        if not self.enabled:
+        if not self.enabled or self.type != "cli":
             return False
-        if self.type != "cli":
-            return False
-        return (self.base_agent or self.id) in ("codex", "deepseek-harness")
+        return (self.base_agent or self.id) in ("codex", "deepseek-harness", "antigravity")
 
     @property
     def ready(self):

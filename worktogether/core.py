@@ -603,10 +603,11 @@ class Engine:
     def _pick_writer(self, db, task, message, pending):
         """At most one agent per round may actually change files.
 
-        The first capable coder in the caller's selection order writes; the rest
-        take part read-only and can hand work over with an `assign` message. Only
-        an adapter that can really write is ever offered the grant, so the room
-        never tells an agent it holds a write turn it cannot use.
+        Among several candidates a capable coder is preferred, so a discussion
+        round writes through the coding agent. But when the round is addressed to
+        a single writable agent - an explicit `assign` hand-off - that agent gets
+        the turn even if it is not the team's coder. Only an adapter that can
+        really write is ever offered the grant.
         """
         if not message.get("allow_write"):
             return None
@@ -620,14 +621,18 @@ class Engine:
                 stored = json.loads(secrets_file.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 stored = {}
+        candidates = []
         for role in pending:
             row = db.execute("SELECT body FROM agents WHERE id=?", (role,)).fetchone()
             if row is None:
                 continue
             config = AgentConfig(json.loads(row[0]), stored_secret=stored.get(role, ""))
-            if "code" in config.roles and config.writable:
-                return role
-        return None
+            if config.writable:
+                candidates.append((role, "code" in config.roles))
+        if not candidates:
+            return None
+        coders = [role for role, is_coder in candidates if is_coder]
+        return coders[0] if coders else candidates[0][0]
 
 
     def message_add(self, task_id, message_id, recipient, content, allow_write=None,

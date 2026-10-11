@@ -67,6 +67,14 @@
 
 尚未验证：真实模型下的长会话、多任务并发与 Token 成本对照。
 
+## 2026-10-11 补记四：三个本机 CLI 适配器都能写
+
+用户要求"不只是 Antigravity，还有 DeepSeek"。三个适配器此前都不认写入授权，已一并修正（细节与实测见 [qa/group-room/acceptance.md](../qa/group-room/acceptance.md)）：Antigravity 写入回合改用 `--mode accept-edits`（只读回合仍是 `--sandbox --mode plan`）；DeepSeek Harness 的 CHAT 按授权决定 `sandbox-policy`，并让 `:write`/`:read` 会话作用域随授权变化；写入者选择在只点名一个可写成员时把回合交给它，使 `assign` 交接真正可执行。
+
+真实模型实测：DeepSeek Harness 打开项目源码作答，并按指令真的创建了 `IMPROVEMENTS.md`（策略为 `workspace-write`）；Codex 早已验证可写。Antigravity 的写模式参数**已被 CLI 接受**，但真实验证被 429 配额用尽打断，属**未完成验证**，配额恢复后需重跑。
+
+仍然只有只读能力的：**OpenAI 兼容的自定义 Agent（含 DeepSeek API 模板）**——它没有文件系统接口，只能讨论、复核与做传入材料的分析。要让它真正在项目里干活，需要给 API 适配器加本地工具回路（读文件/写文件/跑命令），这是下一块的候选。
+
 ## 尚未达到的预期
 
 1. **真实项目的无人值守闭环**：隔离样例已通过，但 Antigravity 的工具权限拒绝仍可能让需要运行命令的验收停止。平台提供手动交接与报告提交，不绕过权限，也不把隔离样例当作真实项目验收。

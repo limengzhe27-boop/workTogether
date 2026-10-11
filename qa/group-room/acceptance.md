@@ -84,6 +84,23 @@
 
 验证：新增 `tests/core/test_change_attribution.py`（4 项，用会真的写文件的桩 CLI）；HTTP 与真实浏览器核对：拿到写入的 codex 显示 2 个文件（`M README.md`、`A fixture-wrote.txt`），只读的 antigravity 不显示徽章。
 
+## 让三个 CLI 适配器都真正能写（2026-10-11）
+
+用户要求"不只是 Antigravity，还有 DeepSeek"。排查后确认三个适配器此前都不认写入授权：
+
+| 适配器 | 之前 | 现在 |
+| --- | --- | --- |
+| Antigravity | 硬编码 `--sandbox --mode plan`，永远只读 | 写入回合切到 `--mode accept-edits --dangerously-skip-permissions`（无人在场必须预授权工具请求）；只读回合保持 `--sandbox --mode plan` |
+| DeepSeek Harness | CHAT 一律 `read-only`，且会话作用域固定 `:read` | 按授权决定 `sandbox-policy.mode`；`:write`/`:read` 作用域随授权变化，避免用只读会话去写 |
+| 写入者选择 | 只挑"有 code 角色且可写"的成员，非编码成员被点名也拿不到写权限 | 多候选人时优先编码成员；**当本轮只点名一个可写成员时，由它持有**——`assign` 交接才有意义 |
+| `AgentConfig.writable` | 只有 Codex/Harness | 三个本机 CLI 适配器都可写；OpenAI 兼容接口仍为否 |
+
+真实模型验证（2026-10-11）：
+
+- **DeepSeek Harness**：启用后问它项目用什么存数据，它**实际打开了 `notes.py`** 并指出"目前只有 `load(path)`，备份规矩还只是文档约定"；再让它创建 `IMPROVEMENTS.md`，它真的写了三条并回读确认。运行策略实测为 `sandbox mode: workspace-write`、`workspaceRoot` 指向项目、`approval: never`。用量：读 5098/733，写 1802/725（输入/输出）。
+- **Codex**：此前已验证改写 `tests/test_app.py` 并自跑测试。
+- **Antigravity**：写模式参数**已被 CLI 接受**（该轮改用 `view_file` 成功、不再出现 `ls` 权限拒绝），但真实验证被 **429 配额用尽**中断（`Individual quota reached … Resets in 2h10m`）。因此"Antigravity 能不能真写文件"目前是**未完成验证**，不是已证否；配额恢复后需重跑同一条指令。
+
 ## 边界
 
 - 写入串行是平台内调度保证，不是文件系统锁：在编辑器里手动改同一个文件仍可能冲突；也没有隔离工作树与固定被测提交。

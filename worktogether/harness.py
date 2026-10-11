@@ -28,10 +28,16 @@ class HarnessRuntime(Runtime):
     def session_scope(self, dispatch):
         # A session can persist permission overrides in Harness. Never resume a
         # writer session for read-only work, even within the same project task.
-        return self.provider + (":write" if dispatch["kind"] in ("CODE", "FIX") else ":read")
+        return self.provider + (":write" if self.writable(dispatch) else ":read")
+
+    @staticmethod
+    def writable(dispatch):
+        """Harness may write when the dispatch is work, or a chat turn was granted."""
+        return dispatch["kind"] in ("CODE", "FIX") or bool(
+            dispatch.get("payload", {}).get("allow_write"))
 
     def command(self, run, dispatch):
-        mode = "workspace-write" if dispatch["kind"] in ("CODE", "FIX") else "read-only"
+        mode = "workspace-write" if self.writable(dispatch) else "read-only"
         policy = [
             {"id": "sandbox-policy", "config": {"mode": mode, "workspaceRoot": run["cwd"]}},
             # Harness 'never' DENIES escalation; it is not auto-approval.

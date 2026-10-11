@@ -48,10 +48,25 @@ class HarnessTests(unittest.TestCase):
         command = json.loads((root / "command.json").read_text())
         self.assertIn("--session-id", command)
         policy = json.loads((root / "harness-policy.json").read_text())
-        self.assertEqual("read-only", policy[0]["config"]["mode"])
+        # A chat turn in a writable session may change files; the write grant is
+        # what decides, not the dispatch kind alone.
+        self.assertEqual("workspace-write", policy[0]["config"]["mode"])
         self.assertEqual("never", policy[1]["config"]["policy"])
         self.assertIn({"id": "tool-subagent", "disabled": True}, policy)
         self.assertNotEqual(self.h.session_scope({"kind": "CODE"}), self.h.session_scope({"kind": "VERIFY"}))
+
+    def test_harness_chat_is_read_only_when_the_session_forbids_writes(self):
+        self.enable()
+        self.engine.chat_config(self.task, {"allow_write": False})
+        self.engine.message_add(self.task, "readonly", "deepseek-harness", "Discuss only")
+        dispatch = self.engine.chat_dispatch(self.task)
+        self.assertFalse(dispatch["payload"].get("allow_write"))
+        run = self.h.run(self.task, dispatch["id"], 10)
+        policy = json.loads((Path(run["artifact_dir"]) / "harness-policy.json").read_text())
+        self.assertEqual("read-only", policy[0]["config"]["mode"])
+        # A read session must never be resumed for a write turn.
+        self.assertNotEqual(self.h.session_scope(dispatch),
+                            self.h.session_scope({"kind": "CODE", "payload": {}}))
 
     def test_three_agent_discussion_and_non_codex_code(self):
         self.enable()
