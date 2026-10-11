@@ -47,10 +47,32 @@ async function component(filename) {
 
 const { MessageContent } = await component('MessageContent.tsx');
 const { ProjectNavigation } = await component('ProjectNavigation.tsx');
-const { TaskChat, ChatScopeNotice } = await component('TaskChat.tsx');
+const { TaskChat, ChatScopeNotice, ApiReadToolsOption } = await component('TaskChat.tsx');
 const { SecretStorageNotice } = await component('SecretStorageNotice.tsx');
 const renderMessage = text => renderToStaticMarkup(React.createElement(MessageContent, { text }));
 const noop = () => {};
+
+test('API read tools require explicit consent and explain scope, disclosure and budgets', () => {
+  const html = renderToStaticMarkup(React.createElement(ApiReadToolsOption, {
+    count: 2, checked: false, disabled: false, onChange: noop,
+  }));
+  assert.doesNotMatch(html, /checked=""/);
+  assert.match(html, /默认关闭/);
+  assert.match(html, /所选 2 个文件/);
+  assert.match(html, /4 次工具调用、5 次模型请求/);
+  assert.match(html, /内容会发送给所选 API 服务/);
+  assert.match(html, /不传给后续派活/);
+  assert.match(html, /不能写文件或运行命令/);
+});
+
+test('API read tools cannot be enabled without selected files or while sending', () => {
+  for (const props of [{ count: 0, disabled: false }, { count: 2, disabled: true }]) {
+    const html = renderToStaticMarkup(React.createElement(ApiReadToolsOption, {
+      ...props, checked: false, onChange: noop,
+    }));
+    assert.match(html, /disabled=""/);
+  }
+});
 
 test('secret permission warning explains risk and manual recovery without exposing a key', () => {
   const html = renderToStaticMarkup(React.createElement(SecretStorageNotice, { storage: {

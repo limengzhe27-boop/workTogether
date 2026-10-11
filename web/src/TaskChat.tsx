@@ -36,6 +36,7 @@ type Message = {
   write_authorized?: boolean;
   room_members?: string[];
   context_files?: string[];
+  tool_files?: string[];
   blocked_role?: string;
   blocked_roles?: string[];
   active_roles?: string[];
@@ -108,6 +109,17 @@ export function ChatScopeNotice({ names, writable, loaded }: { names: string[]; 
   </div>;
 }
 
+export function ApiReadToolsOption({ count, checked, disabled, onChange }: {
+  count: number; checked: boolean; disabled: boolean; onChange: (checked: boolean) => void;
+}) {
+  return <div className="small compose-notice">
+    <label><input type="checkbox" checked={checked} disabled={disabled || !count}
+      onChange={event => onChange(event.target.checked)} /> 允许 API 按需读取所选 {count} 个文件</label>
+    <p>默认关闭，仅限本条消息；不传给后续派活。每位 API Agent 每次回复最多 4 次工具调用、5 次模型请求，可能增加用量。
+      文件内容会发送给所选 API 服务，请确认不含秘密；不能写文件或运行命令。更换成员或文件需重新勾选，暂停会阻止后续读取。</p>
+  </div>;
+}
+
 export function TaskChat({
   taskId,
   projectId,
@@ -154,6 +166,7 @@ export function TaskChat({
   const [tick, setTick] = useState(0);
   const [rounds, setRounds] = useState(1);
   const [contextFiles, setContextFiles] = useState<string[]>([]);
+  const [readGrantScope, setReadGrantScope] = useState('');
   const [pickerOpen, setPickerOpen] = useState(false);
   const [projectFiles, setProjectFiles] = useState<ProjectFileEntry[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
@@ -175,6 +188,10 @@ export function TaskChat({
     return readyIds.filter(id => selectedIds.includes(id));
   }, [selectedIds, readyIds]);
   const isAllSelected = readyIds.length > 0 && activeAgentIds.length === readyIds.length;
+  const hasApiRecipient = readyAgents.some(a => a.type === 'openai_compat' && activeAgentIds.includes(a.id));
+  const readScopeKey = JSON.stringify([taskId, activeAgentIds, contextFiles]);
+  const allowReadTools = hasApiRecipient && contextFiles.length > 0 && readGrantScope === readScopeKey;
+  useEffect(() => { setReadGrantScope(''); }, [readScopeKey]);
 
   function toggleAllAgents() {
     if (isAllSelected) {
@@ -245,6 +262,7 @@ export function TaskChat({
     try {
       const payload: Record<string, unknown> = { message_id: id, recipient: recipientValue, content: text.trim(), allow_write: chat.allow_write };
       if (contextFiles.length > 0) payload.context_files = contextFiles;
+      if (allowReadTools) payload.tool_files = contextFiles;
       if (rounds === 2) payload.rounds = 2;
       await request(`/tasks/${taskId}/messages`, {
         method: 'POST',
@@ -254,6 +272,7 @@ export function TaskChat({
       setText('');
       setId(crypto.randomUUID());
       setContextFiles([]);
+      setReadGrantScope('');
       setRounds(1);
       setPickerOpen(false);
       onPending(true);
@@ -417,6 +436,7 @@ export function TaskChat({
                   {!!m.context_files?.length && <span className="message-flag" title={m.context_files.join('\n')}>
                     <Paperclip aria-hidden="true" />{m.context_files.length} 个文件
                   </span>}
+                  {!!m.tool_files?.length && <span className="message-flag" title={m.tool_files.join('\n')}>API 限定读取 {m.tool_files.length} 个文件</span>}
                   {m.status !== 'DELIVERED' && <span className="message-status small">{statusLabels[m.status] || m.status}</span>}
                 </div>
               </div>
@@ -672,6 +692,10 @@ export function TaskChat({
               </button>
             </div>
           </div>
+          {hasApiRecipient && contextFiles.length > 0 && <ApiReadToolsOption count={contextFiles.length}
+            checked={allowReadTools} disabled={sending || !loaded} onChange={checked => {
+              setReadGrantScope(checked ? readScopeKey : ''); setId(crypto.randomUUID());
+            }} />}
         </form>
         <ChatScopeNotice names={activeAgentIds.map(role => agentMap[role]?.name || role)} writable={chat.allow_write} loaded={loaded} />
         {readyAgents.length > 0 && activeAgentIds.length === 0 && <p className="small compose-notice">请点击上方「全部」或单个 Agent 选择消息接收对象。</p>}

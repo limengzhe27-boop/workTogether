@@ -113,8 +113,8 @@ class AgentConfig:
         """Whether this adapter can actually change files when granted the write turn.
 
         Codex, DeepSeek Harness and Antigravity are local CLI coding agents and
-        can write. An OpenAI-compatible agent has no filesystem access at all, so
-        the platform must not hand it a write grant it cannot use.
+        can write. API agents may have an explicit bounded read-file grant, but
+        no write tools; the platform must not hand them a write grant.
         """
         if not self.enabled or self.type != "cli":
             return False

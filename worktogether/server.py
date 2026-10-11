@@ -357,7 +357,7 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                 return self._send_json(HTTPStatus.OK, probe_openai_compatible(agent))
             m_messages = re.fullmatch(r"/api/tasks/([^/]+)/messages", path)
             if m_messages:
-                allowed_keys = {"message_id", "recipient", "content", "allow_write", "context_files", "referenced_task_ids", "rounds"}
+                allowed_keys = {"message_id", "recipient", "content", "allow_write", "context_files", "referenced_task_ids", "rounds", "tool_files"}
                 if not {"message_id", "recipient", "content"}.issubset(set(body)) or set(body) - allowed_keys:
                     raise CollabError("INVALID_INPUT", "message_id, recipient and content required")
                 return self._send_json(202, self.engine.message_add(m_messages.group(1), **body))

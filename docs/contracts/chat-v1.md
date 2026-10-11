@@ -17,6 +17,7 @@ HTTP 总表与错误见 [v1.md](v1.md)。群聊与“讨论方案 → 审批 →
 | `rounds` | 可选，整数 1 或 2（不接受布尔值），默认 1；本条用户消息的发言轮数 |
 | `allow_write` | 可选布尔；省略或 null 继承会话配置，false 使本条及其全部后续委派只读；会话关闭时请求 true 返回 APPROVAL_REQUIRED |
 | `context_files` | 可选，最多 10 个非空文件路径字符串 |
+| `tool_files` | 可选，默认无授权；最多 10 个唯一、显式的相对文件路径，仅本条用户消息的 API 回复可按需读取，不继承给 Agent 派活。拒绝隐藏/凭据路径、绝对路径、空段及 `..` |
 | `referenced_task_ids` | 可选，最多 5 个非空任务 ID 字符串；仅注入同项目引用 |
 
 拒绝额外字段，包括伪造 sender、intent、round、auto、held、room_members、write_epoch、write_authorized。
@@ -27,7 +28,7 @@ room_members；之后的提问/派活只能在这个集合内流转，不能因�
 前端发送明确的 ID 清单，而非动态 all，避免点击发送时加入用户尚未见到的新成员。
 
 相同任务、相同 ID、相同 recipient/content 返回原消息；二者任一不同返回 409。
-当前幂等比较**不包含** rounds / allow_write / 引用字段，修改它们不会覆盖原消息。
+当前幂等比较**不包含** rounds / allow_write / tool_files / 引用字段，修改它们不会覆盖原消息。
 重试请保持完整原请求；改变发送设置须使用新 ID，不要假定重发能更新授权。
 
 ## 消息与会话响应
@@ -53,6 +54,7 @@ status、round、rounds、replies、created_at（Unix 秒）。字段语义如�
 | `write_epoch` | 服务端内部授权代次，随消息保存；不得作为客户端申请扩权的字段 |
 | `write_authorized` | GET 时派生的当前有效写入授权；与历史请求 allow_write 区分，撤销后为 false |
 | `context_files` / `referenced_task_ids` | 用户选择的上下文引用（非空时保存） |
+| `tool_files` | 用户本条消息授予 API 的显式读取文件清单；默认不保存，不复制到后续 Agent 消息 |
 | `pending_roles` / `failed_roles` | GET 派生字段：当前轮待回复 / 失败成员 |
 | `active_roles` / `active_since` / `write_role` | 运行中的派发成员、开始时间及获写授权成员（如有） |
 | `wait_reason` | 如 AUTO_ROUND_BUDGET；不是成功或持续运行证明 |
@@ -87,7 +89,8 @@ ACTIVE / BLOCKED 的占用都须先解决，正式执行也不能绕过未结束
 在启动锁内复核失败后保存 PERMISSION_REVOKED / BLOCKED，必须显式处理，不自动重放。
 需要重新写入时，开启会话写入并发送**新消息**。已经启动的进程不会被强杀；关闭开关
 不承诺回收它已持有的操作系统权限，但其后续委派不能再使用被撤销的授权。
-这不是 worktree 隔离或防外部编辑锁。API Agent 无本地工具，只能使用传入材料。
+这不是 worktree 隔离或防外部编辑锁。API Agent 默认只用传入材料；显式 tool_files
+可启用下述只读工具，不能获取写入权限。
 写入仍受 CLI 沙箱/权限约束。Antigravity 写模式保留 sandbox，真实写入边界待独立验收。
 
 暂停、阻塞、在途派发/运行或团队作业可能阻止新聊天派发。暂停不杀在途进程，允许
@@ -126,6 +129,31 @@ max_auto_rounds 名称沿用历史，实际按每条入队的自动 ask/assign �
 已用计数归零。释放本身不调用模型，但后台消费者随后会处理并可能产生用量。
 释放不改变房间范围或授权代次。可以反复释放，所以预算不是整个会话的硬费用封顶。
 
+## API 限定读取工具（第一阶段）
+
+只有 CHAT 用户消息可授权，默认关闭；在输入框选中 API 成员和项目文件后，可勾选
+“允许 API 按需读取所选文件”。前端发送明确 tool_files，与写入开关无关；更换成员或
+文件需重新勾选。该授权涵盖本条消息选择的 1–2 轮，各 API 回复分别计预算；取消下一条
+消息的勾选不会撤回旧消息，需暂停任务以阻止后续读取/请求。ask/assign 不继承读取授权，
+正式分析/规划暂不启用工具。不自动启用 API Agent，也不自动做真实连通探测。
+
+- list_files({}) 只返回授权清单（剔除运行目录），不扫描目录；read_file({path,offset?,limit?})
+  仅打开清单内普通文件，offset 为字节偏移，limit 默认/最大 12000 字节。单文件最大 1 MiB。
+- 每次 API 回复最多 4 次工具调用（拒绝也计数）、5 次 HTTP 请求、48000 字节读取。
+  最后一次请求 tool_choice:none；仍请求工具则 TOOL_LIMIT/BLOCKED，不追加预算。
+  保留原任务超时与剩余请求超时；这是有界回路，不是服务商 Token/计费硬封顶。
+- POSIX 逐层目录描述符 + O_NOFOLLOW，不跟随符号链接，拒绝多硬链接、FIFO、目录、
+  二进制片段、隐藏路径、常见凭据文件和状态库/运行目录。缺少安全读取 API 时失败，
+  不降级成普通路径打开。此规则不是秘密扫描器：源文件/普通文档中自行写入的秘密仍需用户确认。
+- 每次读文件和每次后续 HTTP 前复查房间/任务/读取范围/API 目标；已发送内容不能收回。
+  修改目标或撤销范围会停止继续发送，不自动重试。只读工具没有 shell/write_file 能力，
+  未知工具返回拒绝；模型无法通过参数扩大授权。
+- 工具授权文件不再经旧附件读取通道注入；启用工具的 API 回复不附送自动 README 正文，
+  要读取 README 请把它选进清单。既有用户文字、其它引用材料、项目记忆和讨论上下文仍会发送。
+- 返回片段带字节位置、截断标记、mtime_ns 和片段 SHA-256；这是读取时证据，不是版本快照。
+  events.jsonl 记录调用结果元数据而非重复文件正文；run.usage 汇总已返回的用量，失败也保留，
+  未返回用量的请求不推算。run.api_requests / tool_calls 为本次运行已收到响应数/已执行工具数。
+
 ## 显式恢复与验证边界
 
 `POST .../messages/{message_id}/resolve` 接受 skip（默认）或 retry，只能处理
@@ -135,6 +163,7 @@ BLOCKED / RUNNING / QUEUED。PREPARED/RUNNING 进程须先确认已停止。
 不会自动重放失败成员，也不以恢复绕过权限。
 
 确定性覆盖：test_group_chat.py、test_server_context.py、test_contracts.py、test_room_authorization.py、test_openai_runtime.py。
+test_read_tools.py 覆盖文件边界、工具预算/撤权、HTTP 假服务的列文件→读取→回复闭环；无真实模型。
 新增模拟 CLI 的 HTTP 两轮讨论与同伴跟进闭环，不是实际模型验收。
 真实证据以 [group-room 验收记录](../../qa/group-room/acceptance.md) 为准。
 本次契约对齐未调用真实模型，未验证 Antigravity 写权限、长会话成本或并行写隔离。

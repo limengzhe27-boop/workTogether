@@ -670,12 +670,15 @@ class Engine:
 
 
     def message_add(self, task_id, message_id, recipient, content, allow_write=None,
-                    context_files=None, referenced_task_ids=None, rounds=1):
+                    context_files=None, referenced_task_ids=None, rounds=1, tool_files=None):
         require(string(message_id) and len(message_id) <= 128 and string(recipient)
                 and string(content) and len(content) <= 20000,
                 "Invalid message", "INVALID_INPUT")
         require(allow_write is None or type(allow_write) is bool, "allow_write must be boolean", "INVALID_INPUT")
         require(type(rounds) is int and rounds in (1, 2), "rounds must be 1 or 2", "INVALID_INPUT")
+        if tool_files is not None:
+            from .read_tools import validate_tool_files
+            validate_tool_files(tool_files)
         if context_files is not None:
             require(strings(context_files) and len(context_files) <= 10, "Invalid context_files", "INVALID_INPUT")
         if referenced_task_ids is not None:
@@ -720,6 +723,8 @@ class Engine:
                 m["allow_write"] = True
             if context_files:
                 m["context_files"] = [f.strip() for f in context_files if f.strip()]
+            if tool_files:
+                m["tool_files"] = list(tool_files)
             if referenced_task_ids:
                 m["referenced_task_ids"] = [tid.strip() for tid in referenced_task_ids if tid.strip()]
             db.execute("INSERT INTO messages VALUES(?,?,?)", (message_id, task_id, encode(m)))
@@ -879,6 +884,9 @@ class Engine:
                                     room_members=room_members,
                                     write_epoch=m.get("write_epoch", 0),
                                     is_auto=bool(m.get("auto")))
+                # Explicit per-user-message grant; never inherited by peer messages.
+                if m.get("sender") == "user" and not m.get("auto") and m.get("tool_files"):
+                    d["payload"]["tool_files"] = list(m["tool_files"])
                 if writer == role:
                     d["payload"]["allow_write"] = True
                 p = self._project(db, t["project_id"])
@@ -893,7 +901,10 @@ class Engine:
                     d["payload"]["project_context"] = digest
                 if m.get("context_files"):
                     from .workspace import read_project_files
-                    d["payload"]["attached_files"] = read_project_files(p["path"], m["context_files"])
+                    # A tool-authorized file must not bypass its secure reader
+                    # via the legacy attachment path (which can follow links).
+                    attachments = [f for f in m["context_files"] if f not in m.get("tool_files", [])]
+                    d["payload"]["attached_files"] = read_project_files(p["path"], attachments)
                 if m.get("referenced_task_ids"):
                     ref_sessions = []
                     for ref_id in m["referenced_task_ids"]:
