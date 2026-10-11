@@ -21,18 +21,24 @@ class ChatTests(unittest.TestCase):
         self.a = AntigravityRuntime(self.e, str((root / "fake_agy.py").resolve()))
         self.q = ChatQueue(self.e, self.c, self.a)
 
-    def test_both_two_calls_peer_context_no_plan_mutation(self):
+    def test_both_two_calls_are_simultaneous_and_do_not_mutate_the_plan(self):
         self.e.message_add(self.t, "m", "both", "How should we approach this?")
         self.assertIsNone(self.e.dispatch(self.t)["dispatch"])
-        self.q.once(); self.q.once(); self.q.once()
+        self.q.once()
         m = self.e.messages(self.t)[0]
         self.assertEqual("DELIVERED", m["status"])
-        self.assertEqual(["codex", "antigravity"], [r["role"] for r in m["replies"]])
+        self.assertEqual({"codex", "antigravity"}, {r["role"] for r in m["replies"]})
+        # Round 1 is a true broadcast: both dispatches exist at once and neither
+        # agent could see the other's reply before answering.
+        chat = [d for d in self.e.show(self.t)["dispatches"] if d["kind"] == "CHAT"]
+        self.assertEqual({"codex", "antigravity"}, {d["role"] for d in chat})
+        for d in chat:
+            self.assertEqual(1, d["payload"]["round"])
+            self.assertEqual([], d["payload"]["peer_replies"])
         t = self.e.show(self.t)
         self.assertEqual("PLANNING", t["phase"])
         self.assertIsNone(t["draft_plan"])
         self.assertEqual(2, len(self.c.list(self.t)["runs"]))
-        self.assertEqual("codex", t["dispatches"][1]["payload"]["peer_replies"][0]["role"])
 
     def test_exact_recipient_and_session_resume(self):
         for i in range(2):

@@ -123,10 +123,10 @@ const renderChat = props => {
   }
 };
 
-test('chat composer exposes file context, write permission and rounds controls', () => {
+test('chat composer exposes file context, session write grant and rounds controls', () => {
   const html = renderChat({});
   assert.match(html, /引用文件/);
-  assert.match(html, /允许修改/);
+  assert.match(html, /可在项目里工作/);
   assert.match(html, /aria-label="选择对话 Agent"/);
   assert.match(html, /轮次/);
   assert.match(html, /aria-label="发送消息"/);
@@ -138,10 +138,10 @@ test('chat composer explains the no-ready-agent case instead of offering a dead 
   assert.match(html, /disabled=""/);
 });
 
-test('chat composer does not offer write permission as a default', () => {
+test('chat composer does not grant project write before the session state loads', () => {
   const html = renderChat({});
-  const writeToggle = html.match(/<input type="checkbox"[^>]*>/g) || [];
-  assert.ok(writeToggle.every(tag => !tag.includes('checked')), 'write permission must default to off');
+  const toggles = html.match(/<input type="checkbox"[^>]*>/g) || [];
+  assert.ok(toggles.every(tag => !tag.includes('checked')), 'write grant must default to off in the UI');
 });
 
 test('chat composer marks an agent whose local CLI is missing', () => {

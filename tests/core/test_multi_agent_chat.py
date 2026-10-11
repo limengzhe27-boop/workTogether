@@ -43,7 +43,7 @@ class MultiAgentChatTests(unittest.TestCase):
         self.assertEqual(d["role"], "local-model")
         self.assertEqual(d["payload"]["message"], "如何优化多Agent之间的消息同步机制？")
 
-    def test_broadcast_to_all_agents(self):
+    def test_broadcast_reaches_every_agent_at_once(self):
         msg = self.engine.message_add(self.task["id"], "msg-all", "all", "请各位Agent分别评估本项目的前端技术选型。")
         self.assertEqual(msg["status"], "QUEUED")
         self.assertEqual(msg["recipient"], "all")
@@ -51,58 +51,59 @@ class MultiAgentChatTests(unittest.TestCase):
         enabled_agents = msg["participants"]
         self.assertEqual(enabled_agents, ["codex", "antigravity", "local-model"])
 
-        # 1. First agent dispatch
-        d1 = self.engine.chat_dispatch(self.task["id"])
-        self.assertIsNotNone(d1)
-        role1 = d1["role"]
-        self.assertEqual(role1, enabled_agents[0])
+        # The whole round is issued in one step: a genuine simultaneous broadcast.
+        round_one = self.engine.chat_dispatch_round(self.task["id"])
+        self.assertEqual([d["role"] for d in round_one], enabled_agents)
+        for d in round_one:
+            self.assertEqual(d["payload"]["round"], 1)
+            self.assertEqual(d["payload"]["total_rounds"], 1)
+            # Nobody sees a peer before answering in round 1.
+            self.assertEqual(d["payload"]["peer_replies"], [])
+        # A second call while the round is in flight must not double-dispatch.
+        self.assertEqual(self.engine.chat_dispatch_round(self.task["id"]), [])
 
-        # Submit role 1 response
-        r1 = self.registry.get_runtime(role1, custom_executables=self.custom_executables)
-        run1 = r1.run(self.task["id"], d1["id"], timeout=30)
-        self.assertEqual(run1["status"], "COMPLETED")
+        for d in round_one[:2]:
+            runtime = self.registry.get_runtime(d["role"], custom_executables=self.custom_executables)
+            self.assertEqual(runtime.run(self.task["id"], d["id"], timeout=30)["status"], "COMPLETED")
 
-        # 2. Second agent dispatch (sees role 1 peer reply)
-        d2 = self.engine.chat_dispatch(self.task["id"])
-        self.assertIsNotNone(d2)
-        role2 = d2["role"]
-        self.assertEqual(role2, enabled_agents[1])
-        self.assertEqual(len(d2["payload"]["peer_replies"]), 1)
-        self.assertEqual(d2["payload"]["peer_replies"][0]["role"], role1)
+        # Still running: the third agent has not answered yet.
+        self.assertEqual(self.engine.messages(self.task["id"])[0]["status"], "RUNNING")
+        self.assertEqual(self.engine.messages(self.task["id"])[0]["pending_roles"], [enabled_agents[2]])
 
-        # Submit role 2 response
-        r2 = self.registry.get_runtime(role2, custom_executables=self.custom_executables)
-        run2 = r2.run(self.task["id"], d2["id"], timeout=30)
-        self.assertEqual(run2["status"], "COMPLETED")
-
-        # 3. Third agent dispatch (sees role 1 & 2 peer replies)
-        d3 = self.engine.chat_dispatch(self.task["id"])
-        self.assertIsNotNone(d3)
-        role3 = d3["role"]
-        self.assertEqual(role3, enabled_agents[2])
-        self.assertEqual(len(d3["payload"]["peer_replies"]), 2)
-
-        # Submit role 3 response
-        r3 = self.registry.get_runtime(role3, custom_executables=self.custom_executables)
-        report = {"schema_version": 1, "task_id": self.task["id"], "dispatch_id": d3["id"],
-                  "role": role3, "attempt": 1, "status": "DONE", "summary": "综合前两位意见",
-                  "basis": ["前两位的回答"], "suggestions": [], "next_action": "等待用户", "data": {}}
+        last = round_one[2]
+        report = {"schema_version": 1, "task_id": self.task["id"], "dispatch_id": last["id"],
+                  "role": last["role"], "attempt": 1, "status": "DONE", "summary": "我的独立评估",
+                  "basis": ["自己的判断"], "suggestions": [], "next_action": "等待用户", "data": {}}
         class Response:
             def __enter__(self): return self
             def __exit__(self, *_): return False
             def read(self, *_): return json.dumps({"choices": [{"message": {"content": json.dumps(report)}}]}).encode()
+        runtime = self.registry.get_runtime(last["role"], custom_executables=self.custom_executables)
         with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()):
-            run3 = r3.run(self.task["id"], d3["id"], timeout=30)
+            run3 = runtime.run(self.task["id"], last["id"], timeout=30)
         self.assertEqual(run3["status"], "COMPLETED")
 
-        # Check final message status is DELIVERED
-        msgs = self.engine.messages(self.task["id"])
-        self.assertEqual(len(msgs), 1)
-        final_msg = msgs[0]
+        final_msg = self.engine.messages(self.task["id"])[0]
         self.assertEqual(final_msg["status"], "DELIVERED")
         self.assertEqual(len(final_msg["replies"]), 3)
-        reply_roles = [r["role"] for r in final_msg["replies"]]
-        self.assertEqual(reply_roles, [role1, role2, role3])
+        self.assertEqual({r["role"] for r in final_msg["replies"]}, set(enabled_agents))
+        self.assertTrue(all(r["round"] == 1 for r in final_msg["replies"]))
+
+    def test_second_round_shows_every_peer_reply(self):
+        self.engine.message_add(self.task["id"], "msg-r2", "codex,antigravity", "先各自表态，再互相回应。", rounds=2)
+        first = self.engine.chat_dispatch_round(self.task["id"])
+        self.assertEqual(len(first), 2)
+        for d in first:
+            runtime = self.registry.get_runtime(d["role"], custom_executables=self.custom_executables)
+            self.assertEqual(runtime.run(self.task["id"], d["id"], timeout=30)["status"], "COMPLETED")
+
+        # Round 2 opens automatically and everyone can see the whole first round.
+        second = self.engine.chat_dispatch_round(self.task["id"])
+        self.assertEqual({d["role"] for d in second}, {"codex", "antigravity"})
+        for d in second:
+            self.assertEqual(d["payload"]["round"], 2)
+            self.assertEqual({r["role"] for r in d["payload"]["peer_replies"]},
+                             {"codex", "antigravity"})
 
     def test_participants_are_fixed_when_message_is_sent(self):
         msg = self.engine.message_add(self.task["id"], "msg-all", "all", "讨论")

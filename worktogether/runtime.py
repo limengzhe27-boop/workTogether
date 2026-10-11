@@ -113,30 +113,49 @@ class Runtime:
 
     def _build_chat_context(self, dispatch):
         parts = []
-        persona = getattr(self, "system_prompt", "") or dispatch.get("payload", {}).get("agent_persona", "")
+        payload = dispatch.get("payload", {})
+        persona = getattr(self, "system_prompt", "") or payload.get("agent_persona", "")
         if persona:
             parts.append(f"AGENT ROLE / PERSONA:\n{persona}")
-        if dispatch.get("payload", {}).get("allow_write"):
-            parts.append("WRITE PERMISSION: Enabled for this turn. You may directly create or modify files in the project workspace if requested.")
-        project_memory = dispatch.get("payload", {}).get("project_memory", "")
+        room = [f"ROOM: {dispatch.get('role')} speaking"]
+        if payload.get("message_sender") and payload["message_sender"] != "user":
+            room.append(f"the message you are answering was written by peer agent '{payload['message_sender']}'"
+                        + (f" (intent: {payload.get('message_intent')})" if payload.get("message_intent") else ""))
+        else:
+            room.append("the message you are answering was written by the user")
+        room.append(f"this is round {payload.get('round', 1)} of {payload.get('total_rounds', 1)}")
+        if payload.get("is_auto"):
+            room.append("this turn was started by a peer agent, not by the user")
+        peer_replies = payload.get("peer_replies") or []
+        if peer_replies:
+            room.append("PREVIOUS ROUND REPLIES (respond to these; you may ask or assign with data.messages):")
+            for reply in peer_replies:
+                room.append(f"- {reply['role']}: {reply['content'][:1200]}")
+        parts.append("\n".join(room))
+        if payload.get("allow_write"):
+            parts.append("WRITE PERMISSION: You hold this project's single write turn for this round. "
+                         "You may create or modify files in the project workspace if the request needs it, "
+                         "and you should say exactly what you changed. Other agents are running read-only in "
+                         "parallel, so do not rely on their edits landing at the same time.")
+        else:
+            parts.append("WRITE PERMISSION: read-only for this round. If a change is needed, describe it and use "
+                         "data.messages with intent 'assign' to hand it to the agent that should make it.")
+        project_memory = payload.get("project_memory", "")
         if project_memory:
             parts.append(f"PROJECT SHARED MEMORY:\n{project_memory}")
-        ref_summaries = dispatch.get("payload", {}).get("referenced_sessions") or []
+        ref_summaries = payload.get("referenced_sessions") or []
         if ref_summaries:
             lines = ["REFERENCED SESSIONS IN THIS PROJECT:"]
             for ref in ref_summaries:
                 lines.append(f"- [{ref.get('title', 'Session')}]: {ref.get('summary', '')}")
             parts.append("\n".join(lines))
-        attached = dispatch.get("payload", {}).get("attached_files") or []
+        attached = payload.get("attached_files") or []
         if attached:
             lines = ["USER REFERENCED PROJECT FILES (@file):"]
             for item in attached:
                 lines.append(f"--- FILE: {item['path']} ---\n{item['content']}\n--- END FILE ---")
             parts.append("\n".join(lines))
-        proj_files = dispatch.get("payload", {}).get("project_files") or []
-        if proj_files and (self.provider == "openai_compat" or attached):
-            parts.append("PROJECT FILE TREE (excerpt):\n" + ", ".join(proj_files[:80]))
-        project = dispatch.get("payload", {}).get("project_context") or {}
+        project = payload.get("project_context") or {}
         if project:
             lines = [f"PROJECT CONTEXT: {project.get('name', '')} at {project.get('path', '')}"]
             if project.get("readme"):
@@ -157,9 +176,13 @@ class Runtime:
     def _prompt(self, dispatch):
         if dispatch["kind"] == "CHAT":
             extra_context = self._build_chat_context(dispatch)
-            return ("You are collaborating in a multi-agent project session. Respond directly and constructively "
-                    "to the user's message and any peer_replies in the conversation. You may freely discuss architecture, "
-                    "code, debugging, or coordinate task division with other agents. "
+            return ("You are one agent in a shared project room. The user and several peer agents are all "
+                    "participants; the room transcript is in the DISPATCH below. "
+                    "Round 1 is simultaneous: every agent answers the user's message on its own, without seeing "
+                    "the others, so state your own position plainly instead of referring to replies you cannot see. "
+                    "From round 2 on you receive the previous round's replies and should respond to them: agree, "
+                    "disagree with reasons, answer a peer's question, or take over work. "
+                    "You may also address a peer directly by adding data.messages entries. "
                     "When asked about this project, answer from the PROJECT CONTEXT block below and from files you actually "
                     "open; never invent project details and say plainly when the context is missing or truncated. "
                     "Format summary in clean Markdown (state the direct conclusion first, then use short paragraphs or '- ' bullet points "
@@ -167,9 +190,13 @@ class Runtime:
                     "Do not lecture the user about internal state-machine fields like requirement_revision. "
                     "Return ONLY JSON with schema_version:1, task_id, dispatch_id (dispatch.id), role, attempt, "
                     "status:DONE, summary:your Markdown reply, basis:[nonempty strings], suggestions:[] (max 3), "
-                    "next_action:string. data is {} or {proposals:[{title,work_kind:code|analysis,assignee,reason}]} "
-                    "with at most 3 optional task proposals when task breakdown is helpful. If unable, status:BLOCKED and "
-                    "data:{reason:string}.\n" + extra_context + "DISPATCH:\n" + encode(dispatch))
+                    "next_action:string. "
+                    "data is {} or an object with any of: "
+                    "proposals:[{title,work_kind:code|analysis,assignee,reason}] (max 3, advice for the user), "
+                    "messages:[{to:peer-id-or-'all', intent:'ask'|'assign'|'claim'|'report', content:string}] "
+                    "(max 3) to question a peer, hand work to a peer, claim work, or report to the room. "
+                    "Use assign when another agent should do work; the platform delivers it and lets that agent act. "
+                    "If unable, status:BLOCKED and data:{reason:string}.\n" + extra_context + "DISPATCH:\n" + encode(dispatch))
         if dispatch["kind"] == "ANALYZE":
             return ("Complete this assigned read-only analysis. Do not modify files or launch other agents. "
                     "Use prior step handoffs and review findings in the dispatch; distinguish observation from inference. "
@@ -518,8 +545,19 @@ def normalize_chat_report(raw, dispatch):
         if not (isinstance(data, dict) and isinstance(data.get("reason"), str) and data["reason"].strip()):
             data = {"reason": summary.strip()[:500]}
     else:
-        if not (isinstance(data, dict) and (data == {} or set(data) == {"proposals"})):
+        allowed = {"proposals", "messages"}
+        if not (isinstance(data, dict) and set(data) <= allowed):
             data = {}
+        else:
+            cleaned = {}
+            if isinstance(data.get("proposals"), list) and data["proposals"]:
+                cleaned["proposals"] = data["proposals"]
+            if isinstance(data.get("messages"), list) and data["messages"]:
+                kept = [item for item in data["messages"]
+                        if isinstance(item, dict) and {"to", "intent", "content"} <= set(item)]
+                if kept:
+                    cleaned["messages"] = kept
+            data = cleaned
     return {
         "schema_version": 1,
         "task_id": dispatch["task_id"],

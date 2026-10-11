@@ -49,9 +49,21 @@ class ChatContextTests(unittest.TestCase):
         self.e.message_add(self.t, "m", "codex", "add a docstring", allow_write=True)
         self.assertTrue(self.dispatch_payload()["allow_write"])
 
-    def test_write_is_not_granted_by_default(self):
-        self.e.message_add(self.t, "m", "codex", "just explain")
-        self.assertNotIn("allow_write", self.dispatch_payload())
+    def test_write_is_granted_by_default_and_only_to_one_agent(self):
+        # A session is writable by default; parallel discussion still serializes
+        # the write turn so two agents never edit the same checkout at once.
+        self.e.message_add(self.t, "m", "both", "please look at the code")
+        issued = self.e.chat_dispatch_round(self.t)
+        writers = [d["role"] for d in issued if d["payload"].get("allow_write")]
+        self.assertEqual(["codex"], writers)
+        self.assertEqual(1, len(writers))
+
+    def test_write_can_be_turned_off_for_the_session(self):
+        self.e.chat_config(self.t, {"allow_write": False})
+        self.e.message_add(self.t, "m", "both", "just discuss")
+        issued = self.e.chat_dispatch_round(self.t)
+        self.assertTrue(issued)
+        self.assertFalse(any(d["payload"].get("allow_write") for d in issued))
 
     def test_referenced_files_are_attached_within_bounds(self):
         self.e.message_add(self.t, "m", "codex", "review main", context_files=["main.py"])
@@ -68,10 +80,12 @@ class ChatContextTests(unittest.TestCase):
         self.assertEqual("previous", referenced[0]["title"])
         self.assertIn("codex", referenced[0]["summary"])
 
-    def test_rounds_double_the_speaking_order(self):
+    def test_rounds_keep_the_roster_and_add_a_second_pass(self):
         message = self.e.message_add(self.t, "m", "both", "debate this", rounds=2)
-        self.assertEqual(["codex", "antigravity", "codex", "antigravity"], message["participants"])
+        # The roster is the roster; rounds no longer duplicate participants.
+        self.assertEqual(["codex", "antigravity"], message["participants"])
         self.assertEqual(2, message["rounds"])
+        self.assertEqual(1, message["round"])
 
     def test_message_options_are_validated(self):
         for kwargs in ({"rounds": 3}, {"rounds": "2"}, {"allow_write": "yes"},
@@ -99,19 +113,20 @@ class ChatContextTests(unittest.TestCase):
         self.assertTrue(resolved["replies"][0]["skipped"])
         self.assertIsNone(resolved.get("error"))
 
-    def test_skip_advances_to_the_next_speaker(self):
+    def test_partial_round_failure_can_be_skipped_without_losing_peers(self):
+        # Only codex is broken; antigravity runs fine in the same parallel round.
+        import os
         self.e.message_add(self.t, "m", "both", "question")
         with patch.dict("os.environ", {"WT_FAKE_MODE": "exit"}):
             self.q.once()
-        self.assertEqual("BLOCKED", self.e.messages(self.t)[0]["status"])
+        message = self.e.messages(self.t)[0]
+        self.assertEqual("BLOCKED", message["status"])
+        self.assertEqual("codex", message["blocked_role"])
         resolved = self.e.message_resolve(self.t, "m", action="skip")
-        self.assertEqual("QUEUED", resolved["status"])
-        self.assertEqual("codex", resolved["replies"][0]["role"])
-        self.assertTrue(resolved["replies"][0]["skipped"])
-        self.q.once()
-        delivered = self.e.messages(self.t)[0]
-        self.assertEqual("DELIVERED", delivered["status"])
-        self.assertEqual(["codex", "antigravity"], [r["role"] for r in delivered["replies"]])
+        self.assertEqual("DELIVERED", resolved["status"])
+        by_role = {r["role"]: r for r in resolved["replies"]}
+        self.assertTrue(by_role["codex"]["skipped"])
+        self.assertFalse(by_role["antigravity"].get("skipped", False))
 
     def test_retry_requeues_the_message(self):
         self.e.message_add(self.t, "m", "codex", "question")
@@ -163,6 +178,24 @@ class NormalizeChatReportTests(unittest.TestCase):
     def test_non_chat_reports_pass_through_untouched(self):
         raw = {"anything": 1}
         self.assertIs(raw, normalize_chat_report(raw, {"kind": "CODE"}))
+
+    def test_peer_messages_survive_normalization(self):
+        report = self.normalize({"summary": "hi", "data": {
+            "messages": [{"to": "antigravity", "intent": "ask", "content": "复核一下"}]}})
+        self.assertEqual([{"to": "antigravity", "intent": "ask", "content": "复核一下"}],
+                         report["data"]["messages"])
+
+    def test_malformed_chat_data_is_dropped(self):
+        for data in ({"nope": 1}, {"messages": [{"to": "x"}]}, {"messages": "not a list"}):
+            with self.subTest(data=data):
+                self.assertEqual({}, self.normalize({"summary": "hi", "data": data})["data"])
+
+    def test_proposals_and_messages_can_coexist(self):
+        report = self.normalize({"summary": "hi", "data": {
+            "proposals": [{"title": "t", "work_kind": "code", "assignee": "codex", "reason": "r"}],
+            "messages": [{"to": "antigravity", "intent": "report", "content": "done"}]}})
+        self.assertIn("proposals", report["data"])
+        self.assertIn("messages", report["data"])
 
     def test_empty_response_is_rejected(self):
         with self.assertRaises(ValueError):

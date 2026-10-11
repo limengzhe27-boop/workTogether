@@ -137,7 +137,8 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                 return self._send_json(HTTPStatus.OK, {"agents": reg.list()})
             m_messages = re.fullmatch(r"/api/tasks/([^/]+)/messages", path)
             if m_messages:
-                return self._send_json(200, {"messages": self.engine.messages(m_messages.group(1))})
+                return self._send_json(200, {"messages": self.engine.messages(m_messages.group(1)),
+                                             "chat": self.engine.chat_state(m_messages.group(1))})
 
             m_jobs = re.fullmatch(r"/api/tasks/([^/]+)/planning-jobs", path)
             if m_jobs:
@@ -344,6 +345,15 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
             if m_msg_resolve:
                 action = body.get("action", "skip")
                 return self._send_json(200, self.engine.message_resolve(m_msg_resolve.group(1), m_msg_resolve.group(2), action=action))
+
+            # Group chat session settings and the explicit "continue" action for
+            # agent-to-agent messages held back by the automatic round budget.
+            m_chat_config = re.fullmatch(r"/api/tasks/([^/]+)/chat-config", path)
+            if m_chat_config:
+                return self._send_json(200, self.engine.chat_config(m_chat_config.group(1), body))
+            m_chat_release = re.fullmatch(r"/api/tasks/([^/]+)/chat-release", path)
+            if m_chat_release:
+                return self._send_json(200, self.engine.chat_release(m_chat_release.group(1)))
 
             m_revision = re.fullmatch(r"/api/tasks/([^/]+)/revisions", path)
             if m_revision:

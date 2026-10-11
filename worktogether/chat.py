@@ -1,7 +1,14 @@
-"""Deterministic queue pump: no model calls while idle, no automatic retry."""
+"""Deterministic queue pump: no model calls while idle, no automatic retry.
+
+One worker per task. Inside a worker a whole round is issued at once and the
+agents run concurrently: each role has its own CLI session, so a parallel
+broadcast is safe as long as the platform serializes file writes, which
+core._pick_writer does.
+"""
 import threading
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 
 class ChatQueue:
@@ -13,6 +20,7 @@ class ChatQueue:
         self._worker_lock = threading.Lock()
         self._cursor = 0
         self.max_parallel_tasks = 4
+        self.max_parallel_agents = 4
 
     def get_provider(self, role):
         if role in self.providers:
@@ -28,16 +36,38 @@ class ChatQueue:
         # Custom configuration may change between messages; never keep a stale adapter.
         return AgentRegistry(self.engine).get_runtime(role)
 
+    def _run_round(self, task_id):
+        """Issue the current round and run its agents concurrently.
+
+        A dispatch that was issued but never run is deliberately NOT picked up
+        here: an ambiguous launch must be retried explicitly, never replayed.
+        """
+        dispatches = self.engine.chat_dispatch_round(task_id)
+        if not dispatches:
+            return 0
+        if len(dispatches) == 1:
+            dispatch = dispatches[0]
+            self.get_provider(dispatch["role"]).run(task_id, dispatch["id"], 300)
+            return 1
+
+        def run(dispatch):
+            try:
+                self.get_provider(dispatch["role"]).run(task_id, dispatch["id"], 300)
+            except Exception:
+                # The durable dispatch stays unresolved for an explicit retry.
+                logging.exception("Parallel chat agent stopped; inspect persistent state")
+
+        with ThreadPoolExecutor(max_workers=min(self.max_parallel_agents, len(dispatches))) as pool:
+            list(pool.map(run, dispatches))
+        return len(dispatches)
+
     def once(self):
         with self.engine.transaction() as db:
             tasks = [r[0] for r in db.execute("SELECT DISTINCT task_id FROM messages")]
         for task in tasks:
             if self.stopped.is_set():
                 return
-            d = self.engine.chat_dispatch(task)
-            if d:
-                provider = self.get_provider(d["role"])
-                provider.run(task, d["id"], 300)
+            self._run_round(task)
 
     def start(self):
         def loop():
@@ -88,9 +118,7 @@ class ChatQueue:
         try:
             if self.stopped.is_set():
                 return
-            dispatch = self.engine.chat_dispatch(task_id)
-            if dispatch:
-                self.get_provider(dispatch["role"]).run(task_id, dispatch["id"], 300)
+            self._run_round(task_id)
         except Exception:
             # Leave the durable dispatch unresolved. Do not silently retry an
             # ambiguous launch merely because this worker exited.

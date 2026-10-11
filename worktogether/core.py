@@ -194,9 +194,12 @@ class Engine:
             task = {"id": uid(), "project_id": project, "title": title, "requirement": requirement,
                     "revision": 1, "revisions": [],
                     "status": "ACTIVE", "phase": "PLANNING", "block_reason": None,
-                    "config": {"max_repairs": 2, "timeout_seconds": 1800},
+                    "config": {"max_repairs": 2, "timeout_seconds": 1800,
+                               # A session is writable by default: choosing a project means
+                               # the agents may work in it. Writes stay serialized per project.
+                               "allow_write": True, "max_auto_rounds": 2},
                     "draft_plan": None, "plan_review": None, "steps": [], "dispatches": [],
-                    "created_at": time.time()}
+                    "auto_rounds_used": 0, "created_at": time.time()}
             db.execute("INSERT INTO tasks VALUES(?,?,?)", (task["id"], project, encode(task)))
             self._save(db, task, "TASK_CREATED", {"title": title})
             return task
@@ -341,34 +344,55 @@ class Engine:
             return projects
 
     def messages(self, task_id):
+        return self._chat_view(task_id)[0]
+
+    def chat_state(self, task_id):
+        """Session-level group chat state: write grant, round budget, held messages."""
+        return self._chat_view(task_id)[1]
+
+    def _chat_view(self, task_id):
         with self.transaction() as db:
             task = self._task(db, task_id)
             messages = [json.loads(r[0]) for r in db.execute("SELECT body FROM messages WHERE task_id=? ORDER BY rowid", (task_id,))]
             queued = False
+            config = task.get("config", {})
             for message in messages:
                 roles = self._chat_roles(message)
+                round_no = message.get("round", 1)
+                _, _, answered, failed_roles, pending = self._round_state(task, message)
+                message.setdefault("sender", "user")
+                message["pending_roles"] = pending
+                message["failed_roles"] = sorted(failed_roles)
                 if message["status"] == "QUEUED":
                     message["wait_reason"] = (self._chat_wait_reason(db, task) or
                         ("EARLIER_MESSAGE" if queued else self._chat_member_wait_reason(db, task, message)))
-                    message["pending_roles"] = roles[len(message["replies"]):]
                     queued = True
                 elif message["status"] == "RUNNING":
-                    active_d = next((d for d in reversed(task["dispatches"])
-                                     if d["kind"] == "CHAT" and d["status"] == "ACTIVE"
-                                     and d["payload"].get("message_id") == message["id"]), None)
-                    if active_d:
-                        message["active_role"] = active_d["role"]
-                        message["active_since"] = active_d["created_at"]
-                    message["pending_roles"] = roles[len(message["replies"]):]
+                    active = [d for d in task["dispatches"]
+                              if d["kind"] == "CHAT" and d["status"] == "ACTIVE"
+                              and d["payload"].get("message_id") == message["id"]]
+                    if active:
+                        message["active_roles"] = [d["role"] for d in active]
+                        message["active_since"] = min(d["created_at"] for d in active)
+                        message["write_role"] = next(
+                            (d["role"] for d in active if d["payload"].get("allow_write")), None)
                 elif message["status"] == "BLOCKED":
-                    blocked_d = next((d for d in reversed(task["dispatches"])
-                                      if d["kind"] == "CHAT" and d["status"] == "BLOCKED"
-                                      and d["payload"].get("message_id") == message["id"]), None)
-                    if blocked_d:
-                        message["blocked_role"] = blocked_d["role"]
-                        message["blocked_dispatch_id"] = blocked_d["id"]
-                    message["pending_roles"] = roles[len(message["replies"]):]
-            return messages
+                    blocked = [d for d in task["dispatches"]
+                               if d["kind"] == "CHAT" and d["status"] == "BLOCKED"
+                               and d["payload"].get("message_id") == message["id"]]
+                    if blocked:
+                        message["blocked_role"] = blocked[-1]["role"]
+                        message["blocked_dispatch_id"] = blocked[-1]["id"]
+                        message["blocked_roles"] = [d["role"] for d in blocked]
+                elif message["status"] == "HELD":
+                    message["wait_reason"] = "AUTO_ROUND_BUDGET"
+            held = sum(1 for m in messages if m["status"] == "HELD")
+            return messages, {
+                "allow_write": config.get("allow_write", False),
+                "max_auto_rounds": config.get("max_auto_rounds", 2),
+                "auto_rounds_used": task.get("auto_rounds_used", 0),
+                "held": held,
+            }
 
     def _chat_wait_reason(self, db, task):
         if task["status"] not in ("ACTIVE", "COMPLETED"):
@@ -391,33 +415,196 @@ class Engine:
         return message.get("participants") or (["codex", "antigravity"]
             if message["recipient"] in ("both", "all") else [message["recipient"]])
 
-    def _chat_member_wait_reason(self, db, task, message):
+    def _chat_member_wait_reason(self, db, task, message, role=None):
         if message["revision"] != task.get("revision", 1):
             return "REQUIREMENT_CHANGED"
         roles = self._chat_roles(message)
-        if len(message["replies"]) < len(roles):
-            role = roles[len(message["replies"])]
-            from .agents import AgentConfig
-            row = db.execute("SELECT body FROM agents WHERE id=?", (role,)).fetchone()
-            secrets_file = Path(self.path).parent / "secrets.json"
-            stored_secret = ""
-            if secrets_file.is_file():
-                try:
-                    stored_secret = json.loads(secrets_file.read_text(encoding="utf-8")).get(role, "")
-                except Exception:
-                    stored_secret = ""
-            if row is None or not AgentConfig(json.loads(row[0]), stored_secret=stored_secret).ready:
-                return "AGENT_UNAVAILABLE"
-            if self._busy(db, task, role):
-                return "MEMBER_UNRESOLVED"
+        round_no = message.get("round", 1)
+        pending = [r for r in roles if r not in self._answered_roles(message, round_no)]
+        if role is None:
+            role = pending[0] if pending else None
+        if role is None:
+            return None
+        from .agents import AgentConfig
+        row = db.execute("SELECT body FROM agents WHERE id=?", (role,)).fetchone()
+        secrets_file = Path(self.path).parent / "secrets.json"
+        stored_secret = ""
+        if secrets_file.is_file():
+            try:
+                stored_secret = json.loads(secrets_file.read_text(encoding="utf-8")).get(role, "")
+            except Exception:
+                stored_secret = ""
+        if row is None or not AgentConfig(json.loads(row[0]), stored_secret=stored_secret).ready:
+            return "AGENT_UNAVAILABLE"
+        if self._busy(db, task, role):
+            return "MEMBER_UNRESOLVED"
         return None
 
-    def message_add(self, task_id, message_id, recipient, content, allow_write=False,
+    @staticmethod
+    def _answered_roles(message, round_no):
+        return {r["role"] for r in message.get("replies", []) if r.get("round", 1) == round_no}
+
+    @staticmethod
+    def _round_replies(message, round_no):
+        return [r for r in message.get("replies", []) if r.get("round", 1) == round_no]
+
+    def _ready_agent_ids(self, db):
+        """Agent ids that are enabled and configured, computed without a nested transaction."""
+        from .agents import AgentConfig
+        secrets = {}
+        secrets_file = Path(self.path).parent / "secrets.json"
+        if secrets_file.is_file():
+            try:
+                secrets = json.loads(secrets_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                secrets = {}
+        ready = set()
+        for row in db.execute("SELECT id,body FROM agents"):
+            try:
+                cfg = AgentConfig(json.loads(row["body"]), stored_secret=secrets.get(row["id"], ""))
+            except (ValueError, KeyError):
+                continue
+            if cfg.enabled and cfg.ready:
+                ready.add(row["id"])
+        return ready
+
+    def _room_members(self, db, task):
+        ready = self._ready_agent_ids(db)
+        if task.get("team"):
+            return sorted(ready & set(task["team"]["members"]))
+        return sorted(ready)
+
+    def _round_state(self, task, message):
+        """Who still owes this round an answer, and who already failed it.
+
+        A role is settled when it produced a reply (including a skip) or when its
+        dispatch for this round ended BLOCKED. A failed role is deliberately not
+        pending: an interrupted agent must be retried explicitly, never replayed.
+        """
+        roles = self._chat_roles(message)
+        round_no = message.get("round", 1)
+        answered = self._answered_roles(message, round_no)
+        failed = set()
+        for d in task["dispatches"]:
+            if d["kind"] != "CHAT" or d["payload"].get("message_id") != message["id"]:
+                continue
+            if d["payload"].get("round", 1) != round_no:
+                continue
+            if d["status"] == "BLOCKED" and d["role"] not in answered:
+                failed.add(d["role"])
+        pending = [role for role in roles if role not in answered and role not in failed]
+        return roles, round_no, answered, failed, pending
+
+    def _record_agent_messages(self, db, task, message, dispatch, report):
+        """Turn an agent's `data.messages` into real group messages.
+
+        This is what makes the room a room: agents can question, hand work to,
+        or claim work from each other without the user relaying anything. The
+        automatic back-and-forth is bounded by config.max_auto_rounds; beyond
+        that the messages are held until the user asks to continue.
+        """
+        from .agents import AgentConfig
+        entries = (report.get("data") or {}).get("messages")
+        if not isinstance(entries, list) or not entries:
+            return
+        members = task.get("team", {}).get("members") if task.get("team") else None
+        room = set(self._room_members(db, task))
+        agents = {a.id: a for a in (AgentConfig(json.loads(r[0]))
+                  for r in db.execute("SELECT body FROM agents"))}
+        sender = dispatch["role"]
+        budget = task.setdefault("config", {}).setdefault("max_auto_rounds", 2)
+        used = task.get("auto_rounds_used", 0)
+        for entry in entries[:3]:
+            if not isinstance(entry, dict):
+                continue
+            to = entry.get("to")
+            content = entry.get("content")
+            intent = entry.get("intent") or "ask"
+            if intent not in ("ask", "assign", "claim", "report"):
+                continue
+            if not (string(to) and string(content) and len(content) <= 4000):
+                continue
+            if intent in ("ask", "assign") and (to == sender or to not in room):
+                continue
+            if members and to not in ("all", sender) and to not in members:
+                continue
+            informative = intent in ("claim", "report")
+            if informative:
+                targets = []
+            elif to == "all":
+                targets = [key for key in (members or sorted(room)) if key != sender and key in room]
+            else:
+                targets = [to]
+            auto = {"id": uid(), "task_id": task["id"], "sender": sender, "intent": intent,
+                    "recipient": to, "content": content, "participants": targets,
+                    "revision": task.get("revision", 1), "round": 1, "rounds": 1,
+                    "replies": [], "created_at": time.time(), "auto": True,
+                    "parent_message_id": message["id"]}
+            if targets and used >= budget:
+                auto["status"] = "HELD"
+                auto["held"] = True
+            else:
+                auto["status"] = "QUEUED" if targets else "DELIVERED"
+                if targets:
+                    used += 1
+            db.execute("INSERT INTO messages VALUES(?,?,?)", (auto["id"], task["id"], encode(auto)))
+        task["auto_rounds_used"] = used
+
+    def _project_write_owner(self, db, project_id, exclude_dispatch=None, exclude_task=None):
+        """Role currently allowed to change files in this project, or None.
+
+        Group chat keeps discussion parallel but writes serial, so at most one
+        chat dispatch may hold the write sandbox for a project at any moment.
+        CODE/FIX/VERIFY mutual exclusion is still enforced by _workspace_busy.
+        """
+        for row in db.execute("SELECT body FROM tasks WHERE project_id=?", (project_id,)):
+            other = json.loads(row[0])
+            if other["id"] == exclude_task:
+                continue
+            for d in other["dispatches"]:
+                if d["status"] != "ACTIVE" or d["id"] == exclude_dispatch:
+                    continue
+                if d["kind"] in ("CODE", "FIX"):
+                    return d["role"]
+                if d["kind"] == "CHAT" and d["payload"].get("allow_write"):
+                    return d["role"]
+        # A writer inside the current task also blocks the next one.
+        if exclude_task is not None:
+            row = db.execute("SELECT body FROM tasks WHERE id=?", (exclude_task,)).fetchone()
+            if row:
+                for d in json.loads(row[0])["dispatches"]:
+                    if d["status"] == "ACTIVE" and d["id"] != exclude_dispatch \
+                            and (d["kind"] in ("CODE", "FIX")
+                                 or (d["kind"] == "CHAT" and d["payload"].get("allow_write"))):
+                        return d["role"]
+        return None
+
+    def _pick_writer(self, db, task, message, pending):
+        """At most one agent per round may actually change files.
+
+        The first capable coder in the caller's selection order writes; the rest
+        take part read-only and can hand work over with an `assign` message.
+        """
+        if not message.get("allow_write"):
+            return None
+        if self._project_write_owner(db, task["project_id"], exclude_task=task["id"]):
+            return None
+        from .agents import AgentConfig
+        for role in pending:
+            row = db.execute("SELECT body FROM agents WHERE id=?", (role,)).fetchone()
+            if row is None:
+                continue
+            if "code" in AgentConfig(json.loads(row[0])).roles:
+                return role
+        return pending[0] if pending else None
+
+
+    def message_add(self, task_id, message_id, recipient, content, allow_write=None,
                     context_files=None, referenced_task_ids=None, rounds=1):
         require(string(message_id) and len(message_id) <= 128 and string(recipient)
                 and string(content) and len(content) <= 20000,
                 "Invalid message", "INVALID_INPUT")
-        require(type(allow_write) is bool, "allow_write must be boolean", "INVALID_INPUT")
+        require(allow_write is None or type(allow_write) is bool, "allow_write must be boolean", "INVALID_INPUT")
         require(type(rounds) is int and rounds in (1, 2), "rounds must be 1 or 2", "INVALID_INPUT")
         if context_files is not None:
             require(strings(context_files) and len(context_files) <= 10, "Invalid context_files", "INVALID_INPUT")
@@ -450,23 +637,61 @@ class Engine:
                 participants = [recipient]
             require(not t.get("team") or all(key in t["team"]["members"] for key in participants),
                     "Recipient is outside this task's team", "INVALID_INPUT")
-            if rounds == 2 and len(participants) >= 2:
-                participants = participants + participants
-            require(bool(participants) and len(participants) <= 24, "No ready agents or too many participants", "INVALID_INPUT")
-            m = {"id": message_id, "task_id": task_id, "recipient": recipient, "content": content,
-                 "participants": participants, "revision": t.get("revision", 1),
-                 "status": "QUEUED", "replies": [], "created_at": time.time()}
-            if allow_write:
+            require(bool(participants) and len(participants) <= 12, "No ready agents or too many participants", "INVALID_INPUT")
+            m = {"id": message_id, "task_id": task_id, "sender": "user", "recipient": recipient,
+                 "content": content, "participants": participants, "revision": t.get("revision", 1),
+                 "status": "QUEUED", "round": 1, "rounds": rounds, "replies": [], "created_at": time.time()}
+            writable = t.get("config", {}).get("allow_write", False) if allow_write is None else allow_write
+            if writable:
                 m["allow_write"] = True
             if context_files:
                 m["context_files"] = [f.strip() for f in context_files if f.strip()]
             if referenced_task_ids:
                 m["referenced_task_ids"] = [tid.strip() for tid in referenced_task_ids if tid.strip()]
-            if rounds == 2:
-                m["rounds"] = 2
             db.execute("INSERT INTO messages VALUES(?,?,?)", (message_id, task_id, encode(m)))
             self._save(db, t, "MESSAGE_SAVED", {"message_id": message_id, "recipient": recipient})
             return m
+
+    def chat_config(self, task_id, patch=None):
+        """Session-level group chat settings: write grant and automatic round budget."""
+        with self.transaction() as db:
+            t = self._task(db, task_id)
+            config = t.setdefault("config", {})
+            config.setdefault("allow_write", False)
+            config.setdefault("max_auto_rounds", 2)
+            if patch:
+                if "allow_write" in patch:
+                    require(type(patch["allow_write"]) is bool, "allow_write must be boolean", "INVALID_INPUT")
+                    config["allow_write"] = patch["allow_write"]
+                if "max_auto_rounds" in patch:
+                    require(type(patch["max_auto_rounds"]) is int and 0 <= patch["max_auto_rounds"] <= 8,
+                            "max_auto_rounds must be 0-8", "INVALID_INPUT")
+                    config["max_auto_rounds"] = patch["max_auto_rounds"]
+                self._save(db, t, "CHAT_CONFIG_CHANGED", dict(config))
+            return {"task_id": task_id, "allow_write": config["allow_write"],
+                    "max_auto_rounds": config["max_auto_rounds"],
+                    "auto_rounds_used": t.get("auto_rounds_used", 0)}
+
+    def chat_release(self, task_id):
+        """Release agent-authored messages that were held back by the round budget."""
+        with self.transaction() as db:
+            t = self._task(db, task_id)
+            held = [json.loads(r[0]) for r in db.execute(
+                "SELECT body FROM messages WHERE task_id=? ORDER BY rowid", (task_id,))]
+            released = 0
+            for m in held:
+                if m.get("held") and m["status"] == "HELD":
+                    m["status"] = "QUEUED"
+                    m.pop("held", None)
+                    m.pop("wait_reason", None)
+                    db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?",
+                               (encode(m), task_id, m["id"]))
+                    released += 1
+            if released:
+                # Releasing is an explicit user decision, so it refreshes the budget.
+                t["auto_rounds_used"] = 0
+                self._save(db, t, "CHAT_RELEASED", {"message_ids": released})
+            return {"released": released}
 
     def message_resolve(self, task_id, message_id, action="skip"):
         require(action in ("skip", "retry"), "action must be skip or retry", "INVALID_INPUT")
@@ -476,29 +701,46 @@ class Engine:
             require(row is not None, "Unknown message", "NOT_FOUND")
             m = json.loads(row[0])
             require(m["status"] in ("BLOCKED", "RUNNING", "QUEUED"), "Message is not blocked or in flight", "INVALID_STATE")
+            round_no = m.get("round", 1)
             chat_dispatches = [d for d in t["dispatches"]
                                if d["kind"] == "CHAT" and d["payload"].get("message_id") == message_id
                                and d["status"] in ("BLOCKED", "ACTIVE")]
-            failed_role = None
+            failed_roles = []
             for d in chat_dispatches:
                 self._require_process_stopped(db, d["id"])
                 d["status"] = "SUPERSEDED"
-                failed_role = d["role"]
+                failed_roles.append(d["role"])
             roles = self._chat_roles(m)
             if action == "skip":
-                target_role = failed_role or (roles[len(m["replies"])] if len(m["replies"]) < len(roles) else "agent")
-                m["replies"].append({
-                    "role": target_role,
-                    "content": "_（已跳过该 Agent 的本次回复）_",
-                    "skipped": True,
-                })
+                _, _, _, failed_now, _ = self._round_state(t, m)
+                targets = [r for r in list(failed_roles) + sorted(failed_now)]
+                for role in targets or [roles[0]]:
+                    for existing in list(m["replies"]):
+                        if existing["role"] == role and existing.get("round", 1) == round_no:
+                            m["replies"].remove(existing)
+                    m["replies"].append({
+                        "role": role,
+                        "content": "_（已跳过该 Agent 的本次回复）_",
+                        "skipped": True,
+                        "round": round_no,
+                        "ok": True,
+                    })
                 m.pop("error", None)
-                if len(m["replies"]) >= len(roles):
-                    m["status"] = "DELIVERED"
-                else:
+                _, _, _, still_failed, pending = self._round_state(t, m)
+                if still_failed:
+                    m["status"] = "BLOCKED"
+                elif pending:
                     m["status"] = "QUEUED"
+                elif round_no < m.get("rounds", 1):
+                    m["round"] = round_no + 1
+                    m["status"] = "QUEUED"
+                else:
+                    m["status"] = "DELIVERED"
             else:
-                # Retry: reset message status to QUEUED so ChatQueue dispatches the current slot
+                # Retry removes the failed attempt so the round re-dispatches it.
+                for role in failed_roles:
+                    m["replies"] = [r for r in m["replies"]
+                                    if not (r["role"] == role and r.get("round", 1) == round_no)]
                 m.pop("error", None)
                 m["status"] = "QUEUED"
             db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, message_id))
@@ -506,70 +748,106 @@ class Engine:
             self._save(db, t, "MESSAGE_RESOLVED", {"message_id": message_id, "action": action})
             return m
 
-    def chat_dispatch(self, task_id):
+    def chat_dispatch_round(self, task_id):
+        """Issue every dispatch of the current round atomically.
+
+        Callers run the returned dispatches concurrently: one agent per dispatch,
+        each with its own CLI session. Round 1 is a true simultaneous broadcast
+        (no peer replies); later rounds let everyone see the previous round.
+        """
         with self.transaction() as db:
             t = self._task(db, task_id)
             if self._chat_wait_reason(db, t):
-                return None
+                return []
             messages = [json.loads(r[0]) for r in db.execute("SELECT body FROM messages WHERE task_id=? ORDER BY rowid", (task_id,))]
-            m = next((m for m in messages if m["status"] == "QUEUED"), None)
+            m = next((x for x in messages if x["status"] == "QUEUED"), None)
             if m is None:
-                return None
+                return []
             if m["revision"] != t.get("revision", 1):
                 m["status"] = "NEEDS_REVIEW"
                 db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
-                return None
+                return []
             roles = self._chat_roles(m)
-            if len(m["replies"]) >= len(roles):
-                m["status"] = "DELIVERED"
+            round_no = m.get("round", 1)
+            _, _, answered, failed_roles, pending = self._round_state(t, m)
+            if not pending:
+                if failed_roles:
+                    m["status"] = "BLOCKED"
+                    m["error"] = "；".join(f"{role}: 回复中断" for role in sorted(failed_roles))
+                else:
+                    m["status"] = "DELIVERED"
                 db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
-                return None
-            role = roles[len(m["replies"])]
-            if self._chat_member_wait_reason(db, t, m):
-                return None
-            d = self._issue(t, "CHAT", role=role)
+                return []
+            writer = self._pick_writer(db, t, m, pending)
+            room_members = self._room_members(db, t)
             brief = lambda replies: [{"role": r["role"], "content": r["content"][:2000]}
                                      for r in replies if not r.get("skipped")]
-            d["payload"].update(message_id=m["id"], message=m["content"], peer_replies=brief(m["replies"]),
-                recent_messages=[{"content": x["content"], "replies": brief(x["replies"])}
-                                 for x in messages if x["status"] == "DELIVERED"][-3:])
-            if m.get("allow_write"):
-                d["payload"]["allow_write"] = True
-            p = self._project(db, t["project_id"])
-            if p.get("memory"):
-                d["payload"]["project_memory"] = p["memory"]
-            # Every chat turn carries a bounded orientation block so a chat-only
-            # or CLI agent can answer questions about this project without the
-            # user pasting README or file paths by hand.
-            from .workspace import project_digest
-            digest = project_digest(p["path"])
-            if digest:
-                d["payload"]["project_context"] = digest
-            if m.get("context_files"):
-                from .workspace import read_project_files
-                d["payload"]["attached_files"] = read_project_files(p["path"], m["context_files"])
-            if m.get("referenced_task_ids"):
-                ref_sessions = []
-                for ref_id in m["referenced_task_ids"]:
-                    ref_row = db.execute("SELECT body FROM tasks WHERE id=? AND project_id=?",
-                                         (ref_id, t["project_id"])).fetchone()
-                    if ref_row:
-                        ref_task = json.loads(ref_row[0])
-                        ref_msgs = [json.loads(r[0]) for r in db.execute(
-                            "SELECT body FROM messages WHERE task_id=? ORDER BY rowid DESC LIMIT 2", (ref_id,))]
-                        excerpts = []
-                        for rm in reversed(ref_msgs):
-                            for rep in rm.get("replies", []):
-                                if not rep.get("skipped"):
-                                    excerpts.append(f"{rep['role']}: {rep['content'][:600]}")
-                        summary_text = " | ".join(excerpts) if excerpts else ref_task.get("requirement", "")[:600]
-                        ref_sessions.append({"id": ref_id, "title": ref_task["title"], "summary": summary_text})
-                if ref_sessions:
-                    d["payload"]["referenced_sessions"] = ref_sessions
+            # Round 1 is simultaneous: nobody sees a peer before answering.
+            peer_replies = [] if round_no == 1 else brief(self._round_replies(m, round_no - 1))
+            recent = [{"sender": x.get("sender", "user"), "content": x["content"],
+                       "replies": brief(x["replies"])}
+                      for x in messages if x["status"] == "DELIVERED"][-4:]
+            issues = []
+            for role in pending:
+                if self._chat_member_wait_reason(db, t, m, role):
+                    continue
+                d = self._issue(t, "CHAT", role=role)
+                d["payload"].update(message_id=m["id"], message=m["content"],
+                                    message_sender=m.get("sender", "user"),
+                                    message_intent=m.get("intent"),
+                                    round=round_no, total_rounds=m.get("rounds", 1),
+                                    peer_replies=peer_replies, recent_messages=recent,
+                                    room_members=room_members,
+                                    is_auto=bool(m.get("auto")))
+                if writer == role:
+                    d["payload"]["allow_write"] = True
+                p = self._project(db, t["project_id"])
+                if p.get("memory"):
+                    d["payload"]["project_memory"] = p["memory"]
+                # Every chat turn carries a bounded orientation block so a
+                # chat-only or CLI agent can answer about this project without
+                # the user pasting README or file paths by hand.
+                from .workspace import project_digest
+                digest = project_digest(p["path"])
+                if digest:
+                    d["payload"]["project_context"] = digest
+                if m.get("context_files"):
+                    from .workspace import read_project_files
+                    d["payload"]["attached_files"] = read_project_files(p["path"], m["context_files"])
+                if m.get("referenced_task_ids"):
+                    ref_sessions = []
+                    for ref_id in m["referenced_task_ids"]:
+                        ref_row = db.execute("SELECT body FROM tasks WHERE id=? AND project_id=?",
+                                             (ref_id, t["project_id"])).fetchone()
+                        if ref_row:
+                            ref_task = json.loads(ref_row[0])
+                            ref_msgs = [json.loads(r[0]) for r in db.execute(
+                                "SELECT body FROM messages WHERE task_id=? ORDER BY rowid DESC LIMIT 2", (ref_id,))]
+                            excerpts = []
+                            for rm in reversed(ref_msgs):
+                                for rep in rm.get("replies", []):
+                                    if not rep.get("skipped"):
+                                        excerpts.append(f"{rep['role']}: {rep['content'][:600]}")
+                            summary_text = " | ".join(excerpts) if excerpts else ref_task.get("requirement", "")[:600]
+                            ref_sessions.append({"id": ref_id, "title": ref_task["title"], "summary": summary_text})
+                    if ref_sessions:
+                        d["payload"]["referenced_sessions"] = ref_sessions
+                issues.append(d)
+            if not issues:
+                return []
             m["status"] = "RUNNING"
+            if len(issues) > 1:
+                m["parallel"] = True
             db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
-            self._save(db, t, "MESSAGE_DISPATCHED", {"message_id": m["id"], "dispatch_id": d["id"], "role": role})
-            return d
+            self._save(db, t, "MESSAGE_DISPATCHED",
+                       {"message_id": m["id"], "round": round_no,
+                        "dispatches": [{"id": d["id"], "role": d["role"]} for d in issues]})
+            return issues
+
+    def chat_dispatch(self, task_id):
+        """Single-dispatch compatibility wrapper used by the CLI and older tests."""
+        issues = self.chat_dispatch_round(task_id)
+        return issues[0] if issues else None
 
     def tasks_list(self, project_id=None):
         with self.transaction() as db:
@@ -809,9 +1087,9 @@ class Engine:
                             "Claim exceeds adapter capabilities")
                     seen.add(claim["step_id"])
             elif kind == "CHAT":
-                require(data == {} or (isinstance(data, dict) and set(data) == {"proposals"}),
-                        "Chat data must be empty or contain proposals")
-                if data:
+                require(data == {} or (isinstance(data, dict) and set(data) <= {"proposals", "messages"}),
+                        "Chat data must be empty, proposals or messages")
+                if data.get("proposals"):
                     proposals = data["proposals"]
                     require(isinstance(proposals, list) and len(proposals) <= 3,
                             "At most three work proposals per reply")
@@ -822,6 +1100,20 @@ class Engine:
                                 and string(proposal["assignee"]) and len(proposal["assignee"]) <= 64
                                 and string(proposal["reason"]) and len(proposal["reason"]) <= 1000,
                                 "Invalid work proposal")
+                if data.get("messages"):
+                    outgoing = data["messages"]
+                    require(isinstance(outgoing, list) and len(outgoing) <= 3,
+                            "At most three peer messages per reply")
+                    room = set(d["payload"].get("room_members") or [])
+                    for item in outgoing:
+                        exact(item, ["to", "intent", "content"])
+                        require(string(item["to"]) and len(item["to"]) <= 64
+                                and item["intent"] in ("ask", "assign", "claim", "report")
+                                and string(item["content"]) and len(item["content"]) <= 4000,
+                                "Invalid peer message")
+                        require(item["to"] != d["role"], "An agent cannot address itself")
+                        require(item["to"] == "all" or not room or item["to"] in room,
+                                "Peer message target is not in this room")
                 require(len(report["suggestions"]) <= 3, "Chat allows at most 3 suggestions")
             elif kind == "ANALYZE":
                 exact(data, ["deliverable", "evidence"])
@@ -865,13 +1157,25 @@ class Engine:
             if d["kind"] == "CHAT":
                 row = db.execute("SELECT body FROM messages WHERE task_id=? AND id=?", (task, d["payload"]["message_id"])).fetchone()
                 m = json.loads(row[0])
-                m["replies"].append({"role": d["role"], "content": report["summary"], "report": report})
-                target_count = len(m.get("participants") or
-                                   (["codex", "antigravity"] if m["recipient"] in ("both", "all") else [m["recipient"]]))
-
-                m["status"] = "BLOCKED" if report["status"] == "BLOCKED" else (
-                    "DELIVERED" if len(m["replies"]) >= target_count else "QUEUED")
+                round_no = d["payload"].get("round", m.get("round", 1))
+                m["replies"].append({"role": d["role"], "content": report["summary"], "report": report,
+                                     "round": round_no, "ok": report["status"] != "BLOCKED"})
+                roles, _, _, failed, pending = self._round_state(t, m)
+                if pending:
+                    # Other agents of this parallel round are still working.
+                    m["status"] = "RUNNING"
+                elif failed:
+                    m["status"] = "BLOCKED"
+                    m["error"] = "；".join(
+                        f"{role}: 回复中断" for role in sorted(failed))
+                elif round_no < m.get("rounds", 1):
+                    m["round"] = round_no + 1
+                    m["status"] = "QUEUED"
+                else:
+                    m["status"] = "DELIVERED"
                 db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task, m["id"]))
+                if report["status"] != "BLOCKED":
+                    self._record_agent_messages(db, t, m, d, report)
             if report["status"] == "BLOCKED":
                 d["status"] = "BLOCKED"
                 t["block_reason"] = data["reason"]

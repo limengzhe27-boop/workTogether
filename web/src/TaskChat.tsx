@@ -26,12 +26,35 @@ type Message = {
   status: string;
   error?: string;
   wait_reason?: string | null;
+  sender?: string;
+  intent?: 'ask' | 'assign' | 'claim' | 'report';
+  auto?: boolean;
+  held?: boolean;
+  round?: number;
+  rounds?: number;
   allow_write?: boolean;
   context_files?: string[];
-  rounds?: number;
   blocked_role?: string;
+  blocked_roles?: string[];
+  active_roles?: string[];
   pending_roles?: string[];
-  replies: { role: string; content: string; report?: ReplyReport; skipped?: boolean }[];
+  failed_roles?: string[];
+  write_role?: string | null;
+  replies: { role: string; content: string; report?: ReplyReport; skipped?: boolean; round?: number; ok?: boolean }[];
+};
+
+type ChatState = {
+  allow_write: boolean;
+  max_auto_rounds: number;
+  auto_rounds_used: number;
+  held: number;
+};
+
+const intentLabels: Record<string, string> = {
+  ask: '提问',
+  assign: '派活',
+  claim: '认领',
+  report: '汇报',
 };
 
 const statusLabels: Record<string, string> = {
@@ -53,6 +76,7 @@ const waitLabels: Record<string, string> = {
   REQUIREMENT_CHANGED: '上下文已更新，需要重新确认。',
   AGENT_UNAVAILABLE: '选中的 Agent 未就绪或已停用，请检查 Agent 设置。',
   MEMBER_UNRESOLVED: '该 Agent 有未解决的失败记录。',
+  AUTO_ROUND_BUDGET: '自动讨论已达上限，等你确认后继续。',
 };
 
 function getAgentBadge(role: string, name: string): { code: string; color: string } {
@@ -102,6 +126,7 @@ export function TaskChat({
   const [loadError, setLoadError] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [chat, setChat] = useState<ChatState>({ allow_write: false, max_auto_rounds: 2, auto_rounds_used: 0, held: 0 });
   const [text, setText] = useState(() => {
     try {
       return localStorage.getItem('wt:chat:' + taskId) || '';
@@ -114,7 +139,6 @@ export function TaskChat({
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
   const [tick, setTick] = useState(0);
-  const [allowWrite, setAllowWrite] = useState(false);
   const [rounds, setRounds] = useState(1);
   const [contextFiles, setContextFiles] = useState<string[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -122,6 +146,7 @@ export function TaskChat({
   const [filesLoading, setFilesLoading] = useState(false);
   const [fileFilter, setFileFilter] = useState('');
   const [resolving, setResolving] = useState('');
+  const [releasing, setReleasing] = useState(false);
 
   const readyAgents = React.useMemo(() => agents.filter(a => a.enabled && a.ready), [agents]);
   const readyIds = React.useMemo(() => readyAgents.map(a => a.id), [readyAgents]);
@@ -175,9 +200,10 @@ export function TaskChat({
     let timer: ReturnType<typeof setTimeout>;
     async function load() {
       try {
-        const data = await request<{ messages: Message[] }>(`/tasks/${taskId}/messages`);
+        const data = await request<{ messages: Message[]; chat?: ChatState }>(`/tasks/${taskId}/messages`);
         if (alive) {
           setMessages(data.messages);
+          if (data.chat) setChat(data.chat);
           setLoadError('');
           setLoaded(true);
           onPending(data.messages.some(m => ['QUEUED', 'RUNNING'].includes(m.status)));
@@ -202,7 +228,6 @@ export function TaskChat({
     setError('');
     try {
       const payload: Record<string, unknown> = { message_id: id, recipient: recipientValue, content: text.trim() };
-      if (allowWrite) payload.allow_write = true;
       if (contextFiles.length > 0) payload.context_files = contextFiles;
       if (rounds === 2) payload.rounds = 2;
       await request(`/tasks/${taskId}/messages`, {
@@ -213,7 +238,6 @@ export function TaskChat({
       setText('');
       setId(crypto.randomUUID());
       setContextFiles([]);
-      setAllowWrite(false);
       setRounds(1);
       setPickerOpen(false);
       onPending(true);
@@ -227,6 +251,35 @@ export function TaskChat({
       setError((e as Error).message);
     } finally {
       setSending(false);
+    }
+  }
+
+  async function toggleSessionWrite() {
+    setError('');
+    try {
+      const next = !chat.allow_write;
+      const state = await request<ChatState>(`/tasks/${taskId}/chat-config`, {
+        method: 'POST',
+        body: JSON.stringify({ allow_write: next }),
+      });
+      setChat(current => ({ ...current, ...state }));
+      setTick(n => n + 1);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function releaseAgentMessages() {
+    if (releasing) return;
+    setReleasing(true);
+    setError('');
+    try {
+      await request(`/tasks/${taskId}/chat-release`, { method: 'POST', body: '{}' });
+      setTick(n => n + 1);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setReleasing(false);
     }
   }
 
@@ -304,33 +357,73 @@ export function TaskChat({
           {loaded && messages.length === 0 && <div className="chat-empty">
             <p>在下方选择要对话的 Agent（支持多选或全选），直接发送消息开始交流。</p>
           </div>}
-          {messages.map(m => <article className="chat-turn" key={m.id}>
+          {messages.map(m => {
+            const isAgent = (m.sender || 'user') !== 'user';
+            const senderAgent = isAgent ? agentMap[m.sender!] : undefined;
+            const senderName = senderAgent?.name || m.sender || '';
+            const senderColor = senderAgent?.color || '#3072d2';
+            const activeRoles = m.active_roles || [];
+            const pendingRoles = m.pending_roles || [];
+            return <article className={'chat-turn' + (isAgent ? ' peer-turn' : '')} key={m.id}>
             {typeof m.created_at === 'number' && <time className="message-time" dateTime={new Date(m.created_at * 1000).toISOString()}>
               {new Date(m.created_at * 1000).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
             </time>}
-            <div className="user-message">
-              <span className="sr-only">你，发给 {getRecipientLabel(m.recipient)}</span>
-              <p className="prose">{m.content}</p>
-              <div className="user-message-meta">
-                {m.recipient !== 'all' && <span className="small">@{getRecipientLabel(m.recipient)}</span>}
-                {m.allow_write && <span className="message-flag" title="本次允许被选中的 Agent 直接修改项目文件">允许修改</span>}
-                {!!m.rounds && m.rounds > 1 && <span className="message-flag">{m.rounds} 轮发言</span>}
-                {!!m.context_files?.length && <span className="message-flag" title={m.context_files.join('\n')}>
-                  <Paperclip aria-hidden="true" />{m.context_files.length} 个文件
-                </span>}
-                {m.status !== 'DELIVERED' && <span className="message-status small">{statusLabels[m.status] || m.status}</span>}
+            {isAgent ? (
+              <div className="peer-message" style={{ '--agent-color': senderColor } as React.CSSProperties}>
+                <div className="peer-message-head">
+                  <span className="agent-monogram" style={{ background: senderColor }}>
+                    {(senderAgent?.avatar || senderName.slice(0, 2)).slice(0, 2)}
+                  </span>
+                  <strong style={{ color: senderColor }}>{senderName}</strong>
+                  <span className="peer-arrow" aria-hidden="true">→</span>
+                  <span className="peer-target">{getRecipientLabel(m.recipient)}</span>
+                  {m.intent && <span className="intent-badge">{intentLabels[m.intent] || m.intent}</span>}
+                  {m.held && <span className="intent-badge is-held">等待你确认</span>}
+                </div>
+                <p className="prose">{m.content}</p>
+                {m.held && <p className="small muted">这条 Agent 之间的消息被自动轮次上限拦下了，点下方“让他们继续”才会送达。</p>}
               </div>
-            </div>
+            ) : (
+              <div className="user-message">
+                <span className="sr-only">你，发给 {getRecipientLabel(m.recipient)}</span>
+                <p className="prose">{m.content}</p>
+                <div className="user-message-meta">
+                  {m.recipient !== 'all' && <span className="small">@{getRecipientLabel(m.recipient)}</span>}
+                  {m.allow_write && <span className="message-flag" title="本会话的 Agent 可以修改项目文件">可写入项目</span>}
+                  {!!m.rounds && m.rounds > 1 && <span className="message-flag">{m.rounds} 轮</span>}
+                  {!!m.context_files?.length && <span className="message-flag" title={m.context_files.join('\n')}>
+                    <Paperclip aria-hidden="true" />{m.context_files.length} 个文件
+                  </span>}
+                  {m.status !== 'DELIVERED' && <span className="message-status small">{statusLabels[m.status] || m.status}</span>}
+                </div>
+              </div>
+            )}
             {m.error && <p className={m.status === 'CANCELLED' ? 'wait-note small' : 'error small'}
               role={m.status === 'CANCELLED' ? undefined : 'alert'}>{m.error} <button type="button" onClick={onDetails}>查看详情</button></p>}
+            {m.status === 'RUNNING' && (
+              <div className="round-status small" role="status">
+                <span className="round-chip">第 {m.round || 1} 轮 / 共 {m.rounds || 1} 轮</span>
+                {activeRoles.length > 1 && <span className="round-chip is-parallel">{activeRoles.length} 位同时回复中</span>}
+                {activeRoles.map(role => <span key={role} className="round-chip is-active">
+                  <span className="agent-dot" style={{ background: agentMap[role]?.color || '#3072d2' }} />
+                  {agentMap[role]?.name || role} 正在回复…
+                </span>)}
+                {pendingRoles.map(role => <span key={role} className="round-chip">
+                  {agentMap[role]?.name || role} 等待中
+                </span>)}
+                {m.write_role && <span className="round-chip is-write">
+                  {agentMap[m.write_role]?.name || m.write_role} 持有项目写入
+                </span>}
+              </div>
+            )}
             {m.status === 'BLOCKED' && (
               <div className="message-recovery small">
                 <span>{m.blocked_role ? `${agentMap[m.blocked_role]?.name || m.blocked_role} 的回复中断。` : '回复中断。'}</span>
                 <button type="button" disabled={!!resolving} onClick={() => resolveMessage(m.id, 'retry')}>
-                  <RefreshCw aria-hidden="true" />{resolving === m.id + 'retry' ? '重试中…' : '重试该 Agent'}
+                  <RefreshCw aria-hidden="true" />{resolving === m.id + 'retry' ? '重试中…' : '重试'}
                 </button>
                 <button type="button" disabled={!!resolving} onClick={() => resolveMessage(m.id, 'skip')}>
-                  {resolving === m.id + 'skip' ? '跳过中…' : '跳过并继续下一位'}
+                  {resolving === m.id + 'skip' ? '跳过中…' : '跳过并继续'}
                 </button>
               </div>
             )}
@@ -402,13 +495,21 @@ export function TaskChat({
                 </div>;
               })}
             </div>
-          </article>)}
+          </article>;})}
         </div>
       </div>
       {unseen && <button type="button" className="new-message-link" onClick={() => {
         if (feed.current) feed.current.scrollTop = feed.current.scrollHeight;
         nearBottom.current = true; setUnseen(false);
       }}>有新动态 · 回到底部</button>}
+      {chat.held > 0 && (
+        <div className="held-banner" role="status">
+          <span>有 {chat.held} 条 Agent 之间的消息停在自动轮次上限（已用 {chat.auto_rounds_used}/{chat.max_auto_rounds} 轮）。</span>
+          <button type="button" disabled={releasing} onClick={releaseAgentMessages}>
+            <RefreshCw aria-hidden="true" />{releasing ? '送达中…' : '让他们继续'}
+          </button>
+        </div>
+      )}
       <div className="chat-compose-wrap">
         {loadError && <p className="error small" role="alert">对话读取失败：{loadError}</p>}
         {error && <p role="alert" className="error small">{error}</p>}
@@ -502,11 +603,11 @@ export function TaskChat({
                 onClick={togglePicker}>
                 <Paperclip aria-hidden="true" /><span>引用文件</span>
               </button>
-              <label className={'composer-tool composer-toggle' + (allowWrite ? ' is-active' : '')}
-                title="勾选后本条消息的接收者可创建或修改项目文件；仍受各自 CLI 的沙箱与你的确认限制">
-                <input type="checkbox" checked={allowWrite} disabled={sending}
-                  onChange={e => { setAllowWrite(e.target.checked); setId(crypto.randomUUID()); }} />
-                <ShieldAlert aria-hidden="true" /><span>允许修改</span>
+              <label className={'composer-tool composer-toggle' + (chat.allow_write ? ' is-active' : '')}
+                title="会话级授权：开启后本会话的 Agent 可以直接读写项目；同一时刻只有一个 Agent 持有写入，其他 Agent 只读并行">
+                <input type="checkbox" checked={chat.allow_write} disabled={sending}
+                  onChange={toggleSessionWrite} />
+                <ShieldAlert aria-hidden="true" /><span>可在项目里工作</span>
               </label>
               <label className="composer-rounds" title="多于一位成员时，可让每人发言两轮">
                 <span className="small">轮次</span>

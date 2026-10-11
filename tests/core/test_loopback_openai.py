@@ -86,13 +86,16 @@ class LoopbackOpenAITransportTests(unittest.TestCase):
             codex = Runtime(engine, str((fixtures / "fake_codex.py").resolve()))
             antigravity = AntigravityRuntime(engine, str((fixtures / "fake_agy.py").resolve()))
             queue = ChatQueue(engine, codex, antigravity)
-            for _ in range(3):
-                queue.once()
+            # One pass runs the whole round: all three agents answer at once.
+            queue.once()
             delivered = engine.messages(task["id"])[0]
             self.assertEqual("DELIVERED", delivered["status"])
-            self.assertEqual(["codex", "antigravity", "local-model"],
-                             [reply["role"] for reply in delivered["replies"]])
-            self.assertEqual("Read 2 peer replies", delivered["replies"][-1]["content"])
+            self.assertEqual({"codex", "antigravity", "local-model"},
+                             {reply["role"] for reply in delivered["replies"]})
+            # Round 1 is a simultaneous broadcast, so nobody saw a peer reply.
+            self.assertTrue(all(reply["round"] == 1 for reply in delivered["replies"]))
+            self.assertEqual("Read 0 peer replies",
+                             next(r["content"] for r in delivered["replies"] if r["role"] == "local-model"))
             self.assertEqual(2, len(received))
             self.assertEqual("fixture", received[-1]["payload"]["model"])
             self.assertIsNone(received[-1]["authorization"])

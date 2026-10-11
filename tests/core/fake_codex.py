@@ -26,7 +26,17 @@ report = {"schema_version": 1, "task_id": dispatch["task_id"], "dispatch_id": di
             "acceptance": ["works"], "depends_on": []}]}}
 if dispatch["kind"] == "CHAT":
     report["data"] = {}
-    report["summary"] = "Fixture reply: " + dispatch["payload"]["message"]
+    round_no = dispatch["payload"].get("round", 1)
+    sender = dispatch["payload"].get("message_sender", "user")
+    report["summary"] = (f"Fixture reply (round {round_no}, answering {sender}): "
+                         + dispatch["payload"]["message"])
+    if mode == "peer":
+        # Exercise the room: ask a peer first, then report to everyone.
+        report["data"] = ({"messages": [{"to": "antigravity", "intent": "ask",
+                                         "content": "antigravity，请复核我的判断。"}]}
+                          if round_no == 1 else
+                          {"messages": [{"to": "all", "intent": "report",
+                                         "content": "我看过同伴的回复了。"}]})
 if dispatch["kind"] in ("CONSULT", "PLAN_REVIEW"):
     report["data"] = {}
 if dispatch["kind"] == "CLAIM":
