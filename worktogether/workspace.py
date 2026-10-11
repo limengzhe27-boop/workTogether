@@ -140,6 +140,49 @@ README_NAMES = ("README.md", "README.MD", "Readme.md", "readme.md",
                 "README.rst", "README.txt", "README")
 
 
+HASH_HEAD_BYTES = 4096
+
+
+def file_digests(project, limit=800):
+    """{relative path: digest} for the files an agent could have touched.
+
+    The digest folds in size, mtime and the first few KB of content: cheap enough
+    to snapshot before and after every turn, precise enough to attribute a change
+    to the turn that made it.
+    """
+    root = Path(project).resolve()
+    if not root.is_dir():
+        return {}
+    digests = {}
+    for rel in list_project_files(project, limit=limit):
+        if rel == ".collab" or rel.startswith(".collab/"):
+            continue
+        target = root / rel
+        try:
+            stat = target.stat()
+            with target.open("rb") as stream:
+                head = stream.read(HASH_HEAD_BYTES)
+        except OSError:
+            continue
+        digest = hashlib.sha1(f"{stat.st_size}\0{stat.st_mtime_ns}\0".encode("ascii"))
+        digest.update(head)
+        digests[rel] = digest.hexdigest()
+    return digests
+
+
+def changed_files(before, after):
+    """Human-readable delta between two file_digests() snapshots."""
+    changes = []
+    for path in sorted(set(before) | set(after)):
+        if path not in before:
+            changes.append({"path": path, "status": "added"})
+        elif path not in after:
+            changes.append({"path": path, "status": "removed"})
+        elif before[path] != after[path]:
+            changes.append({"path": path, "status": "modified"})
+    return changes
+
+
 def project_digest(project, max_readme_chars=3000, max_files=120):
     """Bounded project orientation block prepended to every chat dispatch.
 

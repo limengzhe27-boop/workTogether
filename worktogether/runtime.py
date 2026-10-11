@@ -337,6 +337,9 @@ class Runtime:
             root.mkdir(parents=True, exist_ok=False)
             prompt = self._prompt(d)
             (root / "prompt.txt").write_text(prompt, encoding="utf-8")
+            if d["kind"] in ("CHAT", "CODE", "FIX"):
+                from .workspace import file_digests
+                run["workspace_before"] = file_digests(run["cwd"])
             args = self.command(run, d)
             (root / "command.json").write_text(encode(args), encoding="utf-8")
             with (root / "events.jsonl").open("wb") as out, (root / "stderr.log").open("wb") as err:
@@ -409,6 +412,30 @@ class Runtime:
                 self.engine._status(t)
                 self.engine._save(db, t, "RUN_FAILED", {"run_id": run["id"], "error": run["error"], "error_code": run.get("error_code")})
 
+    def _record_changes(self, run, dispatch):
+        """Attribute the files this turn touched, so the room can show the work.
+
+        Without this the user only sees the agent's prose and has to run git
+        diff themselves to learn what actually happened. Snapshots are taken for
+        every turn, not just the write-granted one, so a turn that changed files
+        without permission is still reported rather than passing unnoticed.
+        """
+        before = run.get("workspace_before")
+        if before is None:
+            return
+        from .workspace import file_digests, changed_files
+        changes = changed_files(before, file_digests(run["cwd"]))
+        run["changed_files"] = changes
+        with self.engine.transaction() as db:
+            task = self.engine._task(db, run["task_id"])
+            target = self.engine._get_dispatch(task, run["dispatch_id"])
+            target["changed_files"] = changes
+            if changes:
+                self.engine._save(db, task, "WORKSPACE_CHANGED_BY_AGENT",
+                                  {"dispatch_id": target["id"], "role": target["role"],
+                                   "writable": bool(target["payload"].get("allow_write")),
+                                   "files": changes[:50], "count": len(changes)})
+
     def collect(self, run_id):
         with self.engine.transaction() as db:
             run = self._get(db, run_id)
@@ -445,6 +472,7 @@ class Runtime:
             # report replay, then marks this run complete.
             self.engine.submit(run["task_id"], report)
             run["status"] = "COMPLETED"
+            self._record_changes(run, dispatch)
             with self.engine.transaction() as db:
                 self._save(db, run)
             return run

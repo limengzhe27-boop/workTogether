@@ -39,6 +39,10 @@ if dispatch["kind"] == "CHAT":
                                          "content": "我看过同伴的回复了。"}]})
 if dispatch["kind"] in ("CONSULT", "PLAN_REVIEW"):
     report["data"] = {}
+if mode == "write" and dispatch["kind"] == "CHAT":
+    # Exercise change attribution: really touch the workspace.
+    Path("fixture-wrote.txt").write_text("written by the fixture\n", encoding="utf-8")
+    Path("README.md").write_text("# Room fixture\n\nchanged by the agent\n", encoding="utf-8")
 if dispatch["kind"] == "CLAIM":
     report["data"] = {"claims": [{"step_id": s["id"], "reason": "Fixture capable volunteer"}
                                for s in dispatch["payload"]["draft_plan"]["steps"]

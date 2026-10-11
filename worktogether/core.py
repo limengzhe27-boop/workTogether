@@ -393,6 +393,12 @@ class Engine:
                 elif message["status"] == "HELD":
                     message["wait_reason"] = "AUTO_ROUND_BUDGET"
             held = sum(1 for m in messages if m["status"] == "HELD")
+            by_dispatch = {d["id"]: d for d in task["dispatches"]}
+            for message in messages:
+                for reply in message.get("replies", []):
+                    dispatch = by_dispatch.get(reply.get("dispatch_id"))
+                    if dispatch and dispatch.get("changed_files"):
+                        reply["changed_files"] = dispatch["changed_files"]
             return messages, {
                 "allow_write": config.get("allow_write", False),
                 "max_auto_rounds": config.get("max_auto_rounds", 2),
@@ -1186,7 +1192,8 @@ class Engine:
                 m = json.loads(row[0])
                 round_no = d["payload"].get("round", m.get("round", 1))
                 m["replies"].append({"role": d["role"], "content": report["summary"], "report": report,
-                                     "round": round_no, "ok": report["status"] != "BLOCKED"})
+                                     "round": round_no, "ok": report["status"] != "BLOCKED",
+                                     "dispatch_id": d["id"]})
                 roles, _, _, failed, pending = self._round_state(t, m)
                 if pending:
                     # Other agents of this parallel round are still working.

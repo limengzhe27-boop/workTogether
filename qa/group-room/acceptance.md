@@ -74,6 +74,16 @@
 | 平台会把写入回合授予根本不能写的适配器 | Antigravity 适配器固定 `--sandbox --mode plan`，却可能被选为唯一写者 | 新增 `AgentConfig.writable`；`_pick_writer` 只考虑「有 code 能力且适配器可写」的成员，否则不给写权限，而不是给一个用不了的授权 |
 | Antigravity 在对话里执行 `ls` 被权限拒绝，整轮丢弃 | `denied_commands: ["ls -la …/proj"]`，33k token 白烧 | CHAT 提示明确要求使用只读文件工具（list_dir/view_file）、命令被拒就用手上能读到的内容继续；并且**命令被拒不再丢弃可用回答**，改为在回答开头如实标注「⚠️ 有命令被权限拒绝」，仅 VERIFY 保持严格失败 |
 
+## 改动归因（2026-10-11 补）
+
+真实运行暴露的体验缺口：Codex 真的改写了 `tests/test_app.py`，但群里只显示它的文字，用户必须自己去敲 `git diff` 才知道发生了什么。
+
+现在每个会改动文件的回合（CODE/FIX，以及拿到写入的 CHAT）在运行前后各拍一次工作区快照（`workspace.file_digests`：路径 → 大小+修改时间+开头 4 KB 的摘要），差集写入该 dispatch，并在回复上呈现：`改了 N 个文件` 徽章 + 「本轮改动 · N 个文件」清单（M/A/D）。有变化才写 `WORKSPACE_CHANGED_BY_AGENT` 审计事件，没变化不写、不显示。
+
+快照对**每一轮对话**都拍，而不只是有写入授权的那一轮：如果某一轮没有授权却仍然改了文件，同样会被记录并标出 `writable: false`，而不是悄悄放过——因为只读轮次的沙箱本该阻止写入。
+
+验证：新增 `tests/core/test_change_attribution.py`（4 项，用会真的写文件的桩 CLI）；HTTP 与真实浏览器核对：拿到写入的 codex 显示 2 个文件（`M README.md`、`A fixture-wrote.txt`），只读的 antigravity 不显示徽章。
+
 ## 边界
 
 - 写入串行是平台内调度保证，不是文件系统锁：在编辑器里手动改同一个文件仍可能冲突；也没有隔离工作树与固定被测提交。

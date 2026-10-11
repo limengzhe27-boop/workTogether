@@ -40,7 +40,8 @@ type Message = {
   pending_roles?: string[];
   failed_roles?: string[];
   write_role?: string | null;
-  replies: { role: string; content: string; report?: ReplyReport; skipped?: boolean; round?: number; ok?: boolean }[];
+  replies: { role: string; content: string; report?: ReplyReport; skipped?: boolean; round?: number; ok?: boolean;
+    changed_files?: { path: string; status: string }[] }[];
 };
 
 type ChatState = {
@@ -460,6 +461,11 @@ export function TaskChat({
                   <div className="reply-heading">
                     <span className="agent-monogram" style={{ background: color }}>{badge.code}</span>
                     <strong className="reply-agent-name" style={{ color }}>{name}</strong>
+                    {!!r.changed_files?.length && (
+                      <span className="change-badge" title={r.changed_files.map(f => f.path).join('\n')}>
+                        改了 {r.changed_files.length} 个文件
+                      </span>
+                    )}
                     <div className="reply-heading-actions">
                       <button type="button" className="icon-button" aria-label={copied === replyKey ? '已复制回复' : '复制 ' + name + ' 的回复'} title="复制回复"
                         onClick={async () => {
@@ -476,8 +482,17 @@ export function TaskChat({
                       {isExpanded ? '收起长文' : '展开完整回复'}
                     </button>
                   )}
-                  {(metaCount > 0 || !!r.report?.data?.proposals?.length) && (
+                  {(metaCount > 0 || !!r.report?.data?.proposals?.length || !!r.changed_files?.length) && (
                     <div className="reply-folds">
+                      {!!r.changed_files?.length && (
+                        <details className="reply-meta-box" open>
+                          <summary>本轮改动 · {r.changed_files.length} 个文件</summary>
+                          <ul>{r.changed_files.map(file => <li key={file.path}>
+                            <code className="diff-status">{file.status === 'added' ? 'A' : file.status === 'removed' ? 'D' : 'M'}</code>
+                            {' '}<span className="diff-path" title={file.path}>{file.path}</span>
+                          </li>)}</ul>
+                        </details>
+                      )}
                       {metaCount > 0 && (
                         <details className="reply-meta-box">
                           <summary>依据与建议 ({metaCount})</summary>
