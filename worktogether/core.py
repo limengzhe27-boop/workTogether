@@ -92,6 +92,10 @@ class Engine:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE);
+                CREATE TABLE IF NOT EXISTS project_meta (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id),
+                    memory TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
                     body TEXT NOT NULL);
@@ -123,7 +127,11 @@ class Engine:
     def _project(self, db, project):
         row = db.execute("SELECT * FROM projects WHERE id=?", (project,)).fetchone()
         require(row is not None, "Unknown project", "NOT_FOUND")
-        return dict(row)
+        p = dict(row)
+        meta = db.execute("SELECT memory FROM project_meta WHERE project_id=?", (project,)).fetchone()
+        if meta and meta["memory"]:
+            p["memory"] = meta["memory"]
+        return p
 
     def _task(self, db, task):
         row = db.execute("SELECT body FROM tasks WHERE id=?", (task,)).fetchone()
@@ -148,6 +156,37 @@ class Engine:
             db.execute("INSERT INTO projects VALUES(:id,:name,:path)", project)
             return project
 
+    def project_memory_update(self, project_id, memory):
+        require(isinstance(memory, str) and len(memory) <= 20000, "Invalid project memory", "INVALID_INPUT")
+        with self.transaction() as db:
+            p = self._project(db, project_id)
+            clean = memory.strip()
+            db.execute("INSERT OR REPLACE INTO project_meta(project_id,memory,updated_at) VALUES(?,?,?)",
+                       (project_id, clean, time.time()))
+            p["memory"] = clean
+            return p
+
+    def _delete_task_rows(self, db, task_id):
+        if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='runs'").fetchone():
+            for r in db.execute("SELECT body FROM runs WHERE task_id=?", (task_id,)):
+                require(json.loads(r[0])["status"] not in ("PREPARED", "RUNNING"),
+                        "Cannot delete a session while an agent process is running", "INVALID_STATE")
+            db.execute("DELETE FROM runs WHERE task_id=?", (task_id,))
+        for tbl in ("sessions", "approvals", "planning_jobs", "execution_jobs", "team_jobs", "messages", "events"):
+            if db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tbl,)).fetchone():
+                db.execute(f"DELETE FROM {tbl} WHERE task_id=?", (task_id,))
+        db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+
+    def project_delete(self, project_id):
+        with self.transaction() as db:
+            self._project(db, project_id)
+            task_ids = [r[0] for r in db.execute("SELECT id FROM tasks WHERE project_id=?", (project_id,)).fetchall()]
+            for tid in task_ids:
+                self._delete_task_rows(db, tid)
+            db.execute("DELETE FROM project_meta WHERE project_id=?", (project_id,))
+            db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+            return {"deleted": project_id, "tasks_removed": len(task_ids)}
+
     def task_add(self, project, title, requirement):
         require(string(title) and string(requirement), "Title and requirement required", "INVALID_INPUT")
         with self.transaction() as db:
@@ -161,6 +200,20 @@ class Engine:
             db.execute("INSERT INTO tasks VALUES(?,?,?)", (task["id"], project, encode(task)))
             self._save(db, task, "TASK_CREATED", {"title": title})
             return task
+
+    def task_rename(self, task_id, title):
+        require(string(title) and len(title.strip()) <= 200, "Valid session title required", "INVALID_INPUT")
+        with self.transaction() as db:
+            task = self._task(db, task_id)
+            task["title"] = title.strip()
+            self._save(db, task, "TASK_RENAMED", {"title": task["title"]})
+            return task
+
+    def task_delete(self, task_id):
+        with self.transaction() as db:
+            self._task(db, task_id)
+            self._delete_task_rows(db, task_id)
+            return {"deleted": task_id}
 
     def revise(self, task_id, message_id, expected_revision, requirement):
         """Replace requirements only at an idle boundary; retain the full audit trail."""
@@ -283,6 +336,8 @@ class Engine:
             for p in projects:
                 count = db.execute("SELECT COUNT(*) as c FROM tasks WHERE project_id=?", (p["id"],)).fetchone()["c"]
                 p["task_count"] = count
+                meta = db.execute("SELECT memory FROM project_meta WHERE project_id=?", (p["id"],)).fetchone()
+                p["memory"] = meta["memory"] if meta and meta["memory"] else ""
             return projects
 
     def messages(self, task_id):
@@ -291,10 +346,28 @@ class Engine:
             messages = [json.loads(r[0]) for r in db.execute("SELECT body FROM messages WHERE task_id=? ORDER BY rowid", (task_id,))]
             queued = False
             for message in messages:
+                roles = self._chat_roles(message)
                 if message["status"] == "QUEUED":
                     message["wait_reason"] = (self._chat_wait_reason(db, task) or
                         ("EARLIER_MESSAGE" if queued else self._chat_member_wait_reason(db, task, message)))
+                    message["pending_roles"] = roles[len(message["replies"]):]
                     queued = True
+                elif message["status"] == "RUNNING":
+                    active_d = next((d for d in reversed(task["dispatches"])
+                                     if d["kind"] == "CHAT" and d["status"] == "ACTIVE"
+                                     and d["payload"].get("message_id") == message["id"]), None)
+                    if active_d:
+                        message["active_role"] = active_d["role"]
+                        message["active_since"] = active_d["created_at"]
+                    message["pending_roles"] = roles[len(message["replies"]):]
+                elif message["status"] == "BLOCKED":
+                    blocked_d = next((d for d in reversed(task["dispatches"])
+                                      if d["kind"] == "CHAT" and d["status"] == "BLOCKED"
+                                      and d["payload"].get("message_id") == message["id"]), None)
+                    if blocked_d:
+                        message["blocked_role"] = blocked_d["role"]
+                        message["blocked_dispatch_id"] = blocked_d["id"]
+                    message["pending_roles"] = roles[len(message["replies"]):]
             return messages
 
     def _chat_wait_reason(self, db, task):
@@ -326,16 +399,30 @@ class Engine:
             role = roles[len(message["replies"])]
             from .agents import AgentConfig
             row = db.execute("SELECT body FROM agents WHERE id=?", (role,)).fetchone()
-            if row is None or not AgentConfig(json.loads(row[0])).ready:
+            secrets_file = Path(self.path).parent / "secrets.json"
+            stored_secret = ""
+            if secrets_file.is_file():
+                try:
+                    stored_secret = json.loads(secrets_file.read_text(encoding="utf-8")).get(role, "")
+                except Exception:
+                    stored_secret = ""
+            if row is None or not AgentConfig(json.loads(row[0]), stored_secret=stored_secret).ready:
                 return "AGENT_UNAVAILABLE"
             if self._busy(db, task, role):
                 return "MEMBER_UNRESOLVED"
         return None
 
-    def message_add(self, task_id, message_id, recipient, content):
+    def message_add(self, task_id, message_id, recipient, content, allow_write=False,
+                    context_files=None, referenced_task_ids=None, rounds=1):
         require(string(message_id) and len(message_id) <= 128 and string(recipient)
                 and string(content) and len(content) <= 20000,
                 "Invalid message", "INVALID_INPUT")
+        require(type(allow_write) is bool, "allow_write must be boolean", "INVALID_INPUT")
+        require(type(rounds) is int and rounds in (1, 2), "rounds must be 1 or 2", "INVALID_INPUT")
+        if context_files is not None:
+            require(strings(context_files) and len(context_files) <= 10, "Invalid context_files", "INVALID_INPUT")
+        if referenced_task_ids is not None:
+            require(strings(referenced_task_ids) and len(referenced_task_ids) <= 5, "Invalid referenced_task_ids", "INVALID_INPUT")
         from .agents import AgentRegistry
         registry = AgentRegistry(self)
         available = [a["id"] for a in registry.list(enabled_only=True) if a["ready"]]
@@ -351,17 +438,72 @@ class Engine:
             elif recipient == "both":
                 participants = [a for a in ("codex", "antigravity") if a in available]
                 require(len(participants) == 2, "Both built-in agents must be enabled", "UNSUPPORTED_PROVIDER")
+            elif "," in recipient:
+                requested = [part.strip() for part in recipient.split(",") if part.strip()]
+                require(bool(requested) and len(requested) == len(set(requested)),
+                        "Invalid recipient list", "INVALID_INPUT")
+                require(all(r in available for r in requested),
+                        "Agent is unknown, disabled or not configured", "UNSUPPORTED_PROVIDER")
+                participants = requested
             else:
                 require(recipient in available, "Agent is unknown, disabled or not configured", "UNSUPPORTED_PROVIDER")
                 participants = [recipient]
             require(not t.get("team") or all(key in t["team"]["members"] for key in participants),
                     "Recipient is outside this task's team", "INVALID_INPUT")
-            require(bool(participants) and len(participants) <= 12, "No ready agents or too many participants", "INVALID_INPUT")
+            if rounds == 2 and len(participants) >= 2:
+                participants = participants + participants
+            require(bool(participants) and len(participants) <= 24, "No ready agents or too many participants", "INVALID_INPUT")
             m = {"id": message_id, "task_id": task_id, "recipient": recipient, "content": content,
                  "participants": participants, "revision": t.get("revision", 1),
                  "status": "QUEUED", "replies": [], "created_at": time.time()}
+            if allow_write:
+                m["allow_write"] = True
+            if context_files:
+                m["context_files"] = [f.strip() for f in context_files if f.strip()]
+            if referenced_task_ids:
+                m["referenced_task_ids"] = [tid.strip() for tid in referenced_task_ids if tid.strip()]
+            if rounds == 2:
+                m["rounds"] = 2
             db.execute("INSERT INTO messages VALUES(?,?,?)", (message_id, task_id, encode(m)))
             self._save(db, t, "MESSAGE_SAVED", {"message_id": message_id, "recipient": recipient})
+            return m
+
+    def message_resolve(self, task_id, message_id, action="skip"):
+        require(action in ("skip", "retry"), "action must be skip or retry", "INVALID_INPUT")
+        with self.transaction() as db:
+            t = self._task(db, task_id)
+            row = db.execute("SELECT body FROM messages WHERE task_id=? AND id=?", (task_id, message_id)).fetchone()
+            require(row is not None, "Unknown message", "NOT_FOUND")
+            m = json.loads(row[0])
+            require(m["status"] in ("BLOCKED", "RUNNING", "QUEUED"), "Message is not blocked or in flight", "INVALID_STATE")
+            chat_dispatches = [d for d in t["dispatches"]
+                               if d["kind"] == "CHAT" and d["payload"].get("message_id") == message_id
+                               and d["status"] in ("BLOCKED", "ACTIVE")]
+            failed_role = None
+            for d in chat_dispatches:
+                self._require_process_stopped(db, d["id"])
+                d["status"] = "SUPERSEDED"
+                failed_role = d["role"]
+            roles = self._chat_roles(m)
+            if action == "skip":
+                target_role = failed_role or (roles[len(m["replies"])] if len(m["replies"]) < len(roles) else "agent")
+                m["replies"].append({
+                    "role": target_role,
+                    "content": "_（已跳过该 Agent 的本次回复）_",
+                    "skipped": True,
+                })
+                m.pop("error", None)
+                if len(m["replies"]) >= len(roles):
+                    m["status"] = "DELIVERED"
+                else:
+                    m["status"] = "QUEUED"
+            else:
+                # Retry: reset message status to QUEUED so ChatQueue dispatches the current slot
+                m.pop("error", None)
+                m["status"] = "QUEUED"
+            db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, message_id))
+            self._status(t)
+            self._save(db, t, "MESSAGE_RESOLVED", {"message_id": message_id, "action": action})
             return m
 
     def chat_dispatch(self, task_id):
@@ -386,10 +528,44 @@ class Engine:
             if self._chat_member_wait_reason(db, t, m):
                 return None
             d = self._issue(t, "CHAT", role=role)
-            brief = lambda replies: [{"role": r["role"], "content": r["content"][:2000]} for r in replies]
+            brief = lambda replies: [{"role": r["role"], "content": r["content"][:2000]}
+                                     for r in replies if not r.get("skipped")]
             d["payload"].update(message_id=m["id"], message=m["content"], peer_replies=brief(m["replies"]),
                 recent_messages=[{"content": x["content"], "replies": brief(x["replies"])}
                                  for x in messages if x["status"] == "DELIVERED"][-3:])
+            if m.get("allow_write"):
+                d["payload"]["allow_write"] = True
+            p = self._project(db, t["project_id"])
+            if p.get("memory"):
+                d["payload"]["project_memory"] = p["memory"]
+            # Every chat turn carries a bounded orientation block so a chat-only
+            # or CLI agent can answer questions about this project without the
+            # user pasting README or file paths by hand.
+            from .workspace import project_digest
+            digest = project_digest(p["path"])
+            if digest:
+                d["payload"]["project_context"] = digest
+            if m.get("context_files"):
+                from .workspace import read_project_files
+                d["payload"]["attached_files"] = read_project_files(p["path"], m["context_files"])
+            if m.get("referenced_task_ids"):
+                ref_sessions = []
+                for ref_id in m["referenced_task_ids"]:
+                    ref_row = db.execute("SELECT body FROM tasks WHERE id=? AND project_id=?",
+                                         (ref_id, t["project_id"])).fetchone()
+                    if ref_row:
+                        ref_task = json.loads(ref_row[0])
+                        ref_msgs = [json.loads(r[0]) for r in db.execute(
+                            "SELECT body FROM messages WHERE task_id=? ORDER BY rowid DESC LIMIT 2", (ref_id,))]
+                        excerpts = []
+                        for rm in reversed(ref_msgs):
+                            for rep in rm.get("replies", []):
+                                if not rep.get("skipped"):
+                                    excerpts.append(f"{rep['role']}: {rep['content'][:600]}")
+                        summary_text = " | ".join(excerpts) if excerpts else ref_task.get("requirement", "")[:600]
+                        ref_sessions.append({"id": ref_id, "title": ref_task["title"], "summary": summary_text})
+                if ref_sessions:
+                    d["payload"]["referenced_sessions"] = ref_sessions
             m["status"] = "RUNNING"
             db.execute("UPDATE messages SET body=? WHERE task_id=? AND id=?", (encode(m), task_id, m["id"]))
             self._save(db, t, "MESSAGE_DISPATCHED", {"message_id": m["id"], "dispatch_id": d["id"], "role": role})

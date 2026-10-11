@@ -16,6 +16,13 @@ class ChatQueue:
 
     def get_provider(self, role):
         if role in self.providers:
+            try:
+                from .agents import AgentRegistry
+                cfg = AgentRegistry(self.engine).get(role)
+                if cfg:
+                    self.providers[role].system_prompt = getattr(cfg, "system_prompt", "")
+            except Exception:
+                pass
             return self.providers[role]
         from .agents import AgentRegistry
         # Custom configuration may change between messages; never keep a stale adapter.

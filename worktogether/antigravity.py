@@ -75,7 +75,10 @@ class AntigravityRuntime(Runtime):
             require(isinstance(result.get("response"), str), "Missing AGY response")
             require(bool(result["response"].strip()),
                     "Antigravity returned no report; SUCCESS alone does not prove verification", "INVALID_REPORT")
-            report = json.loads(result["response"])
+            try:
+                report = json.loads(result["response"])
+            except ValueError:
+                report = {"__raw_markdown__": result["response"].strip()}
         require(isinstance(report, dict), "AGY report must be JSON object")
         (root / "result.json").write_text(encode(report), encoding="utf-8")
         return session, True, report, result.get("usage")

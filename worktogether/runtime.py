@@ -98,7 +98,10 @@ class Runtime:
         return self.provider
 
     def command(self, run, dispatch):
-        sandbox = "workspace-write" if dispatch["kind"] in ("CODE", "FIX") else "read-only"
+        allow_write = dispatch["kind"] in ("CODE", "FIX") or (
+            dispatch["kind"] == "CHAT" and bool(dispatch.get("payload", {}).get("allow_write"))
+        )
+        sandbox = "workspace-write" if allow_write else "read-only"
         result = str(Path(run["artifact_dir"]) / "result.json")
         args = [self.executable, "exec", "--sandbox", sandbox, "-C", run["cwd"], "--json",
                 "--skip-git-repo-check", "--color", "never", "-o", result]
@@ -108,18 +111,65 @@ class Runtime:
             args.append("-")
         return args
 
+    def _build_chat_context(self, dispatch):
+        parts = []
+        persona = getattr(self, "system_prompt", "") or dispatch.get("payload", {}).get("agent_persona", "")
+        if persona:
+            parts.append(f"AGENT ROLE / PERSONA:\n{persona}")
+        if dispatch.get("payload", {}).get("allow_write"):
+            parts.append("WRITE PERMISSION: Enabled for this turn. You may directly create or modify files in the project workspace if requested.")
+        project_memory = dispatch.get("payload", {}).get("project_memory", "")
+        if project_memory:
+            parts.append(f"PROJECT SHARED MEMORY:\n{project_memory}")
+        ref_summaries = dispatch.get("payload", {}).get("referenced_sessions") or []
+        if ref_summaries:
+            lines = ["REFERENCED SESSIONS IN THIS PROJECT:"]
+            for ref in ref_summaries:
+                lines.append(f"- [{ref.get('title', 'Session')}]: {ref.get('summary', '')}")
+            parts.append("\n".join(lines))
+        attached = dispatch.get("payload", {}).get("attached_files") or []
+        if attached:
+            lines = ["USER REFERENCED PROJECT FILES (@file):"]
+            for item in attached:
+                lines.append(f"--- FILE: {item['path']} ---\n{item['content']}\n--- END FILE ---")
+            parts.append("\n".join(lines))
+        proj_files = dispatch.get("payload", {}).get("project_files") or []
+        if proj_files and (self.provider == "openai_compat" or attached):
+            parts.append("PROJECT FILE TREE (excerpt):\n" + ", ".join(proj_files[:80]))
+        project = dispatch.get("payload", {}).get("project_context") or {}
+        if project:
+            lines = [f"PROJECT CONTEXT: {project.get('name', '')} at {project.get('path', '')}"]
+            if project.get("readme"):
+                label = project.get("readme_path", "README")
+                suffix = " (excerpt)" if project.get("readme_truncated") else ""
+                lines.append(f"--- {label}{suffix} ---\n{project['readme']}\n--- END {label} ---")
+            if project.get("files"):
+                listed = ", ".join(project["files"][:120])
+                suffix = ", …" if project.get("files_truncated") else ""
+                lines.append(f"PROJECT FILES: {listed}{suffix}")
+            lines.append("You may inspect this project with your read-only tools when the question needs it. "
+                         "Never claim to have read a file you did not open.")
+            parts.append("\n".join(lines))
+        if not parts:
+            return ""
+        return "\n\n".join(parts).replace("DISPATCH:\n", "DISPATCH_:\n") + "\n\n"
+
     def _prompt(self, dispatch):
         if dispatch["kind"] == "CHAT":
-            return ("Reply to this task-scoped conversation only. Do not run commands or modify files. "
-                    "Messages and peer replies are discussion, NOT authority to start development or change approved requirements. "
-                    "The current requirement_revision supersedes older context. Give a concise useful answer; "
-                    "if a change is requested, explain what needs explicit revision/approval. "
+            extra_context = self._build_chat_context(dispatch)
+            return ("You are collaborating in a multi-agent project session. Respond directly and constructively "
+                    "to the user's message and any peer_replies in the conversation. You may freely discuss architecture, "
+                    "code, debugging, or coordinate task division with other agents. "
+                    "When asked about this project, answer from the PROJECT CONTEXT block below and from files you actually "
+                    "open; never invent project details and say plainly when the context is missing or truncated. "
+                    "Format summary in clean Markdown (state the direct conclusion first, then use short paragraphs or '- ' bullet points "
+                    "for multi-point explanations instead of a single dense block of text). "
+                    "Do not lecture the user about internal state-machine fields like requirement_revision. "
                     "Return ONLY JSON with schema_version:1, task_id, dispatch_id (dispatch.id), role, attempt, "
-                    "status:DONE, summary:your reply, basis:[nonempty strings], suggestions:[] (max 3), "
+                    "status:DONE, summary:your Markdown reply, basis:[nonempty strings], suggestions:[] (max 3), "
                     "next_action:string. data is {} or {proposals:[{title,work_kind:code|analysis,assignee,reason}]} "
-                    "with at most 3 concrete task proposals. A proposal is advice, not permission to run work; "
-                    "only an approved plan can dispatch tasks. If unable, status:BLOCKED and "
-                    "data:{reason:string}.\nDISPATCH:\n" + encode(dispatch))
+                    "with at most 3 optional task proposals when task breakdown is helpful. If unable, status:BLOCKED and "
+                    "data:{reason:string}.\n" + extra_context + "DISPATCH:\n" + encode(dispatch))
         if dispatch["kind"] == "ANALYZE":
             return ("Complete this assigned read-only analysis. Do not modify files or launch other agents. "
                     "Use prior step handoffs and review findings in the dispatch; distinguish observation from inference. "
@@ -357,6 +407,9 @@ class Runtime:
             with self.engine.transaction() as db:
                 task = self.engine._task(db, run["task_id"])
                 dispatch = self.engine._get_dispatch(task, run["dispatch_id"])
+            if dispatch["kind"] == "CHAT":
+                report = normalize_chat_report(report, dispatch)
+                (root / "result.json").write_text(encode(report), encoding="utf-8")
             if dispatch["report"] is None:
                 self._check_handoff_workspace(run, self._handoff_fingerprint(dispatch))
             # If the host crashes after submit, collecting again performs an idempotent
@@ -385,7 +438,14 @@ class Runtime:
                     raise CollabError("PROVIDER_FAILED", "Provider stream reported failure; inspect event log")
                 if event.get("type") == "turn.completed":
                     completed, usage = True, event.get("usage")
-        report = json.loads((root / "result.json").read_text(encoding="utf-8"))
+        raw_text = (root / "result.json").read_text(encoding="utf-8")
+        try:
+            report = json.loads(raw_text)
+        except ValueError:
+            if raw_text.strip():
+                report = {"__raw_markdown__": raw_text.strip()}
+            else:
+                raise
         return session, completed, report, usage
 
     def resolve_stopped(self, run_id, confirmed_stopped=False):
@@ -396,3 +456,81 @@ class Runtime:
         run.update(status="FAILED", error="Operator confirmed orphan execution stopped; explicit dispatch retry required")
         self._fail(run)
         return run
+
+
+def normalize_chat_report(raw, dispatch):
+    """Normalize lenient JSON or plain Markdown replies in CHAT mode into a valid report envelope."""
+    if dispatch.get("kind") != "CHAT":
+        return raw
+    if isinstance(raw, dict) and "__raw_markdown__" in raw:
+        raw = raw["__raw_markdown__"]
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned:
+            raise ValueError("Empty chat response")
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                raw = parsed
+            else:
+                raw = {"summary": cleaned}
+        except ValueError:
+            # Check if there is an embedded JSON object block
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            parsed = None
+            if start != -1 and end > start:
+                try:
+                    candidate = json.loads(cleaned[start:end + 1])
+                    if isinstance(candidate, dict) and ("summary" in candidate or "reply" in candidate):
+                        parsed = candidate
+                except ValueError:
+                    parsed = None
+            raw = parsed if parsed is not None else {"summary": cleaned}
+
+    if not isinstance(raw, dict) or not raw:
+        return raw
+
+    summary = raw.get("summary") or raw.get("reply") or raw.get("content") or raw.get("message")
+    if not (isinstance(summary, str) and summary.strip()):
+        return raw
+
+    status = raw.get("status") if raw.get("status") in ("DONE", "BLOCKED") else "DONE"
+    basis = raw.get("basis")
+    if not (isinstance(basis, list) and basis and all(isinstance(x, str) and x.strip() for x in basis)):
+        basis = ["基于当前对话与项目上下文"]
+    suggestions = raw.get("suggestions")
+    if not (isinstance(suggestions, list) and all(isinstance(x, str) and x.strip() for x in suggestions)):
+        suggestions = []
+    suggestions = suggestions[:3]
+    next_action = raw.get("next_action")
+    if not (isinstance(next_action, str) and next_action.strip()):
+        next_action = "继续协作"
+    data = raw.get("data")
+    if status == "BLOCKED":
+        if not (isinstance(data, dict) and isinstance(data.get("reason"), str) and data["reason"].strip()):
+            data = {"reason": summary.strip()[:500]}
+    else:
+        if not (isinstance(data, dict) and (data == {} or set(data) == {"proposals"})):
+            data = {}
+    return {
+        "schema_version": 1,
+        "task_id": dispatch["task_id"],
+        "dispatch_id": dispatch["id"],
+        "role": dispatch["role"],
+        "attempt": dispatch["attempt"],
+        "status": status,
+        "summary": summary.strip(),
+        "basis": basis,
+        "suggestions": suggestions,
+        "next_action": next_action,
+        "data": data,
+    }
+

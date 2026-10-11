@@ -6,6 +6,8 @@ __pycache__/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
+# Local API keys stored next to the state database (mode 600).
+secrets.json
 *.egg-info/
 node_modules/
 .DS_Store

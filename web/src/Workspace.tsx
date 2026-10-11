@@ -3,8 +3,8 @@ import { api, request } from './api';
 import { TaskChat } from './TaskChat';
 import { Dialog } from './Dialog';
 import { ProjectNavigation } from './ProjectNavigation';
-import { Home, Folder, PanelLeft, PanelRight, Users, Search, Settings2, ClipboardList, MessageSquare } from 'lucide-react';
-import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentProbeResult, ReportEnvelope } from './types';
+import { ArrowUp, Folder, PanelLeft, Users, Search, ClipboardList, MessageSquare, FileDiff, Save, RotateCcw, Trash2, Pencil, RefreshCw, Layers } from 'lucide-react';
+import { Project, TaskDetail, TaskSummary, RunRecord, RunArtifactPreview, AgentInfo, AgentProbeResult, ReportEnvelope, ProjectDiff, ProjectFileEntry } from './types';
 
 type Detail = TaskDetail & { revision?: number; team?: { members: string[]; coordinator: string; reviewer: string } };
 type Job = { id: string; status: string; error: string | null; authorization?: { revision: number }; result?: { reason?: string } };
@@ -17,6 +17,7 @@ const labels: Record<string, string> = {
   CODE: '实现',
   VERIFY: '独立验收',
   FIX: '修复',
+  ANALYZING: '分析中',
   ANALYZE: '分析交付',
   PLANNING: '准备方案',
   PLAN_REVIEW: '审查方案',
@@ -26,7 +27,6 @@ const labels: Record<string, string> = {
   PAUSED: '已暂停',
   BLOCKED: '需要处理',
   RUNNING: '执行中',
-  ANALYZING: '分析中',
   PREPARED: '等待启动确认',
   QUEUED: '已登记',
   FAILED: '失败',
@@ -42,6 +42,16 @@ const artifactLabels: Record<string, string> = {
 const post = <T,>(url: string, body = {}) => request<T>(url, { method: 'POST', body: JSON.stringify(body) });
 function stored(key: string) { try { return localStorage.getItem(key) || ''; } catch { return ''; } }
 function save(key: string, value: string) { try { localStorage.setItem(key, value); } catch { /* Storage is optional. */ } }
+
+type ProviderStatus = Record<string, { available: boolean; executable: string }>;
+
+/** Name of the missing local executable, or '' when the agent is not a local CLI. */
+function missingExecutable(agent: AgentInfo, providers: ProviderStatus | null): string {
+  if (agent.type !== 'cli' || !providers) return '';
+  const info = providers[agent.base_agent || agent.id];
+  if (!info || info.available) return '';
+  return info.executable;
+}
 
 export function Workspace() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -71,7 +81,7 @@ export function Workspace() {
   const [searching, setSearching] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [tab, setTab] = useState('progress');
-  const [dialog, setDialog] = useState<'' | 'team' | 'plan' | 'authorize' | 'discuss' | 'execute'>('');
+  const [dialog, setDialog] = useState<'' | 'team' | 'plan' | 'authorize' | 'discuss' | 'execute' | 'context'>('');
   const [composerRequest, setComposerRequest] = useState(0);
   const [chatPending, setChatPending] = useState(false);
   const [manualDispatchId, setManualDispatchId] = useState('');
@@ -90,10 +100,8 @@ export function Workspace() {
     const main = document.querySelector<HTMLElement>('main')!;
     const trigger = document.activeElement as HTMLElement | null;
     const chrome = document.querySelector<HTMLElement>('.windowbar');
-    const rail = document.querySelector<HTMLElement>('.tool-rail');
     main.setAttribute('inert', '');
     chrome?.setAttribute('inert', '');
-    rail?.setAttribute('inert', '');
     const controls = () => Array.from(sidebar.querySelectorAll<HTMLElement>('button:not(:disabled),select:not(:disabled)'))
       .filter(el => el.getClientRects().length > 0);
     controls()[0]?.focus();
@@ -111,7 +119,6 @@ export function Workspace() {
     return () => {
       main.removeAttribute('inert');
       chrome?.removeAttribute('inert');
-      rail?.removeAttribute('inert');
       document.removeEventListener('keydown', keys);
       query.removeEventListener('change', resized);
       trigger?.focus();
@@ -120,20 +127,39 @@ export function Workspace() {
 
   // Multi-agent states
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [homeSelectedIds, setHomeSelectedIds] = useState<string[] | null>(null);
   const [teamChoice, setTeamChoice] = useState<{ taskId: string; members: string[] }>({ taskId: '', members: [] });
-  const [delegateOnCreate, setDelegateOnCreate] = useState(false);
-  const [newTeamChoice, setNewTeamChoice] = useState<{ project: string; members: string[] }>({ project: '', members: [] });
-  const [providers, setProviders] = useState<Record<string, { available: boolean; executable: string }> | null>(null);
+  const [providers, setProviders] = useState<ProviderStatus | null>(null);
   const [managingAgents, setManagingAgents] = useState(false);
   const [probingAgent, setProbingAgent] = useState('');
   const [probeResults, setProbeResults] = useState<Record<string, AgentProbeResult>>({});
+  // Project context dialog: shared memory, changed files and bounded file list.
+  const [contextProject, setContextProject] = useState('');
+  const [contextMemory, setContextMemory] = useState('');
+  const [contextSaved, setContextSaved] = useState('');
+  const [contextDiff, setContextDiff] = useState<ProjectDiff | null>(null);
+  const [contextFiles, setContextFiles] = useState<ProjectFileEntry[]>([]);
+  const [contextFilesTruncated, setContextFilesTruncated] = useState(false);
+  const [preview, setPreview] = useState<{ path: string; content: string; size: number; truncated: boolean } | null>(null);
+  const [previewBusy, setPreviewBusy] = useState('');
+  const [contextNote, setContextNote] = useState('');
+  const [contextLoading, setContextLoading] = useState(false);
+  const [contextError, setContextError] = useState('');
+  const [revertTarget, setRevertTarget] = useState('');
+  const [profileDraft, setProfileDraft] = useState<{
+    id: string; name: string; description: string; system_prompt: string; model: string; secret_key: string;
+  } | null>(null);
+  const [savingProfile, setSavingProfile] = useState(false);
   const [newAgent, setNewAgent] = useState({
     id: '',
     name: '',
     type: 'openai_compat',
+    base_agent: '',
     endpoint: 'https://api.deepseek.com/v1',
     model: 'deepseek-chat',
     api_key_env: 'DEEPSEEK_API_KEY',
+    secret_key: '',
+    system_prompt: '',
     description: '',
     color: '#8b5cf6',
     avatar: '🧠',
@@ -284,10 +310,22 @@ export function Workspace() {
   async function handleAddAgent(e: React.FormEvent) {
     e.preventDefault();
     if (!newAgent.id || !newAgent.name) return;
+    const payload: Partial<AgentInfo> & { secret_key?: string } = {
+      id: newAgent.id, name: newAgent.name, type: newAgent.type,
+      description: newAgent.description, avatar: newAgent.avatar, color: newAgent.color,
+      system_prompt: newAgent.system_prompt,
+    };
+    if (newAgent.type === 'cli') {
+      payload.base_agent = newAgent.base_agent || 'codex';
+      payload.model = newAgent.model;
+    } else {
+      payload.endpoint = newAgent.endpoint;
+      payload.model = newAgent.model;
+      payload.api_key_env = newAgent.api_key_env;
+      if (newAgent.secret_key) payload.secret_key = newAgent.secret_key;
+    }
     await act(async () => {
-      await api.addAgent({
-        ...newAgent,
-      });
+      await api.addAgent(payload);
       const res = await api.getAgents();
       setAgents(res.agents);
       setProbeResults(current => {
@@ -300,13 +338,191 @@ export function Workspace() {
         id: '',
         name: '',
         type: 'openai_compat',
+        base_agent: '',
         endpoint: 'https://api.deepseek.com/v1',
         model: 'deepseek-chat',
         api_key_env: 'DEEPSEEK_API_KEY',
+        secret_key: '',
+        system_prompt: '',
         description: '',
         color: '#8b5cf6',
         avatar: '🧠',
       });
+    });
+  }
+
+  async function openContext(projectId: string) {
+    if (!projectId) return;
+    setDialog('context');
+    setContextProject(projectId);
+    setContextLoading(true);
+    setContextError('');
+    setContextNote('');
+    setRevertTarget('');
+    setPreview(null);
+    try {
+      const [memory, files, diff] = await Promise.all([
+        api.getProjectMemory(projectId),
+        api.getProjectFiles(projectId),
+        api.getProjectDiff(projectId),
+      ]);
+      setContextMemory(memory.memory);
+      setContextSaved(memory.memory);
+      setContextFiles(files.files);
+      setContextFilesTruncated(files.truncated);
+      setContextDiff(diff);
+    } catch (e) {
+      setContextError((e as Error).message);
+    } finally {
+      setContextLoading(false);
+    }
+  }
+
+  async function reloadContext(projectId: string) {
+    try {
+      const [files, diff] = await Promise.all([api.getProjectFiles(projectId), api.getProjectDiff(projectId)]);
+      setContextFiles(files.files);
+      setContextFilesTruncated(files.truncated);
+      setContextDiff(diff);
+    } catch (e) {
+      setContextError((e as Error).message);
+    }
+  }
+
+  async function previewContextFile(path: string) {
+    if (!contextProject || previewBusy) return;
+    if (preview?.path === path) { setPreview(null); return; }
+    setPreviewBusy(path);
+    setContextError('');
+    try {
+      const file = await api.getProjectFile(contextProject, path);
+      setPreview({ path: file.path, content: file.content, size: file.size_bytes, truncated: file.truncated });
+    } catch (e) {
+      setContextError((e as Error).message);
+    } finally {
+      setPreviewBusy('');
+    }
+  }
+
+  async function renameCurrentTask() {
+    if (!task) return;
+    const title = window.prompt('新的会话名称', task.title);
+    if (title === null) return;
+    const trimmed = title.trim();
+    if (!trimmed || trimmed === task.title) return;
+    await act(async () => {
+      const updated = await api.renameTask(taskId, trimmed);
+      setTask(current => (current ? { ...current, title: updated.title } : current));
+    });
+  }
+
+  async function deleteCurrentTask() {
+    if (!task) return;
+    if (!window.confirm(`删除会话「${task.title}」？其消息、运行记录与事件会一并删除，无法撤销。`)) return;
+    await act(async () => {
+      await api.deleteTask(taskId);
+      choose('');
+    });
+  }
+
+  async function deleteContextProject() {
+    const ctx = projects.find(p => p.id === contextProject);
+    if (!ctx) return;
+    const count = typeof ctx.task_count === 'number' ? `其 ${ctx.task_count} 个会话及` : '其全部会话及';
+    if (!window.confirm(`删除项目「${ctx.name}」？${count}消息、运行记录都会被删除；代码文件本身不受影响。`)) return;
+    await act(async () => {
+      await api.deleteProject(ctx.id);
+      const rest = (await api.getProjects()).projects;
+      setProjects(rest);
+      setTasks([]);
+      choose('');
+      setProject(current => (current === ctx.id ? (rest[0]?.id || '') : current));
+      setDialog('');
+    });
+  }
+
+  async function saveContextMemory(append: boolean) {
+    if (!contextProject) return;
+    setContextError('');
+    try {
+      const res = await api.updateProjectMemory(contextProject, contextMemory, append);
+      setContextMemory(res.memory);
+      setContextSaved(res.memory);
+      setContextNote(append ? '已追加到项目记忆。' : '已保存项目记忆，后续对话会带上它。');
+      setProjects(list => list.map(p => p.id === contextProject ? { ...p, memory: res.memory } : p));
+    } catch (e) {
+      setContextError((e as Error).message);
+    }
+  }
+
+  async function revertContextFile(path: string) {
+    if (!contextProject || !path) return;
+    const confirmed = window.confirm(
+      `确认还原 ${path}？\n已跟踪文件会恢复到 HEAD 版本，未跟踪文件会被删除。此操作不可撤销。`);
+    if (!confirmed) return;
+    setContextError('');
+    setRevertTarget(path);
+    try {
+      await api.revertProjectFile(contextProject, path);
+      setContextNote(`已还原 ${path}。`);
+      await reloadContext(contextProject);
+    } catch (e) {
+      setContextError((e as Error).message);
+    } finally {
+      setRevertTarget('');
+    }
+  }
+
+  function beginProfile(agent: AgentInfo) {
+    setProfileDraft({
+      id: agent.id,
+      name: agent.name,
+      description: agent.description || '',
+      system_prompt: agent.system_prompt || '',
+      model: agent.model || '',
+      secret_key: '',
+    });
+  }
+
+  async function saveProfile(e: React.FormEvent) {
+    e.preventDefault();
+    if (!profileDraft || savingProfile) return;
+    setSavingProfile(true);
+    setError('');
+    try {
+      const patch: Partial<AgentInfo> & { secret_key?: string } = {
+        name: profileDraft.name,
+        description: profileDraft.description,
+        system_prompt: profileDraft.system_prompt,
+      };
+      if (profileDraft.model) patch.model = profileDraft.model;
+      if (profileDraft.secret_key) patch.secret_key = profileDraft.secret_key;
+      await api.updateAgentProfile(profileDraft.id, patch);
+      setAgents((await api.getAgents()).agents);
+      setProfileDraft(null);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSavingProfile(false);
+    }
+  }
+
+  async function clearStoredKey(agentId: string) {
+    setError('');
+    try {
+      await api.updateAgentProfile(agentId, { secret_key: '' });
+      setAgents((await api.getAgents()).agents);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  async function removeAgent(agent: AgentInfo) {
+    if (!window.confirm(`移除 Agent「${agent.name}」？仅影响尚未启动、只发给它的消息，历史记录会保留。`)) return;
+    await act(async () => {
+      await api.deleteAgent(agent.id);
+      setAgents((await api.getAgents()).agents);
+      setProfileDraft(null);
     });
   }
 
@@ -355,7 +571,6 @@ export function Workspace() {
   const revisionStarted = !!task?.dispatches.some(d => (d.payload.requirement_revision || 1) === (task.revision || 1));
   const canRevise = !!task && !locked && !activeDispatch;
   const base = '/tasks/' + taskId;
-  const newTeamMembers = newTeamChoice.project === project ? newTeamChoice.members : ['codex', 'antigravity'];
 
   async function prepareManual(dispatchId: string) {
     await act(async () => {
@@ -392,6 +607,28 @@ export function Workspace() {
     chatPending ? '正在处理消息' : task?.phase === 'EXECUTING' && !approval?.approved ? '方案待你确认' :
     task ? label(task.phase) : '';
 
+  const readyAgents = agents.filter(a => a.enabled && a.ready);
+  const readyIds = readyAgents.map(a => a.id);
+  const homeActiveAgentIds = homeSelectedIds === null ? readyIds : readyIds.filter(id => homeSelectedIds.includes(id));
+  const isHomeAllSelected = readyIds.length > 0 && homeActiveAgentIds.length === readyIds.length;
+  const homeRecipientValue = homeActiveAgentIds.length === 0 ? '' :
+    homeActiveAgentIds.length === readyIds.length ? 'all' :
+    homeActiveAgentIds.length === 1 ? homeActiveAgentIds[0] : homeActiveAgentIds.join(',');
+  const activeTeamIds = members.length ? members : readyAgents.map(a => a.id);
+
+  function toggleHomeAllAgents() {
+    if (isHomeAllSelected) setHomeSelectedIds([]);
+    else setHomeSelectedIds([...readyIds]);
+  }
+
+  function toggleHomeOneAgent(agentId: string) {
+    if (homeActiveAgentIds.includes(agentId)) {
+      setHomeSelectedIds(homeActiveAgentIds.filter(x => x !== agentId));
+    } else {
+      setHomeSelectedIds(readyIds.filter(x => x === agentId || homeActiveAgentIds.includes(x)));
+    }
+  }
+
   function toggleNavigation() {
     if (window.matchMedia('(max-width: 959px)').matches) setNavigation(open => !open);
     else setSidebarCollapsed(collapsed => !collapsed);
@@ -403,29 +640,30 @@ export function Workspace() {
     <div className={'workspace ' + (sidebarCollapsed ? 'sidebar-collapsed' : '')}>
       <header className="windowbar">
         <div className="window-leading">
-          <span className="window-logo" aria-hidden="true">W</span>
           <button className="icon-button sidebar-toggle" onClick={toggleNavigation}
             aria-label="切换项目侧栏" title="展开／收起项目侧栏"><PanelLeft /></button>
-          <span className="window-caption">本地工作区</span>
         </div>
-        <div className="window-title"><Folder aria-hidden="true" /><h1 title={task?.title || currentProject?.name}>
-          {task?.title || (taskId ? '正在加载…' : currentProject?.name || 'WorkTogether')}
-        </h1></div>
+        <div className="window-title">
+          <Folder aria-hidden="true" />
+          {currentProject && task && <span className="window-project-chip">{currentProject.name} /</span>}
+          <h1 title={task?.title || currentProject?.name}>
+            {task?.title || (taskId ? '正在加载…' : currentProject?.name || 'WorkTogether')}
+          </h1>
+          {task && <span className={'status-pill status-' + task.status.toLowerCase()}>{label(task.status)}</span>}
+        </div>
         <div className="window-actions">
-          {task && <button className="icon-button team-button" onClick={() => setDialog('team')} aria-label="任务团队" title={'任务团队 · ' + (members.length || agents.filter(a => a.ready).length) + ' 位成员'}><Users /></button>}
-          {task?.draft_plan && <button className="icon-button" onClick={() => setDialog('plan')} aria-label="查看方案" title="查看方案"><ClipboardList /></button>}
-          <button className="icon-button" disabled={!task} aria-label={tab === 'details' ? '返回对话' : '任务详情'}
-            title={tab === 'details' ? '返回对话' : '任务详情'} aria-pressed={tab === 'details'}
-            onClick={() => setTab(tab === 'details' ? 'progress' : 'details')}>{tab === 'details' ? <MessageSquare /> : <PanelRight />}</button>
+          {task?.draft_plan && <button className="header-chip-btn" onClick={() => setDialog('plan')} aria-label="查看方案" title="查看方案">
+            <ClipboardList /><span>方案</span>
+          </button>}
+          {task && (
+            <button className="header-chip-btn" aria-label={tab === 'details' ? '返回对话' : '任务详情'}
+              aria-pressed={tab === 'details'} onClick={() => setTab(tab === 'details' ? 'progress' : 'details')}>
+              {tab === 'details' ? <MessageSquare /> : <ClipboardList />}
+              <span>{tab === 'details' ? '对话' : '记录'}</span>
+            </button>
+          )}
         </div>
       </header>
-      <nav className="tool-rail" aria-label="工作区工具">
-        <button className="icon-button" disabled={!project || busy} onClick={newTask} aria-label="新任务首页" title="新任务首页" aria-current={!taskId ? 'page' : undefined}><Home /></button>
-        <button className="icon-button" onClick={toggleNavigation} aria-label="项目导航" title="项目导航"><Folder /></button>
-        <button className="icon-button" onClick={openSearch} aria-label="搜索任务" title="搜索任务"><Search /></button>
-        <button className="icon-button" onClick={() => { setNavigation(false); setManagingAgents(true); }} aria-label="Agent 设置" title="Agent 设置"><Users /></button>
-        <div className="rail-bottom"><button className="icon-button" onClick={() => setManagingAgents(true)} aria-label="管理工作区 Agent" title="管理 Agent"><Settings2 /></button><span className="rail-mark" title="WorkTogether 本地工作区">W</span></div>
-      </nav>
       {navigation && <button className="nav-scrim" tabIndex={-1} aria-label="关闭项目导航" onClick={() => setNavigation(false)} />}
       <aside className={'sidebar ' + (navigation ? 'visible' : '')} aria-label="项目与任务">
         <ProjectNavigation projects={projects} project={project} tasks={tasks} taskId={taskId} busy={busy}
@@ -437,112 +675,125 @@ export function Workspace() {
         {error && <div className="global-error error" role="alert">{error}<button onClick={() => setError('')}>关闭提示</button></div>}
         {!taskId ? <div className="home-scroll"><div className="reading page-enter">
               <section className="home">
-                <p className="eyebrow">一起把想法做出来</p>
-                <h1>今天想完成什么？</h1>
-                <p className="muted">说清目标，和你的 Agent 一起讨论、分工与完成。</p>
+                <div className="home-header">
+                  <h1>{currentProject ? `${currentProject.name} · 新建会话` : '新建会话'}</h1>
+                  {currentProject && <p className="small muted">{currentProject.path}</p>}
+                  {currentProject && (
+                    <div className="home-context-actions">
+                      <button type="button" className="header-chip-btn" onClick={() => openContext(currentProject.id)}
+                        aria-label="项目上下文" title="项目记忆与代码变更">
+                        <Layers /><span>项目上下文</span>
+                      </button>
+                      <span className="small muted">每次对话自动附带 README 与文件列表</span>
+                    </div>
+                  )}
+                </div>
 
                 <form className="composer" onSubmit={e => {
                   e.preventDefault();
                   const p = project;
-                  const delegate = delegateOnCreate;
-                  const members = [...newTeamMembers];
+                  const content = draft.trim();
+                  if (!p || !content) return;
+                  const recipient = homeRecipientValue;
                   act(async () => {
-                    const t = await api.addTask(p, draft.trim().split('\n')[0].slice(0, 60), draft.trim());
+                    const t = await api.addTask(p, content.split('\n')[0].slice(0, 60), content);
                     save('wt:draft:' + p, '');
                     setDraft('');
                     choose(t.id);
-                    if (delegate) {
-                      // Keep the created task visible if configuration or launch
-                      // fails; never recreate it blindly or hide partial state.
-                      await post(`/tasks/${t.id}/team`, { members });
-                      await post(`/tasks/${t.id}/delegate-team`, { authorize_execution: true });
+                    if (recipient) {
+                      await post(`/tasks/${t.id}/messages`, {
+                        message_id: crypto.randomUUID(),
+                        recipient,
+                        content,
+                      });
                     }
                   });
                 }}>
-                  <label htmlFor="requirement" className="small">任务需求</label>
                   <textarea
                     id="requirement"
-                    placeholder="描述你想完成的事，以及怎样才算做好…"
+                    aria-label="新会话消息"
+                    placeholder={currentProject ? `在 ${currentProject.name} 下输入问题或任务，直接与选中的 Agent 交流… (⌘ + Enter 发送)` : '请先在左侧点击项目右侧 + 添加本地项目…'}
                     value={draft}
+                    onKeyDown={e => {
+                      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                        e.preventDefault();
+                        e.currentTarget.form?.requestSubmit();
+                      }
+                    }}
                     onChange={e => {
                       setDraft(e.target.value);
                       save('wt:draft:' + project, e.target.value);
                     }}
                   />
-                  <label className="check-label small">
-                    <input type="checkbox" checked={delegateOnCreate} disabled={busy}
-                      onChange={e => setDelegateOnCreate(e.target.checked)} /> 创建后授权团队讨论、分工并执行当前需求
-                  </label>
-                  {delegateOnCreate && <div>
-                    <div className="actions">{agents.filter(a => a.ready).map(a => <label key={a.id}>
-                      <input type="checkbox" disabled={busy} checked={newTeamMembers.includes(a.id)} onChange={e => setNewTeamChoice({
-                        project, members: e.target.checked ? [...newTeamMembers, a.id] : newTeamMembers.filter(id => id !== a.id),
-                      })} /> {a.name}
-                    </label>)}</div>
-                    <p className="small">至少选择两位成员。选定 Agent 将收到需求并可能修改项目，定稿后不再逐步询问。最多 {2 * newTeamMembers.length + 15} 次 Agent 调用；外部接口会接收必要任务信息。暂停、失败或预算耗尽会停止。</p>
-                  </div>}
                   <div className="composer-footer">
-                    <span className="small">{delegateOnCreate ? '将调用选定 Agent，可能消耗其额度' : '仅创建不会消耗模型额度'}</span>
-                    <button className="primary" disabled={!project || !draft.trim() || busy || (delegateOnCreate && newTeamMembers.length < 2)}>{delegateOnCreate ? '创建并授权团队执行' : '创建任务'}</button>
+                    <div className="agent-multiselect-bar" role="group" aria-label="选择参与对话的 Agent">
+                      <button
+                        type="button"
+                        className={'agent-select-pill select-all-pill ' + (isHomeAllSelected ? 'is-selected' : '')}
+                        aria-pressed={isHomeAllSelected}
+                        disabled={busy || readyAgents.length === 0}
+                        onClick={toggleHomeAllAgents}
+                        title={isHomeAllSelected ? '再次点击取消全选' : '点击全选所有就绪 Agent'}
+                      >
+                        <span className="pill-check">{isHomeAllSelected ? '✓' : ''}</span>
+                        <span>全部</span>
+                      </button>
+                      {readyAgents.map(a => {
+                        const selected = homeActiveAgentIds.includes(a.id);
+                        const color = a.color || '#3072d2';
+                        const missing = missingExecutable(a, providers);
+                        return (
+                          <button
+                            key={a.id}
+                            type="button"
+                            className={'agent-select-pill ' + (selected ? 'is-selected' : '') + (missing ? ' is-unavailable' : '')}
+                            aria-pressed={selected}
+                            disabled={busy}
+                            style={{ '--pill-color': color } as React.CSSProperties}
+                            title={missing ? `本机未找到 ${missing}，发送会立即失败` : undefined}
+                            onClick={() => toggleHomeOneAgent(a.id)}
+                          >
+                            <span className="agent-dot" style={{ background: color }} />
+                            <span>{a.name}</span>
+                            {missing && <span className="pill-warn" aria-label="本机 CLI 未找到">!</span>}
+                            {selected && <span className="pill-check">✓</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <button className="primary icon-button send-button" title="开始新会话" aria-label="发送并开始新会话"
+                      disabled={!project || !draft.trim() || busy || (readyAgents.length > 0 && homeActiveAgentIds.length === 0)}>
+                      <ArrowUp />
+                    </button>
                   </div>
                 </form>
-
-                {!project && <p className="notice">请先添加一个本地项目。</p>}
-
+                {readyAgents.length > 0 && homeActiveAgentIds.length === 0 && (
+                  <p className="small compose-notice">请点击上方「全部」或单个 Agent 选择消息接收对象。</p>
+                )}
+                {!project && <p className="notice">请先在左侧「项目」右侧点击「+」关联一个本机代码文件夹。</p>}
               </section>
 
-        </div></div> : !task ? <p className="empty" role="status">正在加载任务…</p> : (
+        </div></div> : !task ? <p className="empty" role="status">正在加载会话…</p> : (
           <div className="task-layout">
-            <div className="task-toolbar">
-              <div className="progress-copy" role="status"><span className={'status-dot ' + (task.status === 'BLOCKED' ? 'attention' : '')} />
-                <span>{progressText}</span>
-                {task.steps.length > 0 && <span className="small">{finishedSteps}/{task.steps.length} 步骤完成</span>}
-              </div>
-              <div className="actions stage-actions">
-                {task.status === 'ACTIVE' && planning && !activeDispatch && !running && (
-                  <button className="primary" disabled={locked} onClick={() => setDialog('discuss')}>讨论方案</button>
-                )}
-                {task.phase === 'EXECUTING' && !approval?.approved && <button className="primary"
-                  disabled={!task.draft_plan} onClick={() => setDialog('plan')}>审阅方案</button>}
-                {task.phase === 'EXECUTING' && approval?.approved && !activeDispatch && !running && task.status === 'ACTIVE' && (
-                  <button className="primary" disabled={locked} onClick={() => setDialog('execute')}>开始执行</button>
-                )}
-                {activeDispatch && !running && task.status === 'ACTIVE' && <button className="primary"
-                  disabled={locked || (['CODE', 'ANALYZE', 'FIX', 'VERIFY'].includes(activeDispatch.kind) && !approval?.approved)}
-                  title={'调用 ' + (agentMap[activeDispatch.role]?.name || activeDispatch.role) + '，将消耗额度'}
-                  onClick={() => act(() => api.triggerRun(taskId, activeDispatch.id))}>执行当前项</button>}
-                {(running || task.status === 'PAUSED') && <button disabled={busy}
-                  title="暂停只停止后续派发，不会终止正在运行的模型"
-                  onClick={() => act(() => task.status === 'PAUSED' ? api.resumeTask(taskId) : api.pauseTask(taskId))}>
-                  {task.status === 'PAUSED' ? '恢复' : '暂停'}
-                </button>}
-              </div>
-            </div>
             {task.status === 'BLOCKED' && <div className="attention-bar" role="alert">
-              当前任务需要处理：{task.block_reason || '请查看失败原因'}
-              <button onClick={() => setTab('details')}>查看并处理</button>
+              当前会话有未完成项：{task.block_reason || '请查看原因'}
+              <button onClick={() => setTab('details')}>查看记录</button>
             </div>}
-            {task.status === 'PAUSED' && <p className="inline-notice">已暂停后续派发；正在运行的模型仍会完成并保留结果。</p>}
+            {task.status === 'PAUSED' && <p className="inline-notice">当前会话已暂停后续派发。</p>}
             <div className="conversation-panel" hidden={tab !== 'progress'}>
-              <TaskChat key={taskId} taskId={taskId}
-                agents={task.team ? agents.filter(a => members.includes(a.id)) : agents}
+              <TaskChat key={taskId} taskId={taskId} projectId={project}
+                agents={agents} providers={providers}
                 completed={task.status === 'COMPLETED'} onPending={setChatPending}
-                onDetails={() => setTab('details')} onTeam={() => setDialog('team')} visible={tab === 'progress'}>
-                <details className="task-brief"><summary>任务需求 <span className="small">版本 {task.revision || 1}</span></summary>
-                  <p className="prose">{task.requirement}</p>
-                </details>
-                {latestReport && <section className="activity-note">
-                  <p className="small">最近协作 · {agentMap[latestReport.role]?.name || latestReport.role} · {label(latestReport.kind)}</p>
-                  <p>{latestReport.report!.summary.length > 180 ? latestReport.report!.summary.slice(0, 180) + '…' : latestReport.report!.summary}</p>
-                  <button onClick={() => setTab('details')}>查看协作记录</button>
-                </section>}
-              </TaskChat>
+                onDetails={() => setTab('details')} visible={tab === 'progress'} />
             </div>
             <div className="detail-scroll" hidden={tab !== 'details'}>
               <div className="reading">
                 <div className="detail-heading"><h2>任务详情</h2><button onClick={() => setTab('progress')}>返回对话</button></div>
                 <p className="small">需求版本 {task.revision || 1} · {label(task.phase)} · {label(task.status)}</p>
                 <div className="actions">
+                  <button disabled={!project} onClick={() => openContext(project)}><Layers aria-hidden="true" />项目上下文与变更</button>
+                  <button disabled={locked || !task} onClick={renameCurrentTask}><Pencil aria-hidden="true" />重命名会话</button>
+                  <button disabled={locked || !task || busy} onClick={deleteCurrentTask}><Trash2 aria-hidden="true" />删除会话</button>
                   <button disabled={!canRevise} onClick={beginEdit}>修改需求</button>
                   {task.status !== 'COMPLETED' && <button disabled={busy} onClick={() => act(() => task.status === 'PAUSED' ? api.resumeTask(taskId) : api.pauseTask(taskId))}>
                     {task.status === 'PAUSED' ? '恢复后续工作' : '暂停后续工作'}</button>}
@@ -682,12 +933,12 @@ export function Workspace() {
                 )}
 
 
-                <details className="card"><summary>协作记录 · {task.dispatches.filter(d => d.report && d.kind !== 'CHAT').length} 项</summary>
+                <details className="card" open><summary>协作记录 · {task.dispatches.filter(d => d.report && d.kind !== 'CHAT').length} 项</summary>
                     {task.dispatches.filter(d => d.report && d.kind !== 'CHAT').map(d => {
                       const ag = agentMap[d.role];
-                      const avatar = (ag?.name || d.role).slice(0, 1).toUpperCase();
+                      const avatar = ag?.avatar || (ag?.name || d.role).slice(0, 1).toUpperCase();
                       const name = ag?.name || d.role;
-                      const color = 'var(--secondary)';
+                      const color = ag?.color || '#3072d2';
                       return (
                         <section key={d.id} className="message">
                           <div className="message-heading">
@@ -719,15 +970,21 @@ export function Workspace() {
                     <h2>步骤与验收标准</h2>
                     {task.steps.map(s => {
                       const assignee = s.assignee ? agentMap[s.assignee] : agentMap['codex'];
+                      const verifier = s.verifier ? agentMap[s.verifier] : undefined;
                       return (
                         <details key={s.id} className="card">
-                          <summary style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <summary style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
                             <span>{s.title} · {label(s.status || '')}</span>
-                            {assignee && (
-                              <span className="agent-tag">
-                                {assignee.name}
-                              </span>
-                            )}
+                            <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                              {assignee && (
+                                <span className="agent-tag" style={{ borderColor: assignee.color || '#3072d2' }}>
+                                  {assignee.avatar} {assignee.name}
+                                </span>
+                              )}
+                              {verifier && (
+                                <span className="badge">验收: {verifier.name}</span>
+                              )}
+                            </span>
                           </summary>
                           <ul>{s.acceptance.map(c => <li key={c}>{c}</li>)}</ul>
                         </details>
@@ -859,21 +1116,28 @@ export function Workspace() {
 
       {task && dialog === 'team' && <Dialog title="任务团队" onClose={() => setDialog('')}>
         <p className="small">成员按能力参与讨论与分工。就绪表示配置可用，不代表登录或额度已经验证。</p>
-        <div className="team-list">{members.map(id => <div key={id} className="team-member">
-          <span className="avatar">{(agentMap[id]?.name || id).slice(0, 1).toUpperCase()}</span>
-          <span>{agentMap[id]?.name || id}</span><span className="small">{agentMap[id]?.ready ? '配置就绪' : '未就绪'}</span>
-        </div>)}</div>
+        <div className="team-list">{members.map(id => {
+          const ag = agentMap[id];
+          const color = ag?.color || '#3072d2';
+          return <div key={id} className="team-member">
+            <span className="avatar" style={{ borderColor: color, color }}>{ag?.avatar || (ag?.name || id).slice(0, 1).toUpperCase()}</span>
+            <strong>{ag?.name || id}</strong>
+            {task.team?.coordinator === id && <span className="badge">统筹规划</span>}
+            {task.team?.reviewer === id && <span className="badge">方案复核</span>}
+            <span className="small">{ag?.ready ? '配置就绪' : '未就绪'}</span>
+          </div>;
+        })}</div>
                 {task.phase === 'PLANNING' && !revisionStarted && (
                   <section className="card">
-                    <h2>任务团队</h2>
+                    <h2>调整参与本任务的成员</h2>
                     <p className="muted">选择参与本任务的成员。规划与执行按能力分工；普通 API 不能修改代码或运行测试。可用配置不代表登录与配额已验证。</p>
                     <div className="actions">
                       {agents.filter(a => a.ready).map(a => {
                         const members = teamChoice.taskId === taskId ? teamChoice.members : task.team?.members || ['codex', 'antigravity'];
-                        return <label key={a.id}>
+                        return <label key={a.id} className="agent-check-pill">
                           <input type="checkbox" disabled={locked} checked={members.includes(a.id)} onChange={e => setTeamChoice({
                             taskId, members: e.target.checked ? [...members, a.id] : members.filter(id => id !== a.id),
-                          })} /> {a.name}
+                          })} /> {a.avatar || ''} {a.name}
                         </label>;
                       })}
                     </div>
@@ -899,12 +1163,12 @@ export function Workspace() {
                               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                         <strong>{s.title} {s.work_kind === 'analysis' ? '· 分析' : '· 开发'}</strong>
                                 {assignee && (
-                                  <span className="agent-tag">
-                                    {assignee.name}
+                                  <span className="agent-tag" style={{ borderColor: assignee.color || '#3072d2' }}>
+                                    {assignee.avatar} {assignee.name}
                                   </span>
                                 )}
                               </div>
-                              {s.verifier && <p className="muted">独立验收：{agentMap[s.verifier]?.name || s.verifier}</p>}
+                              {s.verifier && <p className="muted">独立验收：{agentMap[s.verifier]?.avatar || ''} {agentMap[s.verifier]?.name || s.verifier}</p>}
                               {s.assignment_reason && <p className="muted">分工依据：{s.assignment_reason}</p>}
                               <ul>{s.acceptance.map(c => <li key={c}>{c}</li>)}</ul>
                             </div>
@@ -921,6 +1185,87 @@ export function Workspace() {
             await post(base + '/approve', { digest: approval!.digest }); setDialog('');
           })}>批准此方案</button>
         </>}
+      </Dialog>}
+      {dialog === 'context' && <Dialog title="项目上下文" onClose={() => setDialog('')}>
+        {(() => {
+          const ctx = projects.find(p => p.id === contextProject);
+          return <>
+            <p className="small muted">{ctx ? `${ctx.name} · ${ctx.path}` : '未选择项目'}</p>
+            <p className="small">项目记忆与 README、文件列表会在每次对话派发时一并提供给 Agent。
+              这里的内容本机保存，不写入你的代码仓库。</p>
+            {contextError && <p className="error" role="alert">{contextError}</p>}
+            {contextNote && <p className="small notice" role="status">{contextNote}</p>}
+            {contextLoading && <p className="empty" role="status">正在读取项目信息…</p>}
+
+            <section className="card context-block">
+              <h2><Layers aria-hidden="true" /> 项目记忆</h2>
+              <label className="sr-only" htmlFor="project-memory">项目记忆</label>
+              <textarea id="project-memory" rows={6} value={contextMemory}
+                placeholder="例如：使用 Python 3.9，无第三方依赖；改动必须跑 python3 -m unittest；不要动 .collab/。"
+                onChange={e => setContextMemory(e.target.value)} />
+              <div className="actions">
+                <button type="button" className="primary" disabled={contextLoading || contextMemory === contextSaved}
+                  onClick={() => saveContextMemory(false)}><Save aria-hidden="true" />保存记忆</button>
+                <button type="button" disabled={contextLoading || !contextMemory.trim()}
+                  onClick={() => saveContextMemory(true)}>追加到现有记忆</button>
+                {contextMemory !== contextSaved && <span className="small muted">有未保存的修改</span>}
+              </div>
+            </section>
+
+            <section className="card context-block">
+              <h2><FileDiff aria-hidden="true" /> 代码变更 {contextDiff?.is_git ? `· ${contextDiff.files.length} 个文件` : ''}</h2>
+              {!contextDiff?.is_git && <p className="muted">该项目不是 Git 仓库，无法列出变更或还原文件。</p>}
+              {contextDiff?.is_git && contextDiff.files.length === 0 && <p className="muted">工作区没有未提交的改动。</p>}
+              {contextDiff?.is_git && contextDiff.files.length > 0 && <>
+                <ul className="diff-file-list">{contextDiff.files.map(file => <li key={file.path}>
+                  <code className="diff-status">{file.status}</code>
+                  <span className="diff-path" title={file.path}>{file.path}</span>
+                  <button type="button" disabled={!!revertTarget} onClick={() => revertContextFile(file.path)}>
+                    <RotateCcw aria-hidden="true" />{revertTarget === file.path ? '还原中…' : '还原'}
+                  </button>
+                </li>)}</ul>
+                <p className="small muted">还原已跟踪文件会恢复到 HEAD；未跟踪文件会被删除。平台不会替你确认 Agent 的改动是否正确。</p>
+                <details className="diff-view"><summary>查看统一 diff</summary>
+                  <pre>{contextDiff.diff || '（无文本差异，可能只有未跟踪文件）'}</pre>
+                  {contextDiff.truncated && <p className="small muted">diff 已截断显示。</p>}
+                </details>
+              </>}
+              <div className="actions">
+                <button type="button" disabled={contextLoading} onClick={() => reloadContext(contextProject)}>
+                  <RefreshCw aria-hidden="true" />刷新
+                </button>
+              </div>
+            </section>
+
+            <details className="card context-block"><summary>项目文件 · {contextFiles.length}{contextFilesTruncated ? '+' : ''}</summary>
+              <p className="small muted">点击文件名可只读预览前 12 KB；不会执行任何内容。</p>
+              <ul className="context-file-list">{contextFiles.map(file => <li key={file.path}>
+                <button type="button" className="context-file-name" aria-expanded={preview?.path === file.path}
+                  disabled={!!previewBusy} onClick={() => previewContextFile(file.path)}>
+                  <span className="diff-path" title={file.path}>{file.path}</span>
+                </button>
+                <span className="small muted">{previewBusy === file.path ? '读取中…' : `${file.size} B`}</span>
+              </li>)}</ul>
+              {contextFilesTruncated && <p className="small muted">文件较多，仅显示前 {contextFiles.length} 个。</p>}
+              {preview && <>
+                <div className="artifact-view">
+                  <p className="small">{preview.path} · {preview.size} B{preview.truncated ? ' · 仅显示开头部分' : ''}</p>
+                  <pre>{preview.content}</pre>
+                </div>
+                <div className="actions"><button type="button" onClick={() => setPreview(null)}>收起预览</button></div>
+              </>}
+            </details>
+
+            <details className="card context-block danger-zone"><summary>项目维护</summary>
+              <p className="small muted">删除项目会移除它在本平台的会话、消息与运行记录；你的代码文件不会被删除。此操作不可撤销。</p>
+              <div className="actions">
+                <button type="button" className="danger" disabled={busy || contextLoading} onClick={deleteContextProject}>
+                  <Trash2 aria-hidden="true" />删除此项目及其记录
+                </button>
+              </div>
+            </details>
+          </>;
+        })()}
       </Dialog>}
       {task && ['discuss', 'execute', 'authorize'].includes(dialog) && <Dialog
         title={dialog === 'discuss' ? '开始方案讨论' : dialog === 'execute' ? '开始开发与验收' : '授权团队连续执行'} onClose={() => setDialog('')}>
@@ -949,30 +1294,50 @@ export function Workspace() {
       </Dialog>}
       {managingAgents && <Dialog title="Agent 设置" onClose={() => setManagingAgents(false)}>
         {error && <p className="error" role="alert">{error}</p>}
-            <p className="small muted">自定义 Agent 可通过 OpenAI 兼容接口参与任务讨论并接受只读分析步骤；不能修改项目代码或独立验收。分工须经能力校验和你的方案批准。密钥只从启动服务的环境变量读取。连接测试会发送一条不含任务内容的短消息，可能产生少量模型用量。</p>
+            <p className="small muted">自定义 Agent 有两种接法：OpenAI 兼容接口只能讨论、复核方案和做只读分析；克隆本机 CLI 可继承对应的编码或验收能力。
+              密钥优先读启动服务的环境变量，其次读本机 secrets.json（可选，权限 600，不写入注册数据库）。分工仍须经能力校验和你的方案批准。
+              连接测试会发送一条不含任务内容的短消息，可能产生少量模型用量。</p>
             <p className="small">DeepSeek Harness 是本机 CLI 接入；本机 CLI 仍可能调用云端模型，并不表示离线运行。</p>
             {agents.some(a => a.id === 'deepseek-hermes') && <p className="small">DeepSeek API 是另一种云端接口配置，不是 Harness。旧 ID deepseek-hermes 仅为兼容历史消息。</p>}
 
             <div className="agent-card-list">
               {agents.map(a => (
-                <div key={a.id} className="agent-card">
+                <div key={a.id} className="agent-card" style={{ '--agent-color': a.color || '#3072d2' } as React.CSSProperties}>
                   <div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span className="avatar">{a.name.slice(0, 1).toUpperCase()}</span>
+                      <span className="avatar" style={{ borderColor: a.color || '#3072d2', color: a.color || '#3072d2' }}>{a.avatar || a.name.slice(0, 1).toUpperCase()}</span>
                       <strong>{a.name}</strong>
                       <span className="small muted">({a.id})</span>
                       <span className="badge" style={{ fontSize: 11 }}>{a.type === 'cli' ? '本机 CLI' : 'API 接口'}</span>
                     </div>
                     <p className="small" style={{ margin: '4px 0 0' }}>{a.description || '无描述'}</p>
+                    {a.base_agent && <p className="small muted" style={{ margin: 0 }}>基于 {a.base_agent} 的本机 CLI 配置</p>}
                     {a.endpoint && <p className="small muted" style={{ margin: 0 }}>接口: {a.endpoint} ({a.model})</p>}
+                    {a.system_prompt && <p className="small muted" style={{ margin: 0 }}>系统提示：{a.system_prompt.slice(0, 80)}{a.system_prompt.length > 80 ? '…' : ''}</p>}
+                    {a.type === 'openai_compat' && <p className="small muted" style={{ margin: 0 }}>
+                      {a.has_key ? (a.has_secret_file ? '已配置密钥（本机 secrets.json，可覆盖）' : '已从环境变量读取密钥') : '未配置密钥'}
+                    </p>}
+                    {missingExecutable(a, providers) && <p className="small agent-warning" role="status">
+                      本机 PATH 未找到 {missingExecutable(a, providers)}：发送消息会立即失败。请先安装，或改用 <code>--codex-executable</code> / <code>--antigravity-executable</code> 指定路径后重启服务。
+                    </p>}
                   </div>
                   <div className="agent-card-actions">
                     <button type="button" disabled={busy} onClick={() => act(async () => {
                       await post(`/agents/${a.id}/enabled`, { enabled: !a.enabled });
                       setAgents((await api.getAgents()).agents);
                     })}>{a.enabled ? '停用' : '启用（不会立即调用模型）'}</button>
+                    <button type="button" disabled={busy} onClick={() => beginProfile(a)}>
+                      <Pencil aria-hidden="true" />编辑档案
+                    </button>
+                    {!['codex', 'antigravity', 'deepseek-harness'].includes(a.id) && (
+                      <button type="button" disabled={busy} onClick={() => removeAgent(a)}>
+                        <Trash2 aria-hidden="true" />移除
+                      </button>
+                    )}
                     <span className={`badge ${a.ready ? 'active' : ''}`}>
-                      {!a.ready ? '未配置／已禁用' : a.type === 'openai_compat' ? '配置就绪 · 未验证连接' : '内置 Agent · 调用时验证'}
+                      {!a.ready ? '未配置／已禁用'
+                        : missingExecutable(a, providers) ? '本机 CLI 未找到'
+                        : a.type === 'openai_compat' ? '配置就绪 · 未验证连接' : '内置 Agent · 调用时验证'}
                     </span>
                     {a.type === 'openai_compat' && (
                       <button type="button" disabled={!a.ready || !!probingAgent}
@@ -988,6 +1353,41 @@ export function Workspace() {
                       </span>
                     )}
                   </div>
+                  {profileDraft?.id === a.id && (
+                    <form className="agent-profile-form" onSubmit={saveProfile}>
+                      <p className="small muted">这里修改的是平台配置；系统提示会作为该 Agent 在对话中的角色设定。</p>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                        <label>显示名称<input value={profileDraft.name}
+                          onChange={e => setProfileDraft({ ...profileDraft, name: e.target.value })} /></label>
+                        {a.type === 'openai_compat' && <label>模型名称<input value={profileDraft.model}
+                          onChange={e => setProfileDraft({ ...profileDraft, model: e.target.value })} /></label>}
+                      </div>
+                      <label>定位描述<input value={profileDraft.description}
+                        onChange={e => setProfileDraft({ ...profileDraft, description: e.target.value })} /></label>
+                      <label>系统提示 / 角色设定
+                        <textarea rows={4} value={profileDraft.system_prompt}
+                          placeholder="如：你负责验收，只报告可核查的证据；不确定时明确说不知道。"
+                          onChange={e => setProfileDraft({ ...profileDraft, system_prompt: e.target.value })} />
+                      </label>
+                      {a.type === 'openai_compat' && (
+                        <label>API Key（留空表示不修改）
+                          <input type="password" autoComplete="off" value={profileDraft.secret_key}
+                            placeholder={a.has_secret_file ? '已保存本机密钥' : '粘贴后保存到本机 secrets.json'}
+                            onChange={e => setProfileDraft({ ...profileDraft, secret_key: e.target.value })} />
+                        </label>
+                      )}
+                      <div className="actions">
+                        <button className="primary" type="submit" disabled={savingProfile || !profileDraft.name.trim()}>
+                          {savingProfile ? '保存中…' : '保存档案'}
+                        </button>
+                        {a.type === 'openai_compat' && a.has_secret_file && (
+                          <button type="button" disabled={savingProfile}
+                            onClick={() => clearStoredKey(a.id)}>清除本机密钥</button>
+                        )}
+                        <button type="button" onClick={() => setProfileDraft(null)}>取消</button>
+                      </div>
+                    </form>
+                  )}
                 </div>
               ))}
             </div>
@@ -1002,19 +1402,37 @@ export function Workspace() {
                 <label>接入类型
                   <select value={newAgent.type} onChange={e => setNewAgent({ ...newAgent, type: e.target.value })}>
                     <option value="openai_compat">OpenAI 兼容接口 (DeepSeek/Ollama/vLLM)</option>
+                    <option value="cli">本机 CLI 的独立配置（克隆 Codex / Antigravity / Harness）</option>
                   </select>
                 </label>
-                <label>模型名称<input placeholder="如 deepseek-chat / qwen2.5-coder" value={newAgent.model} onChange={e => setNewAgent({ ...newAgent, model: e.target.value })} /></label>
+                {newAgent.type === 'cli'
+                  ? <label>基于哪个本机 CLI
+                      <select value={newAgent.base_agent || 'codex'} onChange={e => setNewAgent({ ...newAgent, base_agent: e.target.value })}>
+                        <option value="codex">Codex (codex)</option>
+                        <option value="antigravity">Antigravity (agy)</option>
+                        <option value="deepseek-harness">DeepSeek Harness (dsh)</option>
+                      </select>
+                    </label>
+                  : <label>模型名称<input placeholder="如 deepseek-chat / qwen2.5-coder" value={newAgent.model} onChange={e => setNewAgent({ ...newAgent, model: e.target.value })} /></label>}
               </div>
+              {newAgent.type === 'cli' && <label>默认模型（可选，留空使用 CLI 自己的配置）
+                <input placeholder="一般留空" value={newAgent.model} onChange={e => setNewAgent({ ...newAgent, model: e.target.value })} />
+              </label>}
               {newAgent.type === 'openai_compat' && (
                 <>
                   <label>API Endpoint (基础地址)<input placeholder="如 https://api.deepseek.com/v1 或 http://localhost:11434/v1" value={newAgent.endpoint} onChange={e => setNewAgent({ ...newAgent, endpoint: e.target.value })} /></label>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                     <label>API Key 环境变量名<input placeholder="如 DEEPSEEK_API_KEY" value={newAgent.api_key_env} onChange={e => setNewAgent({ ...newAgent, api_key_env: e.target.value })} /></label>
-                    <p className="small muted">公网接口须先在启动服务的终端设置该环境变量；本机 Ollama 可留空。密钥不会保存在项目数据库中。</p>
+                    <label>API Key（可选，保存到本机 secrets.json）<input type="password" autoComplete="off" placeholder="留空则只读环境变量" value={newAgent.secret_key} onChange={e => setNewAgent({ ...newAgent, secret_key: e.target.value })} /></label>
                   </div>
+                  <p className="small muted">环境变量优先于本机保存的密钥；密钥不写入注册数据库，文件权限为 600。</p>
                 </>
               )}
+              <label>系统提示 / 角色设定（可选）
+                <textarea rows={3} value={newAgent.system_prompt}
+                  placeholder="如：你只做只读分析，输出可核查的证据清单。"
+                  onChange={e => setNewAgent({ ...newAgent, system_prompt: e.target.value })} />
+              </label>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 <label>图标 Emoji<input placeholder="如 🧠, 🚀, 🤖" value={newAgent.avatar} onChange={e => setNewAgent({ ...newAgent, avatar: e.target.value })} /></label>
                 <label>主题颜色<input type="color" value={newAgent.color} onChange={e => setNewAgent({ ...newAgent, color: e.target.value })} /></label>

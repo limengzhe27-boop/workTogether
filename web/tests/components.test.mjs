@@ -1,24 +1,53 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ts from 'typescript';
 
-// Compile these leaf components in memory; no DOM runner or generated files needed.
-async function component(filename) {
-  const source = await readFile(new URL('../src/' + filename, import.meta.url), 'utf8');
+// Compile these leaf components (and the local modules they import) in memory;
+// no DOM runner or generated files needed.
+const srcRoot = new URL('../src/', import.meta.url);
+const compiled = new Map();
+
+function resolveLocal(specifier, fromFile) {
+  const base = new URL(specifier, new URL(fromFile, srcRoot));
+  for (const candidate of [base.href, base.href + '.tsx', base.href + '.ts', base.href + '/index.tsx']) {
+    const path = new URL(candidate);
+    if (existsSync(path)) return path.pathname.slice(srcRoot.pathname.length);
+  }
+  throw new Error(`Cannot resolve local module ${specifier} from ${fromFile}`);
+}
+
+async function moduleHref(filename) {
+  if (compiled.has(filename)) return compiled.get(filename);
+  const source = await readFile(new URL(filename, srcRoot), 'utf8');
   const { outputText } = ts.transpileModule(source, {
     fileName: filename,
     compilerOptions: { module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
   });
+  const localSpecifiers = new Set(
+    [...outputText.matchAll(/from (['"])(\.\.?\/[^'"]+)\1/g)].map(match => match[2]));
+  const hrefs = new Map();
+  for (const specifier of localSpecifiers) {
+    hrefs.set(specifier, await moduleHref(resolveLocal(specifier, filename)));
+  }
   const linked = outputText.replace(/from (['"])([^'"]+)\1/g,
-    (_, quote, specifier) => 'from ' + JSON.stringify(import.meta.resolve(specifier)));
-  return import('data:text/javascript;base64,' + Buffer.from(linked).toString('base64'));
+    (_, quote, specifier) => 'from ' + JSON.stringify(
+      hrefs.has(specifier) ? hrefs.get(specifier) : import.meta.resolve(specifier)));
+  const href = 'data:text/javascript;base64,' + Buffer.from(linked).toString('base64');
+  compiled.set(filename, href);
+  return href;
+}
+
+async function component(filename) {
+  return import(await moduleHref(filename));
 }
 
 const { MessageContent } = await component('MessageContent.tsx');
 const { ProjectNavigation } = await component('ProjectNavigation.tsx');
+const { TaskChat } = await component('TaskChat.tsx');
 const renderMessage = text => renderToStaticMarkup(React.createElement(MessageContent, { text }));
 const noop = () => {};
 const navigationProps = {
@@ -62,6 +91,7 @@ test('project tree renders a selected task once and leaves other projects collap
   assert.match(html, /aria-current="page"/);
   assert.match(html, /aria-expanded="true"/);
   assert.match(html, /aria-expanded="false"/);
+  assert.match(html, /aria-label="在 Project One 下新建会话"/);
   assert.match(html, /aria-label="需要处理"/);
   assert.doesNotMatch(html, /未读/);
 });
@@ -69,8 +99,60 @@ test('project tree renders a selected task once and leaves other projects collap
 test('empty workspace keeps add-project, search and mobile settings reachable', () => {
   const html = renderNavigation({ projects: [], project: '', tasks: [], taskId: '' });
   assert.match(html, /添加本地项目后开始协作/);
-  assert.match(html, /class="new-task" disabled=""/);
-  assert.match(html, /添加项目/);
+  assert.match(html, /aria-label="添加项目"/);
   assert.match(html, /aria-label="搜索当前项目任务"/);
   assert.match(html, /aria-label="工作区 Agent 设置"/);
+});
+
+const chatAgent = {
+  id: 'codex', name: 'Codex', type: 'cli', roles: ['chat'], color: '#6366f1',
+  avatar: '🤖', description: '', enabled: true, ready: true,
+};
+const renderChat = props => {
+  // TaskChat polls in an effect and uses useLayoutEffect; server rendering only
+  // checks the static composer markup, so silence the expected SSR warnings.
+  const original = console.error;
+  console.error = () => {};
+  try {
+    return renderToStaticMarkup(React.createElement(TaskChat, {
+      taskId: 't1', projectId: 'p1', agents: [chatAgent], onPending: noop, onDetails: noop,
+      visible: true, ...props,
+    }));
+  } finally {
+    console.error = original;
+  }
+};
+
+test('chat composer exposes file context, write permission and rounds controls', () => {
+  const html = renderChat({});
+  assert.match(html, /引用文件/);
+  assert.match(html, /允许修改/);
+  assert.match(html, /aria-label="选择对话 Agent"/);
+  assert.match(html, /轮次/);
+  assert.match(html, /aria-label="发送消息"/);
+});
+
+test('chat composer explains the no-ready-agent case instead of offering a dead send', () => {
+  const html = renderChat({ agents: [{ ...chatAgent, ready: false }] });
+  assert.match(html, /没有就绪成员/);
+  assert.match(html, /disabled=""/);
+});
+
+test('chat composer does not offer write permission as a default', () => {
+  const html = renderChat({});
+  const writeToggle = html.match(/<input type="checkbox"[^>]*>/g) || [];
+  assert.ok(writeToggle.every(tag => !tag.includes('checked')), 'write permission must default to off');
+});
+
+test('chat composer marks an agent whose local CLI is missing', () => {
+  const html = renderChat({ providers: { codex: { available: false, executable: 'codex' } } });
+  assert.match(html, /本机未找到 codex/);
+  assert.match(html, /is-unavailable/);
+  assert.match(html, /aria-label="本机 CLI 未找到"/);
+});
+
+test('chat composer leaves available CLIs unmarked', () => {
+  const html = renderChat({ providers: { codex: { available: true, executable: 'codex' } } });
+  assert.doesNotMatch(html, /本机未找到/);
+  assert.doesNotMatch(html, /is-unavailable/);
 });

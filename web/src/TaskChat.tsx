@@ -1,8 +1,22 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { request } from './api';
-import { AgentInfo } from './types';
-import { ArrowUp, Plus, ShieldCheck, Copy, Check, ChevronRight } from 'lucide-react';
+import { api, request } from './api';
+import { AgentInfo, ProjectFileEntry } from './types';
+import { ArrowUp, Copy, Check, Paperclip, X, RefreshCw, ShieldAlert } from 'lucide-react';
 import { MessageContent } from './MessageContent';
+
+type ReplyReport = {
+  basis?: string[];
+  suggestions?: string[];
+  next_action?: string;
+  data?: {
+    proposals?: {
+      title: string;
+      work_kind: 'code' | 'analysis';
+      assignee: string;
+      reason: string;
+    }[];
+  };
+};
 
 type Message = {
   id: string;
@@ -12,9 +26,12 @@ type Message = {
   status: string;
   error?: string;
   wait_reason?: string | null;
-  replies: { role: string; content: string; report?: { data?: { proposals?: {
-    title: string; work_kind: 'code' | 'analysis'; assignee: string; reason: string;
-  }[] } } }[];
+  allow_write?: boolean;
+  context_files?: string[];
+  rounds?: number;
+  blocked_role?: string;
+  pending_roles?: string[];
+  replies: { role: string; content: string; report?: ReplyReport; skipped?: boolean }[];
 };
 
 const statusLabels: Record<string, string> = {
@@ -22,38 +39,57 @@ const statusLabels: Record<string, string> = {
   RUNNING: '正在回复',
   DELIVERED: '已回复',
   BLOCKED: '回复中断',
-  NEEDS_REVIEW: '需求变更，待确认',
-  CANCELLED: '已取消（保留记录）',
+  NEEDS_REVIEW: '待确认',
+  CANCELLED: '已取消',
 };
 
 const waitLabels: Record<string, string> = {
-  TASK_PAUSED: '任务已暂停，恢复后才会发送。',
-  TASK_BLOCKED: '当前任务有未解决的问题，请先查看任务阻塞原因。',
-  DISPATCH_UNRESOLVED: '本任务已有派发尚未结束，请查看执行详情；不要重复发送。',
-  WORKFLOW_RUNNING: '正在等待本任务的团队流程让出会话。',
-  RUN_UNRESOLVED: '本任务有运行结果尚未确认，请检查执行详情。',
-  EARLIER_MESSAGE: '正在等待本任务较早的消息处理完毕。',
-  REQUIREMENT_CHANGED: '需求已变更，需要重新确认这条消息。',
-  AGENT_UNAVAILABLE: '下一位接收成员未就绪或已停用，请检查 Agent 配置。',
-  MEMBER_UNRESOLVED: '接收成员在本任务中有未解决的派发，请先检查失败记录。',
+  TASK_PAUSED: '当前会话已暂停，恢复后发送。',
+  TASK_BLOCKED: '当前会话有未解决的问题，请先查看阻塞原因。',
+  DISPATCH_UNRESOLVED: '上一项执行尚未结束，请稍候。',
+  WORKFLOW_RUNNING: '正在等待后台流程结束。',
+  RUN_UNRESOLVED: '有运行结果尚未确认。',
+  EARLIER_MESSAGE: '正在等待上一条消息回复完成。',
+  REQUIREMENT_CHANGED: '上下文已更新，需要重新确认。',
+  AGENT_UNAVAILABLE: '选中的 Agent 未就绪或已停用，请检查 Agent 设置。',
+  MEMBER_UNRESOLVED: '该 Agent 有未解决的失败记录。',
 };
+
+function getAgentBadge(role: string, name: string): { code: string; color: string } {
+  if (role === 'codex') {
+    return { code: 'CX', color: '#6366f1' };
+  }
+  if (role === 'antigravity') {
+    return { code: 'AG', color: '#10b981' };
+  }
+  if (role.startsWith('deepseek')) {
+    return { code: 'DS', color: '#f59e0b' };
+  }
+  return {
+    code: name.slice(0, 2).toUpperCase(),
+    color: '#38bdf8',
+  };
+}
 
 export function TaskChat({
   taskId,
+  projectId,
   agents,
+  providers,
   completed,
   onPending,
   onDetails,
-  onTeam,
   visible,
   children,
 }: {
   taskId: string;
+  projectId?: string;
   agents: AgentInfo[];
-  completed: boolean;
+  providers?: Record<string, { available: boolean; executable: string }> | null;
+  completed?: boolean;
   onPending: (pending: boolean) => void;
   onDetails: () => void;
-  onTeam: () => void;
+  onTeam?: () => void;
   visible: boolean;
   children?: React.ReactNode;
 }) {
@@ -62,6 +98,7 @@ export function TaskChat({
   const previousVersion = useRef('');
   const [unseen, setUnseen] = useState(false);
   const [copied, setCopied] = useState('');
+  const [expandedReplies, setExpandedReplies] = useState<Record<string, boolean>>({});
   const [loadError, setLoadError] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -72,19 +109,57 @@ export function TaskChat({
       return '';
     }
   });
-  const [recipient, setRecipient] = useState('all');
+  const [selectedIds, setSelectedIds] = useState<string[] | null>(null);
   const [id, setId] = useState(() => crypto.randomUUID());
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
   const [tick, setTick] = useState(0);
-  const bothReady = ['codex', 'antigravity'].every(id => agents.some(a => a.id === id && a.ready));
-  useEffect(() => {
-    if ((recipient === 'both' && !bothReady) ||
-        (!['all', 'both'].includes(recipient) && !agents.some(a => a.id === recipient && a.ready))) {
-      setRecipient('all');
-      setId(crypto.randomUUID());
+  const [allowWrite, setAllowWrite] = useState(false);
+  const [rounds, setRounds] = useState(1);
+  const [contextFiles, setContextFiles] = useState<string[]>([]);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [projectFiles, setProjectFiles] = useState<ProjectFileEntry[]>([]);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [fileFilter, setFileFilter] = useState('');
+  const [resolving, setResolving] = useState('');
+
+  const readyAgents = React.useMemo(() => agents.filter(a => a.enabled && a.ready), [agents]);
+  const readyIds = React.useMemo(() => readyAgents.map(a => a.id), [readyAgents]);
+  const missingCli = React.useCallback((agent: AgentInfo) => {
+    if (agent.type !== 'cli' || !providers) return '';
+    const info = providers[agent.base_agent || agent.id];
+    return info && !info.available ? info.executable : '';
+  }, [providers]);
+  const activeAgentIds = React.useMemo(() => {
+    if (selectedIds === null) return readyIds;
+    return readyIds.filter(id => selectedIds.includes(id));
+  }, [selectedIds, readyIds]);
+  const isAllSelected = readyIds.length > 0 && activeAgentIds.length === readyIds.length;
+
+  function toggleAllAgents() {
+    if (isAllSelected) {
+      setSelectedIds([]);
+    } else {
+      setSelectedIds([...readyIds]);
     }
-  }, [agents, recipient, bothReady]);
+    setId(crypto.randomUUID());
+  }
+
+  function toggleOneAgent(agentId: string) {
+    if (activeAgentIds.includes(agentId)) {
+      setSelectedIds(activeAgentIds.filter(x => x !== agentId));
+    } else {
+      setSelectedIds(readyIds.filter(x => x === agentId || activeAgentIds.includes(x)));
+    }
+    setId(crypto.randomUUID());
+  }
+
+  const recipientValue = React.useMemo(() => {
+    if (activeAgentIds.length === 0) return '';
+    if (activeAgentIds.length === readyIds.length) return 'all';
+    if (activeAgentIds.length === 1) return activeAgentIds[0];
+    return activeAgentIds.join(',');
+  }, [activeAgentIds, readyIds]);
 
   const agentMap = React.useMemo(() => {
     const map: Record<string, AgentInfo> = {};
@@ -122,17 +197,25 @@ export function TaskChat({
 
   async function send(e: React.FormEvent) {
     e.preventDefault();
-    if (sending || !text.trim() || !agents.some(a => a.ready)) return;
+    if (sending || !text.trim() || !recipientValue) return;
     setSending(true);
     setError('');
     try {
+      const payload: Record<string, unknown> = { message_id: id, recipient: recipientValue, content: text.trim() };
+      if (allowWrite) payload.allow_write = true;
+      if (contextFiles.length > 0) payload.context_files = contextFiles;
+      if (rounds === 2) payload.rounds = 2;
       await request(`/tasks/${taskId}/messages`, {
         method: 'POST',
-        body: JSON.stringify({ message_id: id, recipient, content: text.trim() }),
+        body: JSON.stringify(payload),
       });
       nearBottom.current = true;
       setText('');
       setId(crypto.randomUUID());
+      setContextFiles([]);
+      setAllowWrite(false);
+      setRounds(1);
+      setPickerOpen(false);
       onPending(true);
       setTick(n => n + 1);
       try {
@@ -145,6 +228,42 @@ export function TaskChat({
     } finally {
       setSending(false);
     }
+  }
+
+  async function resolveMessage(messageId: string, action: 'skip' | 'retry') {
+    if (resolving) return;
+    setResolving(messageId + action);
+    setError('');
+    try {
+      await api.resolveMessage(taskId, messageId, action);
+      setTick(n => n + 1);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setResolving('');
+    }
+  }
+
+  async function togglePicker() {
+    const next = !pickerOpen;
+    setPickerOpen(next);
+    if (!next || !projectId || projectFiles.length > 0) return;
+    setFilesLoading(true);
+    try {
+      const result = await api.getProjectFiles(projectId);
+      setProjectFiles(result.files);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setFilesLoading(false);
+    }
+  }
+
+  function toggleContextFile(path: string) {
+    setContextFiles(current => current.includes(path)
+      ? current.filter(item => item !== path)
+      : current.length >= 10 ? current : [...current, path]);
+    setId(crypto.randomUUID());
   }
 
   const messageVersion = JSON.stringify(messages);
@@ -163,8 +282,11 @@ export function TaskChat({
   }, [messageVersion, loaded, visible]);
 
   function getRecipientLabel(rec: string) {
-    if (rec === 'all') return '本任务成员';
+    if (rec === 'all') return '全部';
     if (rec === 'both') return 'Codex + Antigravity';
+    if (rec.includes(',')) {
+      return rec.split(',').map(part => agentMap[part]?.name || part).join(' + ');
+    }
     return agentMap[rec]?.name || rec;
   }
 
@@ -180,9 +302,7 @@ export function TaskChat({
           {children}
           {!loaded && !loadError && <p className="empty" role="status">正在读取对话…</p>}
           {loaded && messages.length === 0 && <div className="chat-empty">
-            <h2>在这里，和团队聊一聊</h2>
-            <p>补充想法、询问进展，或一起推敲方案。</p>
-            <p className="small">要拆分任务并开始工作，请使用上方的“讨论方案”。</p>
+            <p>在下方选择要对话的 Agent（支持多选或全选），直接发送消息开始交流。</p>
           </div>}
           {messages.map(m => <article className="chat-turn" key={m.id}>
             {typeof m.created_at === 'number' && <time className="message-time" dateTime={new Date(m.created_at * 1000).toISOString()}>
@@ -191,38 +311,97 @@ export function TaskChat({
             <div className="user-message">
               <span className="sr-only">你，发给 {getRecipientLabel(m.recipient)}</span>
               <p className="prose">{m.content}</p>
-              {m.status !== 'DELIVERED' && <span className="message-status small">{statusLabels[m.status] || m.status}</span>}
+              <div className="user-message-meta">
+                {m.recipient !== 'all' && <span className="small">@{getRecipientLabel(m.recipient)}</span>}
+                {m.allow_write && <span className="message-flag" title="本次允许被选中的 Agent 直接修改项目文件">允许修改</span>}
+                {!!m.rounds && m.rounds > 1 && <span className="message-flag">{m.rounds} 轮发言</span>}
+                {!!m.context_files?.length && <span className="message-flag" title={m.context_files.join('\n')}>
+                  <Paperclip aria-hidden="true" />{m.context_files.length} 个文件
+                </span>}
+                {m.status !== 'DELIVERED' && <span className="message-status small">{statusLabels[m.status] || m.status}</span>}
+              </div>
             </div>
             {m.error && <p className={m.status === 'CANCELLED' ? 'wait-note small' : 'error small'}
               role={m.status === 'CANCELLED' ? undefined : 'alert'}>{m.error} <button type="button" onClick={onDetails}>查看详情</button></p>}
+            {m.status === 'BLOCKED' && (
+              <div className="message-recovery small">
+                <span>{m.blocked_role ? `${agentMap[m.blocked_role]?.name || m.blocked_role} 的回复中断。` : '回复中断。'}</span>
+                <button type="button" disabled={!!resolving} onClick={() => resolveMessage(m.id, 'retry')}>
+                  <RefreshCw aria-hidden="true" />{resolving === m.id + 'retry' ? '重试中…' : '重试该 Agent'}
+                </button>
+                <button type="button" disabled={!!resolving} onClick={() => resolveMessage(m.id, 'skip')}>
+                  {resolving === m.id + 'skip' ? '跳过中…' : '跳过并继续下一位'}
+                </button>
+              </div>
+            )}
             {m.status === 'QUEUED' && m.wait_reason && <p className="wait-note small" role="status">
               {waitLabels[m.wait_reason] || m.wait_reason}
               <button type="button" onClick={onDetails}>查看详情</button>
             </p>}
-            {m.replies.map((r, i) => {
-              const name = agentMap[r.role]?.name || r.role;
-              return <div key={i} className="agent-message">
-                <div className="reply-heading"><strong>{name}</strong><button type="button" className="icon-button" aria-label={'查看 ' + name + ' 的协作详情'} title="查看任务详情" onClick={onDetails}><ChevronRight /></button></div>
-                <div className="agent-message-body">
-                  <MessageContent text={r.content} />
-                  {!!r.report?.data?.proposals?.length && <details>
-                    <summary>工作建议 · {r.report.data.proposals.length} 项</summary>
-                    <ul>{r.report.data.proposals.map((proposal, index) => <li key={index}>
-                      {proposal.title} · {proposal.work_kind === 'analysis' ? '分析' : '开发'}
-                      {' → '}{agentMap[proposal.assignee]?.name || proposal.assignee}：{proposal.reason}
-                    </li>)}</ul>
-                  </details>}
-                  <div className="reply-actions">
-                    <button type="button" className="icon-button" aria-label={copied === m.id + ':' + i ? '已复制回复' : '复制 ' + name + ' 的回复'} title="复制回复"
-                      onClick={async () => {
-                        try { await navigator.clipboard.writeText(r.content); setCopied(m.id + ':' + i); }
-                        catch { setError('无法自动复制，请手动选择回复文字并复制。'); }
-                      }}>{copied === m.id + ':' + i ? <Check /> : <Copy />}</button>
-                    {copied === m.id + ':' + i && <span className="small" role="status">已复制</span>}
+            <div className="turn-replies">
+              {m.replies.map((r, i) => {
+                const ag = agentMap[r.role];
+                const name = ag?.name || r.role;
+                const badge = getAgentBadge(r.role, name);
+                const color = ag?.color || badge.color;
+                const replyKey = `${m.id}:${i}`;
+                const isLong = r.content.length > 340 || r.content.split('\n').length > 8;
+                const isExpanded = !!expandedReplies[replyKey];
+                const basis = r.report?.basis?.filter(Boolean) || [];
+                const suggestions = r.report?.suggestions?.filter(Boolean) || [];
+                const metaCount = basis.length + suggestions.length;
+
+                return <div key={i} className="agent-message" data-agent={r.role} style={{ '--agent-color': color } as React.CSSProperties}>
+                  <div className="reply-heading">
+                    <span className="agent-monogram" style={{ background: color }}>{badge.code}</span>
+                    <strong className="reply-agent-name" style={{ color }}>{name}</strong>
+                    <div className="reply-heading-actions">
+                      <button type="button" className="icon-button" aria-label={copied === replyKey ? '已复制回复' : '复制 ' + name + ' 的回复'} title="复制回复"
+                        onClick={async () => {
+                          try { await navigator.clipboard.writeText(r.content); setCopied(replyKey); }
+                          catch { setError('无法自动复制，请手动选择回复文字并复制。'); }
+                        }}>{copied === replyKey ? <Check /> : <Copy />}</button>
+                    </div>
                   </div>
-                </div>
-              </div>;
-            })}
+                  <div className={'agent-message-body ' + (isLong && !isExpanded ? 'is-clamped' : '')}>
+                    <MessageContent text={r.content} />
+                  </div>
+                  {isLong && (
+                    <button type="button" className="reply-expand-btn" onClick={() => setExpandedReplies(prev => ({ ...prev, [replyKey]: !isExpanded }))}>
+                      {isExpanded ? '收起长文' : '展开完整回复'}
+                    </button>
+                  )}
+                  {(metaCount > 0 || !!r.report?.data?.proposals?.length) && (
+                    <div className="reply-folds">
+                      {metaCount > 0 && (
+                        <details className="reply-meta-box">
+                          <summary>依据与建议 ({metaCount})</summary>
+                          {basis.length > 0 && (
+                            <div className="meta-group">
+                              <span className="meta-label">判断依据</span>
+                              <ul>{basis.map((b, idx) => <li key={idx}>{b}</li>)}</ul>
+                            </div>
+                          )}
+                          {suggestions.length > 0 && (
+                            <div className="meta-group">
+                              <span className="meta-label">建议下一步</span>
+                              <ul>{suggestions.map((s, idx) => <li key={idx}>{s}</li>)}</ul>
+                            </div>
+                          )}
+                        </details>
+                      )}
+                      {!!r.report?.data?.proposals?.length && <details className="reply-meta-box">
+                        <summary>协作建议 ({r.report.data.proposals.length})</summary>
+                        <ul>{r.report.data.proposals.map((proposal, index) => <li key={index}>
+                          <strong>{proposal.title}</strong>
+                          {' → '}{agentMap[proposal.assignee]?.name || proposal.assignee}：{proposal.reason}
+                        </li>)}</ul>
+                      </details>}
+                    </div>
+                  )}
+                </div>;
+              })}
+            </div>
           </article>)}
         </div>
       </div>
@@ -233,10 +412,19 @@ export function TaskChat({
       <div className="chat-compose-wrap">
         {loadError && <p className="error small" role="alert">对话读取失败：{loadError}</p>}
         {error && <p role="alert" className="error small">{error}</p>}
-        {completed && <p className="small compose-notice">任务已完成，仍可交流；继续开发需修改需求并重新规划。</p>}
+        {completed && <p className="small compose-notice">任务已完成，可继续自由对话。</p>}
         <form onSubmit={send} className="chat-composer">
+          {contextFiles.length > 0 && (
+            <div className="context-chips" aria-label="已引用的项目文件">
+              {contextFiles.map(path => <span key={path} className="context-chip">
+                <Paperclip aria-hidden="true" />
+                <span title={path}>{path}</span>
+                <button type="button" aria-label={'移除引用 ' + path} onClick={() => toggleContextFile(path)}><X aria-hidden="true" /></button>
+              </span>)}
+            </div>
+          )}
           <textarea aria-label="对话消息" disabled={sending} rows={2}
-            placeholder="向团队发送消息…"
+            placeholder="输入消息… (⌘ + Enter 发送)"
             value={text} onKeyDown={e => {
               if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.nativeEvent.isComposing) {
                 e.preventDefault(); e.currentTarget.form?.requestSubmit();
@@ -246,26 +434,96 @@ export function TaskChat({
               setText(e.target.value); setId(crypto.randomUUID());
               try { localStorage.setItem('wt:chat:' + taskId, e.target.value); } catch { /* Optional storage */ }
             }} />
+          {pickerOpen && (
+            <div className="file-picker">
+              <div className="file-picker-head">
+                <strong>引用项目文件</strong>
+                <span className="small muted">{projectId ? '最多 10 个，内容随本条消息发送' : '未选择项目'}</span>
+              </div>
+              <input type="search" aria-label="过滤项目文件" placeholder="过滤文件名…"
+                value={fileFilter} onChange={e => setFileFilter(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Escape') { e.preventDefault(); setPickerOpen(false); } }} />
+              {filesLoading && <p className="small" role="status">正在读取文件列表…</p>}
+              {!filesLoading && projectFiles.length === 0 && <p className="small muted">没有可引用的文件。</p>}
+              <ul className="file-picker-list">
+                {projectFiles
+                  .filter(file => file.path.toLocaleLowerCase().includes(fileFilter.trim().toLocaleLowerCase()))
+                  .slice(0, 200)
+                  .map(file => <li key={file.path}>
+                    <label>
+                      <input type="checkbox" checked={contextFiles.includes(file.path)}
+                        onChange={() => toggleContextFile(file.path)} />
+                      <span title={file.path}>{file.path}</span>
+                      <span className="small muted">{file.size} B</span>
+                    </label>
+                  </li>)}
+              </ul>
+            </div>
+          )}
           <div className="chat-composer-footer">
-            <button className="icon-button composer-team" type="button" aria-label="管理任务团队" title="查看任务团队" onClick={onTeam}><Plus /></button>
-            <details className="chat-policy"><summary><ShieldCheck /><span>仅交流</span></summary>
-              <p>本任务的已就绪成员依次回复一次，后发言者会看到前面的简要回复。发送会消耗 Agent 额度，外部服务会接收本任务的必要上下文；不会自动修改方案或启动开发。</p>
-            </details>
-            <label className="recipient-field"><span className="sr-only">消息接收者</span>
-              <select aria-label="消息接收者" value={recipient} disabled={sending} onChange={e => {
-                setRecipient(e.target.value); setId(crypto.randomUUID());
-              }}>
-                <option value="all">整个任务团队</option>
-                {bothReady && <option value="both">Codex + Antigravity</option>}
-                {agents.filter(a => a.enabled && a.ready).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-              </select>
-            </label>
-            <button className="primary icon-button send-button" aria-label={sending ? '发送中' : '发送消息'} title="⌘ / Ctrl + Enter 发送" disabled={sending || !text.trim() || !agents.some(a => a.ready)}>
-              <ArrowUp /><span className="sr-only">{sending ? '发送中…' : '发送消息'}</span>
-            </button>
+            <div className="agent-multiselect-bar" role="group" aria-label="选择对话 Agent">
+              <button
+                type="button"
+                className={'agent-select-pill select-all-pill ' + (isAllSelected ? 'is-selected' : '')}
+                aria-pressed={isAllSelected}
+                disabled={sending || readyAgents.length === 0}
+                onClick={toggleAllAgents}
+                title={isAllSelected ? '再次点击取消全选' : '点击全选所有就绪 Agent'}
+              >
+                <span className="pill-check">{isAllSelected ? '✓' : ''}</span>
+                <span>全部</span>
+              </button>
+              {readyAgents.map(a => {
+                const selected = activeAgentIds.includes(a.id);
+                const color = a.color || '#3072d2';
+                const missing = missingCli(a);
+                return (
+                  <button
+                    key={a.id}
+                    type="button"
+                    className={'agent-select-pill ' + (selected ? 'is-selected' : '') + (missing ? ' is-unavailable' : '')}
+                    aria-pressed={selected}
+                    disabled={sending}
+                    style={{ '--pill-color': color } as React.CSSProperties}
+                    title={missing ? `本机未找到 ${missing}，发送会立即失败` : undefined}
+                    onClick={() => toggleOneAgent(a.id)}
+                  >
+                    <span className="agent-dot" style={{ background: color }} />
+                    <span>{a.name}</span>
+                    {missing && <span className="pill-warn" aria-label="本机 CLI 未找到">!</span>}
+                    {selected && <span className="pill-check">✓</span>}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="composer-right-tools">
+              <button type="button" className={'composer-tool' + (pickerOpen ? ' is-active' : '')}
+                aria-pressed={pickerOpen} disabled={sending || !projectId} title="引用项目文件作为本次上下文"
+                onClick={togglePicker}>
+                <Paperclip aria-hidden="true" /><span>引用文件</span>
+              </button>
+              <label className={'composer-tool composer-toggle' + (allowWrite ? ' is-active' : '')}
+                title="勾选后本条消息的接收者可创建或修改项目文件；仍受各自 CLI 的沙箱与你的确认限制">
+                <input type="checkbox" checked={allowWrite} disabled={sending}
+                  onChange={e => { setAllowWrite(e.target.checked); setId(crypto.randomUUID()); }} />
+                <ShieldAlert aria-hidden="true" /><span>允许修改</span>
+              </label>
+              <label className="composer-rounds" title="多于一位成员时，可让每人发言两轮">
+                <span className="small">轮次</span>
+                <select value={rounds} disabled={sending || activeAgentIds.length < 2}
+                  onChange={e => { setRounds(Number(e.target.value)); setId(crypto.randomUUID()); }}>
+                  <option value={1}>1</option>
+                  <option value={2}>2</option>
+                </select>
+              </label>
+              <button className="primary icon-button send-button" aria-label={sending ? '发送中' : '发送消息'} title="⌘ / Ctrl + Enter 发送" disabled={sending || !text.trim() || !recipientValue}>
+                <ArrowUp /><span className="sr-only">{sending ? '发送中…' : '发送消息'}</span>
+              </button>
+            </div>
           </div>
         </form>
-        {!agents.some(a => a.ready) && <p className="small error">没有就绪成员，请先检查团队与 Agent 设置。</p>}
+        {readyAgents.length > 0 && activeAgentIds.length === 0 && <p className="small compose-notice">请点击上方「全部」或单个 Agent 选择消息接收对象。</p>}
+        {!agents.some(a => a.ready) && <p className="small error">没有就绪成员，请先检查左下角 Agent 设置。</p>}
       </div>
     </section>
   );

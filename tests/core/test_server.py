@@ -119,7 +119,8 @@ class ServerApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data["status"], "ok")
         self.assertIn("delegate-team", data["features"])
-        self.assertEqual("v1.1", data["version"])
+        self.assertIn("project-context", data["features"])
+        self.assertEqual("v1.2", data["version"])
 
         self.server.provider_status = {"antigravity": {"available": False, "executable": "agy"}}
         status, data = execute_request(self.server, "GET", "/api/health")

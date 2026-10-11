@@ -29,7 +29,9 @@ def _open_no_redirect(request, timeout):
 def probe_openai_compatible(agent):
     """Explicit, bounded, task-free model call to check a configured API agent."""
     require(agent.type == "openai_compat" and agent.enabled, "API agent is not enabled", "UNSUPPORTED_PROVIDER")
-    key = os.environ.get(agent.api_key_env, "") if agent.api_key_env else ""
+    key = agent.resolve_api_key() if hasattr(agent, "resolve_api_key") else (
+        os.environ.get(agent.api_key_env, "") if agent.api_key_env else ""
+    )
     if not local_endpoint(agent.endpoint) and not key:
         return {"agent_id": agent.id, "connected": False, "code": "MISSING_KEY",
                 "message": "服务端尚未配置 API Key"}
@@ -81,9 +83,12 @@ class OpenAICompatibleRuntime(Runtime):
         self.endpoint = agent_config.endpoint.rstrip("/")
         self.model = agent_config.model
         self.api_key_env = agent_config.api_key_env
+        self.system_prompt = getattr(agent_config, "system_prompt", "")
         self.require_approval = True
 
     def get_api_key(self) -> str:
+        if hasattr(self.agent, "resolve_api_key"):
+            return self.agent.resolve_api_key()
         return os.environ.get(self.api_key_env, "") if self.api_key_env else ""
 
     def command(self, run, dispatch):
@@ -144,13 +149,14 @@ class OpenAICompatibleRuntime(Runtime):
         else:
             # Live HTTP Call
             url = f"{self.endpoint}/chat/completions"
+            persona_suffix = f" {self.system_prompt}" if self.system_prompt else ""
             payload = {
                 "model": self.model,
                 "messages": [
                     {
                         "role": "system",
                         "content": (
-                            f"You are {self.agent.name}, an AI collaborator in the WorkTogether platform. "
+                            f"You are {self.agent.name}, an AI collaborator in the WorkTogether platform.{persona_suffix} "
                             "Follow all response instructions strictly. Return ONLY a valid JSON object matching the required schema."
                         ),
                     },
@@ -171,17 +177,24 @@ class OpenAICompatibleRuntime(Runtime):
                     require(len(raw) <= 2_000_000, "Provider response exceeds 2 MB", "PROVIDER_FAILED")
                     resp_data = json.loads(raw.decode("utf-8"))
                     choice = resp_data.get("choices", [{}])[0]
-                    content = choice.get("message", {}).get("content", "").strip()
+                    raw_content = choice.get("message", {}).get("content")
+                    if not isinstance(raw_content, str) or not raw_content.strip():
+                        raise ValueError("Empty chat completion content")
+                    content = raw_content.strip()
                     usage = resp_data.get("usage", {})
-                    # Clean markdown code blocks if wrapped
-                    if content.startswith("```"):
-                        lines = content.splitlines()
-                        if lines[0].startswith("```"):
-                            lines = lines[1:]
-                        if lines and lines[-1].startswith("```"):
-                            lines = lines[:-1]
-                        content = "\n".join(lines).strip()
-                    report = json.loads(content)
+                    if d["kind"] == "CHAT":
+                        from .runtime import normalize_chat_report
+                        report = normalize_chat_report(content, d)
+                    else:
+                        # Clean markdown code blocks if wrapped
+                        if content.startswith("```"):
+                            lines = content.splitlines()
+                            if lines[0].startswith("```"):
+                                lines = lines[1:]
+                            if lines and lines[-1].startswith("```"):
+                                lines = lines[:-1]
+                            content = "\n".join(lines).strip()
+                        report = json.loads(content)
             except (urllib.error.URLError, ValueError, TypeError, AttributeError,
                     KeyError, IndexError, TimeoutError, CollabError) as exc:
                 err_msg = f"{type(exc).__name__}: {exc}"

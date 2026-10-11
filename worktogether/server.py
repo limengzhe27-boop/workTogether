@@ -124,8 +124,12 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
         try:
             # 1. Health check
             if path == "/api/health":
-                return self._send_json(HTTPStatus.OK, {"status": "ok", "version": "v1.1",
-                                                       "features": ["task-teams", "bounded-team-discussion", "delegate-team", "deepseek-harness"],
+                return self._send_json(HTTPStatus.OK, {"status": "ok", "version": "v1.2",
+                                                       "features": ["task-teams", "bounded-team-discussion",
+                                                                    "delegate-team", "deepseek-harness",
+                                                                    "project-context", "project-memory",
+                                                                    "file-references", "per-message-write",
+                                                                    "project-diff"],
                                                        "providers": getattr(self.server, "provider_status", {})})
             if path == "/api/agents":
                 from .agents import AgentRegistry
@@ -159,6 +163,38 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                 proj_id = m_proj.group(1)
                 doc = self.engine.doctor(proj_id)
                 return self._send_json(HTTPStatus.OK, doc)
+
+            m_proj_files = re.fullmatch(r"/api/projects/([^/]+)/files", path)
+            if m_proj_files:
+                from .workspace import project_files_snapshot
+                doc = self.engine.doctor(m_proj_files.group(1))
+                snapshot = project_files_snapshot(doc["project"]["path"], limit=250)
+                return self._send_json(HTTPStatus.OK, {"project_id": doc["project"]["id"], **snapshot})
+
+            m_proj_memory = re.fullmatch(r"/api/projects/([^/]+)/memory", path)
+            if m_proj_memory:
+                doc = self.engine.doctor(m_proj_memory.group(1))
+                return self._send_json(HTTPStatus.OK, {"project_id": doc["project"]["id"],
+                                                       "memory": doc["project"].get("memory", "")})
+
+            m_proj_file = re.fullmatch(r"/api/projects/([^/]+)/file", path)
+            if m_proj_file:
+                from .workspace import read_project_files
+                requested = (query.get("path") or [""])[0]
+                doc = self.engine.doctor(m_proj_file.group(1))
+                found = read_project_files(doc["project"]["path"], [requested])
+                if not found:
+                    raise CollabError("NOT_FOUND",
+                                      "File not found, not readable, or outside the project workspace")
+                return self._send_json(HTTPStatus.OK,
+                                       {"project_id": doc["project"]["id"], **found[0]})
+
+            m_proj_diff = re.fullmatch(r"/api/projects/([^/]+)/diff", path)
+            if m_proj_diff:
+                from .workspace import project_diff
+                doc = self.engine.doctor(m_proj_diff.group(1))
+                return self._send_json(HTTPStatus.OK,
+                                       {"project_id": doc["project"]["id"], **project_diff(doc["project"]["path"])})
 
             # 4. List tasks for a project
             m_proj_tasks = re.match(r"^/api/projects/([^/]+)/tasks$", path)
@@ -272,11 +308,22 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                 return self._send_json(HTTPStatus.CREATED, created)
             m_agent_probe = re.fullmatch(r"/api/agents/([a-z][a-z0-9-]{0,63})/probe", path)
             m_agent_enabled = re.fullmatch(r"/api/agents/([a-z][a-z0-9-]{0,63})/enabled", path)
+            m_agent_profile = re.fullmatch(r"/api/agents/([a-z][a-z0-9-]{0,63})/profile", path)
+            m_agent_delete = re.fullmatch(r"/api/agents/([a-z][a-z0-9-]{0,63})/delete", path)
             if m_agent_enabled:
                 if set(body) != {"enabled"}:
                     raise CollabError("INVALID_INPUT", "enabled boolean required")
                 from .agents import AgentRegistry
                 return self._send_json(200, AgentRegistry(self.engine).set_enabled(m_agent_enabled.group(1), body["enabled"]))
+            if m_agent_profile:
+                from .agents import AgentRegistry
+                return self._send_json(200, AgentRegistry(self.engine).update_profile(m_agent_profile.group(1), body))
+            if m_agent_delete:
+                from .agents import AgentRegistry
+                removed = AgentRegistry(self.engine).remove(
+                    m_agent_delete.group(1), cancel_queued=bool(body.get("cancel_queued", True))
+                )
+                return self._send_json(200, {"removed": removed, "deleted": removed, "agent_id": m_agent_delete.group(1)})
             if m_agent_probe:
                 if body:
                     raise CollabError("INVALID_INPUT", "Connection probe takes no task data")
@@ -289,9 +336,14 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                 return self._send_json(HTTPStatus.OK, probe_openai_compatible(agent))
             m_messages = re.fullmatch(r"/api/tasks/([^/]+)/messages", path)
             if m_messages:
-                if set(body) != {"message_id", "recipient", "content"}:
+                allowed_keys = {"message_id", "recipient", "content", "allow_write", "context_files", "referenced_task_ids", "rounds"}
+                if not {"message_id", "recipient", "content"}.issubset(set(body)) or set(body) - allowed_keys:
                     raise CollabError("INVALID_INPUT", "message_id, recipient and content required")
                 return self._send_json(202, self.engine.message_add(m_messages.group(1), **body))
+            m_msg_resolve = re.fullmatch(r"/api/tasks/([^/]+)/messages/([^/]+)/resolve", path)
+            if m_msg_resolve:
+                action = body.get("action", "skip")
+                return self._send_json(200, self.engine.message_resolve(m_msg_resolve.group(1), m_msg_resolve.group(2), action=action))
 
             m_revision = re.fullmatch(r"/api/tasks/([^/]+)/revisions", path)
             if m_revision:
@@ -336,6 +388,41 @@ class WorkTogetherHandler(BaseHTTPRequestHandler):
                     raise CollabError("INVALID_INPUT", "Recovery does not accept overrides")
                 manager = getattr(self.server, m_recover.group(2) + "_jobs")
                 return self._send_json(200, manager.recover(m_recover.group(1), m_recover.group(3)))
+
+            # Project memory, revert-file, delete
+            m_proj_memory = re.fullmatch(r"/api/projects/([^/]+)/memory", path)
+            if m_proj_memory:
+                allowed = {"memory", "append"}
+                if set(body) - allowed or "memory" not in body:
+                    raise CollabError("INVALID_INPUT", "memory is required")
+                if body.get("append"):
+                    project = self.engine.doctor(m_proj_memory.group(1))["project"]
+                    existing = project.get("memory", "")
+                    merged = (existing + "\n" + body["memory"]).strip() if existing else body["memory"]
+                    updated = self.engine.project_memory_update(m_proj_memory.group(1), merged)
+                else:
+                    updated = self.engine.project_memory_update(m_proj_memory.group(1), body["memory"])
+                return self._send_json(200, {"project_id": updated["id"], "memory": updated.get("memory", "")})
+            m_proj_revert = re.fullmatch(r"/api/projects/([^/]+)/revert-file", path)
+            if m_proj_revert:
+                from .workspace import revert_project_file
+                doc = self.engine.doctor(m_proj_revert.group(1))
+                result = revert_project_file(doc["project"]["path"], body.get("path", ""))
+                return self._send_json(200, {"reverted": True, "path": result["reverted"], "mode": result["mode"]})
+            m_proj_delete = re.fullmatch(r"/api/projects/([^/]+)/delete", path)
+            if m_proj_delete:
+                result = self.engine.project_delete(m_proj_delete.group(1))
+                return self._send_json(200, {"deleted": True, "project_id": result["deleted"],
+                                             "tasks_removed": result["tasks_removed"]})
+
+            # Task rename, delete
+            m_task_rename = re.fullmatch(r"/api/tasks/([^/]+)/rename", path)
+            if m_task_rename:
+                return self._send_json(200, self.engine.task_rename(m_task_rename.group(1), body.get("title", "")))
+            m_task_delete = re.fullmatch(r"/api/tasks/([^/]+)/delete", path)
+            if m_task_delete:
+                result = self.engine.task_delete(m_task_delete.group(1))
+                return self._send_json(200, {"deleted": True, "task_id": result["deleted"]})
 
             # 1. Project Add
             if path == "/api/projects":

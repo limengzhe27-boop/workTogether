@@ -14,6 +14,7 @@ export interface AgentInfo {
   id: string;
   name: string;
   type: string;
+  base_agent?: string;
   executable?: string;
   endpoint?: string;
   model?: string;
@@ -22,9 +23,12 @@ export interface AgentInfo {
   color: string;
   avatar: string;
   description: string;
+  system_prompt?: string;
   enabled: boolean;
   ready?: boolean;
   has_key?: boolean;
+  has_secret_file?: boolean;
+  secret_key?: string;
 }
 
 export interface AgentProbeResult {
@@ -40,6 +44,52 @@ export interface Project {
   name: string;
   path: string;
   task_count?: number;
+  memory?: string;
+}
+
+export interface ProjectFileEntry {
+  path: string;
+  size: number;
+}
+
+export interface ProjectFiles {
+  project_id: string;
+  files: ProjectFileEntry[];
+  total: number;
+  truncated: boolean;
+}
+
+export interface ProjectDiffFile {
+  path: string;
+  status: string;
+}
+
+export interface ProjectDiff {
+  project_id: string;
+  is_git: boolean;
+  files: ProjectDiffFile[];
+  diff: string;
+  truncated: boolean;
+  message?: string;
+}
+
+export interface ProjectMemory {
+  project_id: string;
+  memory: string;
+}
+
+export interface ProjectFileContent {
+  project_id: string;
+  path: string;
+  content: string;
+  size_bytes: number;
+  truncated: boolean;
+}
+
+export interface RevertResult {
+  reverted: boolean;
+  path: string;
+  mode: string;
 }
 
 export interface DoctorReport {

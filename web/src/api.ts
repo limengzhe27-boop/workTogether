@@ -13,6 +13,11 @@ import {
   AgentInfo,
   AgentProbeResult,
   RunArtifactPreview,
+  ProjectFiles,
+  ProjectFileContent,
+  ProjectDiff,
+  ProjectMemory,
+  RevertResult,
 } from './types';
 
 const BASE_URL = '/api';
@@ -52,6 +57,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(agent),
     }),
+  updateAgentProfile: (agentId: string, body: Partial<AgentInfo> & { secret_key?: string }) =>
+    request<AgentInfo>(`/agents/${encodeURIComponent(agentId)}/profile`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  deleteAgent: (agentId: string) =>
+    request<{ deleted: boolean; removed: boolean; agent_id: string }>(`/agents/${encodeURIComponent(agentId)}/delete`, {
+      method: 'POST',
+      body: '{}',
+    }),
   probeAgent: (agentId: string) =>
     request<AgentProbeResult>(`/agents/${encodeURIComponent(agentId)}/probe`, {
       method: 'POST',
@@ -65,10 +80,34 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ name, path }),
     }),
+  deleteProject: (projectId: string) =>
+    request<{ deleted: boolean; project_id: string; tasks_removed: number }>(`/projects/${encodeURIComponent(projectId)}/delete`, {
+      method: 'POST',
+      body: '{}',
+    }),
   getProjectDoctor: (projectId: string) =>
     request<DoctorReport>(`/projects/${projectId}`),
   getProjectTasks: (projectId: string) =>
     request<{ tasks: TaskSummary[] }>(`/projects/${projectId}/tasks`),
+  getProjectFiles: (projectId: string) =>
+    request<ProjectFiles>(`/projects/${encodeURIComponent(projectId)}/files`),
+  getProjectFile: (projectId: string, path: string) =>
+    request<ProjectFileContent>(
+      `/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}`),
+  getProjectDiff: (projectId: string) =>
+    request<ProjectDiff>(`/projects/${encodeURIComponent(projectId)}/diff`),
+  revertProjectFile: (projectId: string, path: string) =>
+    request<RevertResult>(`/projects/${encodeURIComponent(projectId)}/revert-file`, {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+  getProjectMemory: (projectId: string) =>
+    request<ProjectMemory>(`/projects/${encodeURIComponent(projectId)}/memory`),
+  updateProjectMemory: (projectId: string, memory: string, append = false) =>
+    request<ProjectMemory>(`/projects/${encodeURIComponent(projectId)}/memory`, {
+      method: 'POST',
+      body: JSON.stringify({ memory, append }),
+    }),
 
   // Tasks
   addTask: (projectId: string, title: string, requirement: string) =>
@@ -77,6 +116,21 @@ export const api = {
       body: JSON.stringify({ project_id: projectId, title, requirement }),
     }),
   getTask: (taskId: string) => request<TaskDetail>(`/tasks/${taskId}`),
+  renameTask: (taskId: string, title: string) =>
+    request<TaskDetail>(`/tasks/${encodeURIComponent(taskId)}/rename`, {
+      method: 'POST',
+      body: JSON.stringify({ title }),
+    }),
+  deleteTask: (taskId: string) =>
+    request<{ deleted: boolean; task_id: string }>(`/tasks/${encodeURIComponent(taskId)}/delete`, {
+      method: 'POST',
+      body: '{}',
+    }),
+  resolveMessage: (taskId: string, messageId: string, action: 'skip' | 'retry') =>
+    request<Record<string, any>>(`/tasks/${encodeURIComponent(taskId)}/messages/${encodeURIComponent(messageId)}/resolve`, {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+    }),
   dispatch: (taskId: string) =>
     request<{ dispatch: Dispatch | null; reason?: string }>(`/tasks/${taskId}/dispatch`, {
       method: 'POST',
