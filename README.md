@@ -165,6 +165,20 @@ npm run dev
 
 前端渲染与安全回归运行 `npm test`；发布前运行 `npm run build`，并一起提交更新的 `worktogether/static/`。本次 Codex 截图对齐的验证范围见 [界面验收记录](qa/ui-simplification/codex-reference.md)。
 
+## 自动回归检查
+
+[GitHub Actions 工作流](.github/workflows/ci.yml) 已配置为在 push、pull request 或手动触发时检查：
+
+- Ubuntu 上的 Python 3.9 / 3.13 完整后端测试；用临时数据、模拟 CLI 和本机假 HTTP 服务，不调用真实模型。
+- Node 24 下按锁文件安装依赖、运行前端测试和生产构建；禁用依赖安装脚本。
+- 重建后的静态包与 Git 索引一致，包含新增、删除、修改、忽略文件及符号链接检查，防止漏提交新生成的资源。
+
+本地构建后，检查并暂存准备提交的静态包，再在仓库根目录运行 `python3 scripts/check_static.py`。该脚本只检查、不构建、不修改文件；必须先构建，不能单靠它判断源码是否同步。CI 的干净检出会以该次提交为基准检查。
+
+工作流仅申请只读仓库权限，不保留 Git 凭据、不配置模型密钥；官方 Actions 固定到提交版本，每个任务限时 10 分钟。CI 设置 `WT_REQUIRE_LOOPBACK_TESTS=1`，假 HTTP 测试无法绑定本机端口时直接失败，不以跳过冒充通过；仅探测 macOS 本机 Harness 安装的测试在 Linux 可跳过。
+
+本地已通过后端 362 项、前端 18 项、构建和干净依赖安装验证（macOS / Python 3.9 / Node 26）。**远端工作流尚未运行验证**，需推送后且仓库启用 Actions；未配置分支保护或自动发布，也未证明 Linux / Python 3.13 / Node 24 的实际运行结果。
+
 ## 开发交接与文档
 
 - 架构设计与 UI 决策：[DESIGN.md](DESIGN.md)

@@ -1,6 +1,7 @@
 """Actual loopback HTTP transport test; the server is a deterministic fixture."""
 import errno
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -60,7 +61,7 @@ class LoopbackOpenAITransportTests(unittest.TestCase):
         try:
             server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
         except OSError as exc:
-            if exc.errno in (errno.EPERM, errno.EACCES):
+            if exc.errno in (errno.EPERM, errno.EACCES) and os.environ.get("WT_REQUIRE_LOOPBACK_TESTS") != "1":
                 self.skipTest("Loopback binding is disabled in this sandbox")
             raise
         thread = threading.Thread(target=server.serve_forever, daemon=True)
