@@ -141,6 +141,29 @@ class GroupRoomTests(unittest.TestCase):
                 "messages": [{"to": "deepseek-harness", "intent": "assign", "content": "外部代理"}]}))
         self.assertEqual(1, len(self.e.messages(self.task)))
 
+    def test_a_peer_that_becomes_unavailable_can_still_be_skipped(self):
+        self.e.chat_config(self.task, {"max_auto_rounds": 4})
+        self.e.message_add(self.task, "m", "codex", "开始")
+        dispatch = self.e.chat_dispatch(self.task)
+        self.e.submit(self.task, chat_report(dispatch, data={
+            "messages": [{"to": "antigravity", "intent": "ask", "content": "请复核"}]}))
+        # The addressed peer is disabled before the room can hand it the turn.
+        # Reproduce imported/legacy state directly: the registry refuses to
+        # disable an agent with an unfinished conversation, by design.
+        with self.e.transaction() as db:
+            db.execute("UPDATE agents SET body=json_set(body,'$.enabled',json('false')) WHERE id='antigravity'")
+        self.assertEqual([], self.e.chat_dispatch_round(self.task))
+        auto = self.e.messages(self.task)[1]
+        self.assertEqual("QUEUED", auto["status"])
+        self.assertEqual("AGENT_UNAVAILABLE", auto["wait_reason"])
+        # Otherwise the room would sit on this message forever with no way out.
+        resolved = self.e.message_resolve(self.task, auto["id"], action="skip")
+        self.assertEqual("DELIVERED", resolved["status"])
+
+    def test_session_config_rejects_unknown_keys(self):
+        with self.assertRaises(CollabError):
+            self.e.chat_config(self.task, {"timeout_seconds": 30})
+
     # ---- automatic round budget -------------------------------------------------
     def test_automatic_back_and_forth_stops_at_the_budget(self):
         self.e.chat_config(self.task, {"max_auto_rounds": 1})
@@ -162,6 +185,23 @@ class GroupRoomTests(unittest.TestCase):
         self.assertEqual(1, released["released"])
         self.assertEqual("QUEUED", self.e.messages(self.task)[-1]["status"])
         self.assertTrue(self.e.chat_dispatch_round(self.task))
+
+    def test_an_agent_that_declines_is_not_shown_as_a_normal_answer(self):
+        self.e.message_add(self.task, "m", "both", "能做吗")
+        issued = self.e.chat_dispatch_round(self.task)
+        declined = next(d for d in issued if d["role"] == "codex")
+        accepted = next(d for d in issued if d["role"] == "antigravity")
+        self.e.submit(self.task, chat_report(declined, status="BLOCKED", data={"reason": "需要新授权"}))
+        self.e.submit(self.task, chat_report(accepted, summary="可以，我来做"))
+        message = self.e.messages(self.task)[0]
+        self.assertEqual("BLOCKED", message["status"])
+        self.assertEqual(["codex"], message["failed_roles"])
+        self.assertIn("需要新授权", message["error"])
+        # The peer's answer survives, and an explicit skip recovers the room.
+        resolved = self.e.message_resolve(self.task, "m", action="skip")
+        self.assertEqual("DELIVERED", resolved["status"])
+        self.assertEqual(["antigravity"], [r["role"] for r in resolved["replies"] if not r.get("skipped")])
+        self.assertEqual("ACTIVE", self.e.show(self.task)["status"])
 
     # ---- write serialization ----------------------------------------------------
     def test_only_the_capable_coder_holds_the_write_turn(self):

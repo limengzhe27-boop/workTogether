@@ -416,23 +416,32 @@ export function TaskChat({
                 </span>}
               </div>
             )}
-            {m.status === 'BLOCKED' && (
+            {(m.status === 'BLOCKED' || (m.status === 'QUEUED'
+              && ['AGENT_UNAVAILABLE', 'MEMBER_UNRESOLVED'].includes(m.wait_reason || ''))) && (
               <div className="message-recovery small">
-                <span>{m.blocked_role ? `${agentMap[m.blocked_role]?.name || m.blocked_role} 的回复中断。` : '回复中断。'}</span>
-                <button type="button" disabled={!!resolving} onClick={() => resolveMessage(m.id, 'retry')}>
+                <span>{m.blocked_role
+                  ? `${agentMap[m.blocked_role]?.name || m.blocked_role} 的回复中断。`
+                  : m.status === 'BLOCKED' ? '回复中断。' : '这一条没有 Agent 能接。'}</span>
+                {m.status === 'BLOCKED' && <button type="button" disabled={!!resolving} onClick={() => resolveMessage(m.id, 'retry')}>
                   <RefreshCw aria-hidden="true" />{resolving === m.id + 'retry' ? '重试中…' : '重试'}
-                </button>
+                </button>}
                 <button type="button" disabled={!!resolving} onClick={() => resolveMessage(m.id, 'skip')}>
                   {resolving === m.id + 'skip' ? '跳过中…' : '跳过并继续'}
                 </button>
               </div>
             )}
-            {m.status === 'QUEUED' && m.wait_reason && <p className="wait-note small" role="status">
-              {waitLabels[m.wait_reason] || m.wait_reason}
-              <button type="button" onClick={onDetails}>查看详情</button>
-            </p>}
+            {m.status === 'QUEUED' && m.wait_reason && !['AGENT_UNAVAILABLE', 'MEMBER_UNRESOLVED'].includes(m.wait_reason) && (
+              <p className="wait-note small" role="status">
+                {waitLabels[m.wait_reason] || m.wait_reason}
+                <button type="button" onClick={onDetails}>查看详情</button>
+              </p>
+            )}
             <div className="turn-replies">
-              {m.replies.map((r, i) => {
+              {(() => {
+                const roundList = Array.from(new Set(m.replies.map(r => r.round || 1))).sort((a, b) => a - b);
+                return m.replies.map((r, i) => {
+                const replyRound = r.round || 1;
+                const firstOfRound = m.replies.findIndex(x => (x.round || 1) === replyRound) === i;
                 const ag = agentMap[r.role];
                 const name = ag?.name || r.role;
                 const badge = getAgentBadge(r.role, name);
@@ -443,8 +452,11 @@ export function TaskChat({
                 const basis = r.report?.basis?.filter(Boolean) || [];
                 const suggestions = r.report?.suggestions?.filter(Boolean) || [];
                 const metaCount = basis.length + suggestions.length;
+                const roundLabel = replyRound === 1 ? '第 1 轮 · 各自独立回答' : `第 ${replyRound} 轮 · 看过同伴后回应`;
 
-                return <div key={i} className="agent-message" data-agent={r.role} style={{ '--agent-color': color } as React.CSSProperties}>
+                return <div key={i}>
+                  {roundList.length > 1 && firstOfRound && <p className="round-divider" role="presentation">{roundLabel}</p>}
+                  <div className="agent-message" data-agent={r.role} style={{ '--agent-color': color } as React.CSSProperties}>
                   <div className="reply-heading">
                     <span className="agent-monogram" style={{ background: color }}>{badge.code}</span>
                     <strong className="reply-agent-name" style={{ color }}>{name}</strong>
@@ -492,8 +504,9 @@ export function TaskChat({
                       </details>}
                     </div>
                   )}
+                </div>
                 </div>;
-              })}
+              });})()}
             </div>
           </article>;})}
         </div>

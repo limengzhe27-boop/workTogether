@@ -26,7 +26,7 @@
 
 ## 自动检查
 
-- `python3 -m unittest discover -s tests -q`：256 项通过。新增 `tests/core/test_group_chat.py`（11 项）：同时广播、并发执行（barrier 证明重叠）、Agent 提问/派活/认领、目标与意图校验、房间外成员拒绝、预算与释放、单一写者、跨任务写入串行、会话配置校验。
+- `python3 -m unittest discover -s tests -q`：260 项通过。新增 `tests/core/test_group_chat.py`（15 项）：同时广播、并发执行（barrier 证明重叠）、Agent 提问/派活/认领、目标与意图校验、房间外成员拒绝、拒绝型回复不算正常回答、预算与释放、不可用同伴可跳过、会话配置严格校验、单一写者、跨任务写入串行。
 - 同步更新了编码旧串行语义的用例：`test_chat`、`test_chat_context`、`test_multi_agent_chat`、`test_loopback_openai`。
 - `cd web && npm test`：12 项通过（对话输入框的引用文件/会话写入/轮次控件、无就绪成员提示、CLI 缺失标记、写入默认关闭）。
 - `cd web && npm run build`：TypeScript 与 Vite 构建通过，发布包已重建。
@@ -42,6 +42,19 @@
 5. `chat-release` 释放后消息回到 `QUEUED` 并被派发。
 
 **全程未调用任何真实模型**：`codex` 与 `antigravity` 都指向本仓库的桩脚本。
+
+## 自查发现并修复的缺陷
+
+群聊上线后做了一轮对抗式自查，找到三个真实缺陷：
+
+| 缺陷 | 影响 | 处理 |
+| --- | --- | --- |
+| Agent 明确回报 `status: BLOCKED`（例如“需要新授权，我做不了”）时，回复被记为 `ok:false` 但从未使用 | 消息被判为 **DELIVERED**，看起来像正常回答；`failed_roles` 为空、没有错误提示、界面不提供重试/跳过。只有任务整体变 BLOCKED，用户无从知道是谁拒绝了 | `_round_state` 把 `ok:false` 的回复计入失败；`submit` 用报告里的 `reason` 生成消息错误文案。现在显示 `codex: 需要新授权`，并可显式重试/跳过 |
+| 被 `assign` 的 Agent 在派发前被停用（历史/导入数据） | 该消息永久停在 QUEUED，界面只有“查看详情”，没有任何出口 | 界面在 `AGENT_UNAVAILABLE`/`MEMBER_UNRESOLVED` 的 QUEUED 消息上也提供“跳过并继续” |
+| `chat-config` 接受任意键 | 与其它接口的严格校验不一致，拼错的键会被静默忽略 | 只允许 `allow_write` 与 `max_auto_rounds` |
+| `skip` 时失败角色列表可能重复 | 同一角色可能被追加两条“已跳过”占位 | 去重后再写入 |
+
+另外补上了**回合分隔**：同一轮里第 1 轮回复标为“第 1 轮 · 各自独立回答”，第 2 轮标为“第 2 轮 · 看过同伴后回应”，这样“他们先各自表态、再互相回应”在界面上是看得见的。
 
 ## 边界
 

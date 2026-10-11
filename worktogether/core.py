@@ -483,20 +483,25 @@ class Engine:
     def _round_state(self, task, message):
         """Who still owes this round an answer, and who already failed it.
 
-        A role is settled when it produced a reply (including a skip) or when its
-        dispatch for this round ended BLOCKED. A failed role is deliberately not
-        pending: an interrupted agent must be retried explicitly, never replayed.
+        A role is settled when it produced a usable reply or when its dispatch
+        for this round ended BLOCKED. A reply that came back with status BLOCKED
+        counts as a failure even though text was recorded: an agent saying "I
+        cannot do this" must not be rendered as a normal answer.
+        A failed role is deliberately not pending: an interrupted agent must be
+        retried explicitly, never replayed.
         """
         roles = self._chat_roles(message)
         round_no = message.get("round", 1)
-        answered = self._answered_roles(message, round_no)
-        failed = set()
+        replies = self._round_replies(message, round_no)
+        answered = {r["role"] for r in replies if r.get("ok", True)}
+        recorded = {r["role"] for r in replies}
+        failed = {r["role"] for r in replies if not r.get("ok", True)}
         for d in task["dispatches"]:
             if d["kind"] != "CHAT" or d["payload"].get("message_id") != message["id"]:
                 continue
             if d["payload"].get("round", 1) != round_no:
                 continue
-            if d["status"] == "BLOCKED" and d["role"] not in answered:
+            if d["status"] == "BLOCKED" and d["role"] not in recorded:
                 failed.add(d["role"])
         pending = [role for role in roles if role not in answered and role not in failed]
         return roles, round_no, answered, failed, pending
@@ -666,6 +671,8 @@ class Engine:
             config.setdefault("allow_write", False)
             config.setdefault("max_auto_rounds", 2)
             if patch:
+                require(set(patch) <= {"allow_write", "max_auto_rounds"},
+                        "Only allow_write and max_auto_rounds can be changed", "INVALID_INPUT")
                 if "allow_write" in patch:
                     require(type(patch["allow_write"]) is bool, "allow_write must be boolean", "INVALID_INPUT")
                     config["allow_write"] = patch["allow_write"]
@@ -719,7 +726,7 @@ class Engine:
             roles = self._chat_roles(m)
             if action == "skip":
                 _, _, _, failed_now, _ = self._round_state(t, m)
-                targets = [r for r in list(failed_roles) + sorted(failed_now)]
+                targets = list(dict.fromkeys(list(failed_roles) + sorted(failed_now)))
                 for role in targets or [roles[0]]:
                     for existing in list(m["replies"]):
                         if existing["role"] == role and existing.get("round", 1) == round_no:
@@ -1172,8 +1179,10 @@ class Engine:
                     m["status"] = "RUNNING"
                 elif failed:
                     m["status"] = "BLOCKED"
+                    reasons = {r["role"]: (r.get("report", {}).get("data", {}) or {}).get("reason")
+                               for r in m["replies"] if not r.get("ok", True)}
                     m["error"] = "；".join(
-                        f"{role}: 回复中断" for role in sorted(failed))
+                        f"{role}: {reasons.get(role) or '回复中断'}" for role in sorted(failed))
                 elif round_no < m.get("rounds", 1):
                     m["round"] = round_no + 1
                     m["status"] = "QUEUED"
