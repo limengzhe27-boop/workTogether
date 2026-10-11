@@ -77,7 +77,11 @@ def parser():
     a.add_argument("--port", type=int, default=8765)
     a.add_argument("--host", default="127.0.0.1")
     a.add_argument("--static", default=None)
-    a.add_argument("--db", default=None)
+    # SUPPRESS keeps the subparser from overwriting a global --db that the user
+    # already supplied before the subcommand. With a plain default, argparse
+    # copies the subnamespace back and silently replaces the chosen database
+    # with .collab/state.sqlite3.
+    a.add_argument("--db", default=argparse.SUPPRESS)
     return p
 
 
