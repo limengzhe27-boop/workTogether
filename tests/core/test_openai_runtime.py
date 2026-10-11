@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.request
 from unittest.mock import patch
 
 from worktogether.core import Engine, CollabError
@@ -155,6 +156,105 @@ class OpenAIRuntimeTests(unittest.TestCase):
             result = self.runtime.execute_reserved(run, reserved)
         send.assert_not_called()
         self.assertEqual(result["status"], "FAILED")
+
+    def reserve_chat(self, recipient="local-model"):
+        self.engine.message_add(self.task["id"], "guard", recipient, "review only")
+        dispatch = self.engine.chat_dispatch(self.task["id"])
+        return self.runtime._reserve(self.task["id"], dispatch["id"], 30)
+
+    def assert_request_blocked(self, run, dispatch, code):
+        with patch("worktogether.openai_runtime._open_no_redirect") as send:
+            result = self.runtime.execute_reserved(run, dispatch)
+        send.assert_not_called()
+        self.assertEqual("FAILED", result["status"])
+        self.assertEqual(code, result["error_code"])
+        message = self.engine.messages(self.task["id"])[0]
+        self.assertEqual("BLOCKED", message["status"])
+        self.assertEqual([], message["replies"])
+        self.assertEqual("BLOCKED", self.engine.show(self.task["id"])["dispatches"][-1]["status"])
+
+    def test_prepared_api_rechecks_enabled_member(self):
+        run, dispatch = self.reserve_chat()
+        # Simulate an external importer; normal registry removal already rejects
+        # active members. Launch must still validate the live state, like a CLI.
+        with self.engine.transaction() as db:
+            db.execute("UPDATE agents SET body=json_set(body,'$.enabled',json('false')) WHERE id='local-model'")
+        self.assert_request_blocked(run, dispatch, "ROOM_SCOPE_CHANGED")
+
+    def test_prepared_api_rechecks_original_room_scope(self):
+        run, dispatch = self.reserve_chat()
+        with self.engine.transaction() as db:
+            db.execute("UPDATE messages SET body=json_set(body,'$.room_members',json('[]')) WHERE task_id=?",
+                       (self.task["id"],))
+        self.assert_request_blocked(run, dispatch, "ROOM_SCOPE_CHANGED")
+        # Failure stays visible; the queue must not quietly try the call again.
+        self.assertEqual([], self.engine.chat_dispatch_round(self.task["id"]))
+        self.assertEqual(1, len(self.runtime.list(self.task["id"])["runs"]))
+        self.engine.message_resolve(self.task["id"], "guard", "skip")
+        self.assertEqual("DELIVERED", self.engine.messages(self.task["id"])[0]["status"])
+
+    def test_prepared_api_rechecks_current_team(self):
+        run, dispatch = self.reserve_chat()
+        with self.engine.transaction() as db:
+            task = self.engine._task(db, self.task["id"])
+            task["team"] = {"members": ["codex", "antigravity"],
+                            "coordinator": "codex", "reviewer": "antigravity"}
+            self.engine._save(db, task, "TEST_IMPORT", {})
+        self.assert_request_blocked(run, dispatch, "ROOM_SCOPE_CHANGED")
+
+    def test_clearing_stored_key_blocks_prepared_api_with_cached_credentials(self):
+        self.registry.register({"id": "remote-model", "name": "Fixture", "type": "openai_compat",
+                                "endpoint": "https://example.invalid/v1", "model": "fixture",
+                                "secret_key": "not-a-real-key"})
+        self.runtime = OpenAICompatibleRuntime(self.engine, self.registry.get("remote-model"))
+        run, dispatch = self.reserve_chat("remote-model")
+        self.registry.set_secret("remote-model", "")
+        self.assert_request_blocked(run, dispatch, "ROOM_SCOPE_CHANGED")
+
+    def test_pause_during_request_preparation_prevents_api_send(self):
+        run, dispatch = self.reserve_chat()
+        request_class = urllib.request.Request
+
+        def prepare_then_pause(*args, **kwargs):
+            request = request_class(*args, **kwargs)
+            self.engine.pause(self.task["id"])
+            return request
+
+        with patch("worktogether.openai_runtime.urllib.request.Request", side_effect=prepare_then_pause):
+            self.assert_request_blocked(run, dispatch, "INVALID_STATE")
+        self.assertEqual("PAUSED", self.engine.show(self.task["id"])["status"])
+
+    def test_api_refuses_an_imported_write_grant_even_when_authorized(self):
+        self.engine.chat_config(self.task["id"], {"allow_write": True})
+        run, dispatch = self.reserve_chat()
+        self.assertFalse(dispatch["payload"].get("allow_write"))
+        with self.engine.transaction() as db:
+            task = self.engine._task(db, self.task["id"])
+            current = self.engine._get_dispatch(task, dispatch["id"])
+            current["payload"]["allow_write"] = True
+            self.engine._save(db, task, "TEST_IMPORT", {})
+        self.assert_request_blocked(run, dispatch, "UNSUPPORTED_PROVIDER")
+
+    def test_api_request_in_flight_can_finish_while_task_is_paused(self):
+        run, dispatch = self.reserve_chat()
+        engine, task_id = self.engine, self.task["id"]
+
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, *_):
+                # No database lock is held over the network wait. A user pause
+                # can succeed; it doesn't pretend to cancel an in-flight HTTP call.
+                engine.pause(task_id)
+                return json.dumps({"choices": [{"message": {"content": "Fixture reply"}}]}).encode()
+
+        with patch("worktogether.openai_runtime._open_no_redirect", return_value=Response()) as send:
+            result = self.runtime.execute_reserved(run, dispatch)
+        self.assertEqual(1, send.call_count)
+        self.assertEqual("COMPLETED", result["status"])
+        self.assertEqual("PAUSED", engine.show(task_id)["status"])
+        self.assertEqual([], engine.chat_dispatch_round(task_id))
+        self.assertFalse(json.loads(send.call_args.args[0].data).get("tools"))
 
 
 if __name__ == "__main__":

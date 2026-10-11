@@ -110,7 +110,12 @@ messages 最多三条，每条为 `{to,intent,content}`，content 非空且 ≤4
   绕过；原本可写的请求中，暂时只读的同伴仍可向房间内另一位成员交接写工作。
 - 旧用户消息缺少 room_members 时仅使用其已保存的收件人；旧自动消息缺少范围时
   保守停在 ROOM_SCOPE_CHANGED，提供“跳过后重新选择成员发送”的恢复入口。
-- 派发时和启动进程前都重新检查成员范围；变更不能使一个不在授权范围内的 Agent 启动。
+- 派发时、CLI 启动前和 API 请求准入前都重新检查成员范围；已失效的范围不能启动新调用。
+  API 在请求体/凭据准备完成后复查任务、派发、成员与只读限制，再登记 RUNNING。
+  准入失败留下 FAILED/BLOCKED 与原因，不发 HTTP、不自动重放。API 不接受写入派发。
+  RUNNING 是 API 的准入边界：网络等待不持数据库锁，用户仍可暂停；已准入的请求不能
+  撤回，返回结果可保存，但暂停期间不会因此发起新调用。清除唯一密钥导致成员不再就绪
+  时，尚未准入的聊天请求不能继续使用内存中的旧密钥。
 
 max_auto_rounds 名称沿用历史，实际按每条入队的自动 ask/assign 消息计数，
 不是模型内部轮次、Token 或总费用上限。每条消耗一次，超限进入 HELD。
@@ -129,7 +134,7 @@ BLOCKED / RUNNING / QUEUED。PREPARED/RUNNING 进程须先确认已停止。
 旧派发成为 SUPERSEDED；skip 保存占位，retry 重新排队，已成功结果保留。
 不会自动重放失败成员，也不以恢复绕过权限。
 
-确定性覆盖：test_group_chat.py、test_server_context.py、test_contracts.py、test_room_authorization.py。
+确定性覆盖：test_group_chat.py、test_server_context.py、test_contracts.py、test_room_authorization.py、test_openai_runtime.py。
 新增模拟 CLI 的 HTTP 两轮讨论与同伴跟进闭环，不是实际模型验收。
 真实证据以 [group-room 验收记录](../../qa/group-room/acceptance.md) 为准。
 本次契约对齐未调用真实模型，未验证 Antigravity 写权限、长会话成本或并行写隔离。

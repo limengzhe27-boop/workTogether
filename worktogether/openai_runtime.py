@@ -95,12 +95,40 @@ class OpenAICompatibleRuntime(Runtime):
         # HTTP adapter does not spawn an external CLI subprocess; returns target endpoint info
         return ["http-post", f"{self.endpoint}/chat/completions", "--model", self.model]
 
+    def _begin_request(self, run):
+        """Validate the live reservation immediately before admitting an HTTP call.
+
+        RUNNING is the admission boundary. Do not hold the database lock over
+        network I/O: a later pause must remain possible, but cannot unsend a call
+        already admitted. Like a CLI launch, rejection never triggers a retry.
+        """
+        with self.engine.transaction() as db:
+            task = self.engine._task(db, run["task_id"])
+            dispatch = self.engine._get_dispatch(task, run["dispatch_id"])
+            current = self._get(db, run["id"])
+            require((task["status"] == "ACTIVE" or
+                     (task["status"] == "COMPLETED" and dispatch["kind"] == "CHAT"))
+                    and dispatch["status"] == "ACTIVE"
+                    and dispatch["deadline"] > time.time()
+                    and current["status"] == "PREPARED",
+                    "Task stopped before API request", "INVALID_STATE")
+            self.engine.validate_chat_launch(db, task, dispatch)
+            require(not dispatch.get("payload", {}).get("allow_write"),
+                    "API agents have no local write tools; use a supported CLI agent",
+                    "UNSUPPORTED_PROVIDER")
+            if self.require_approval and dispatch["kind"] == "ANALYZE":
+                approval = db.execute("SELECT digest FROM approvals WHERE task_id=?",
+                                      (run["task_id"],)).fetchone()
+                require(approval is not None and approval[0] == self.plan_digest(task),
+                        "Approve the current plan before analysis", "APPROVAL_REQUIRED")
+            run["status"] = "RUNNING"
+            self._save(db, run)
+
     def execute_reserved(self, run, d):
         if d["kind"] not in ("CHAT", "ANALYZE", "PLAN", "PLAN_REVIEW", "PLAN_FINALIZE", "CONSULT", "CLAIM"):
             run.update(status="FAILED", error="API agents support conversation, supplied-context planning and read-only analysis only")
             self._fail(run)
             return run
-        task, dispatch_id = run["task_id"], run["dispatch_id"]
         root = Path(run["artifact_dir"])
         root.mkdir(parents=True, exist_ok=True)
 
@@ -114,29 +142,6 @@ class OpenAICompatibleRuntime(Runtime):
         api_key = self.get_api_key()
         session_id = run.get("session_id") or uid()
         run["session_id"] = session_id
-
-        # The reservation may have become stale while the prompt was prepared.
-        try:
-            with self.engine.transaction() as db:
-                task_state = self.engine._task(db, task)
-                current_dispatch = self.engine._get_dispatch(task_state, dispatch_id)
-                current = self._get(db, run["id"])
-                require((task_state["status"] == "ACTIVE" or
-                         (task_state["status"] == "COMPLETED" and d["kind"] == "CHAT"))
-                        and current_dispatch["status"] == "ACTIVE"
-                        and current_dispatch["deadline"] > time.time()
-                        and current["status"] == "PREPARED",
-                        "Task stopped before API request", "INVALID_STATE")
-                if self.require_approval and d["kind"] == "ANALYZE":
-                    approval = db.execute("SELECT digest FROM approvals WHERE task_id=?", (task,)).fetchone()
-                    require(approval is not None and approval[0] == self.plan_digest(task_state),
-                            "Approve the current plan before analysis", "APPROVAL_REQUIRED")
-                run["status"] = "RUNNING"
-                self._save(db, run)
-        except CollabError as exc:
-            run.update(status="FAILED", error=str(exc), error_code=exc.code)
-            self._fail(run)
-            return run
 
         report = None
         usage = None
@@ -170,6 +175,15 @@ class OpenAICompatibleRuntime(Runtime):
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
             req = urllib.request.Request(url, data=req_body, headers=headers, method="POST")
+
+            try:
+                # Prompt, credentials and request preparation can take time.
+                # Re-read membership/permission state after all of that work.
+                self._begin_request(run)
+            except CollabError as exc:
+                run.update(status="FAILED", error=str(exc), error_code=exc.code)
+                self._fail(run)
+                return run
 
             try:
                 with _open_no_redirect(req, timeout=run.get("timeout", 120)) as resp:
