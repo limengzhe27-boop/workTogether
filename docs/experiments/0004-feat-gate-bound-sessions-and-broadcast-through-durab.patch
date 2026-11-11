@@ -1,0 +1,975 @@
+From 516885ceabfc04fa78024f82707ba02243f05bd2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Wed, 11 Nov 2026 20:31:43 +0800
+Subject: [PATCH] feat: gate bound sessions and broadcast through durable room
+ admission
+
+Prevent legacy send and steer paths from bypassing room policy, retain bindings after removal, and report per-recipient broadcast outcomes without replaying uncertain deliveries. Covered by service, storage, HTTP contract, race and regression tests.
+---
+ backend/internal/httpd/apispec/openapi.yaml   |  72 +++++++++++++
+ .../internal/httpd/apispec/specgen/build.go   |   3 +
+ .../internal/httpd/controllers/peer_rooms.go  |  22 ++++
+ .../internal/httpd/controllers/sessions.go    |   1 +
+ backend/internal/peerpolicy/guard.go          |  41 +++++++
+ backend/internal/peerpolicy/guard_test.go     |  35 ++++++
+ backend/internal/service/chat/controller.go   |   4 +
+ backend/internal/service/chat/history.go      |   4 +
+ .../internal/service/chat/peer_policy_test.go |  43 ++++++++
+ .../internal/service/chat/provider_switch.go  |   4 +
+ backend/internal/service/chat/service.go      |   7 ++
+ backend/internal/service/chat/side.go         |   4 +
+ backend/internal/service/chat/steer.go        |  12 +++
+ .../service/session/peer_broadcast.go         |  83 +++++++++++++++
+ .../service/session/peer_broadcast_test.go    | 100 ++++++++++++++++++
+ .../internal/service/session/peer_rooms.go    |   3 +-
+ backend/internal/session_manager/manager.go   |   7 ++
+ .../sqlite/migrate_burned_versions_test.go    |   1 +
+ ...0261111122043927_peer_session_bindings.sql |   5 +
+ .../storage/sqlite/peer_rooms_test.go         |  39 +++++++
+ .../storage/sqlite/store/peer_rooms.go        |  31 +++++-
+ frontend/src/api/schema.ts                    |  75 +++++++++++++
+ 22 files changed, 593 insertions(+), 3 deletions(-)
+ create mode 100644 backend/internal/peerpolicy/guard.go
+ create mode 100644 backend/internal/peerpolicy/guard_test.go
+ create mode 100644 backend/internal/service/chat/peer_policy_test.go
+ create mode 100644 backend/internal/service/session/peer_broadcast.go
+ create mode 100644 backend/internal/service/session/peer_broadcast_test.go
+ create mode 100644 backend/internal/storage/sqlite/migrations/20261111122043927_peer_session_bindings.sql
+
+diff --git a/backend/internal/httpd/apispec/openapi.yaml b/backend/internal/httpd/apispec/openapi.yaml
+index 38a6a65..6a46d56 100644
+--- a/backend/internal/httpd/apispec/openapi.yaml
++++ b/backend/internal/httpd/apispec/openapi.yaml
+@@ -4535,6 +4535,43 @@ paths:
+       summary: Configure peer room with expected epoch
+       tags:
+       - sessions
++  /api/v1/peer-rooms/{roomId}/broadcast:
++    post:
++      operationId: broadcastPeerRoom
++      parameters:
++      - in: path
++        name: roomId
++        required: true
++        schema:
++          type: string
++      requestBody:
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/PeerBroadcastRequest'
++        required: true
++      responses:
++        "200":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/PeerBroadcastResult'
++          description: OK
++        "400":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Bad Request
++        "409":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Conflict
++      summary: Broadcast a user message with per-recipient admission and receipts
++      tags:
++      - sessions
+   /api/v1/peer-rooms/{roomId}/integrate:
+     post:
+       operationId: integratePeerRoom
+@@ -19273,6 +19310,41 @@ components:
+       - targetSha
+       - status
+       type: object
++    PeerBroadcastDelivery:
++      properties:
++        detail:
++          type: string
++        session:
++          type: string
++        state:
++          type: string
++      required:
++      - session
++      - state
++      type: object
++    PeerBroadcastRequest:
++      properties:
++        epoch:
++          format: int64
++          type: integer
++        id:
++          type: string
++        message:
++          type: string
++      required:
++      - id
++      - epoch
++      - message
++      type: object
++    PeerBroadcastResult:
++      properties:
++        deliveries:
++          items:
++            $ref: '#/components/schemas/PeerBroadcastDelivery'
++          type: array
++      required:
++      - deliveries
++      type: object
+     PeerIntegrationRequest:
+       properties:
+         base:
+diff --git a/backend/internal/httpd/apispec/specgen/build.go b/backend/internal/httpd/apispec/specgen/build.go
+index d8937f8..1409fdc 100644
+--- a/backend/internal/httpd/apispec/specgen/build.go
++++ b/backend/internal/httpd/apispec/specgen/build.go
+@@ -161,6 +161,7 @@ func schemaName(_ reflect.Type, defaultName string) string {
+ // by projectOperations(). Add an entry when a new contract type is introduced;
+ // the drift test fails until the spec is regenerated, which flags the gap.
+ var schemaNames = map[string]string{
++	"SessionPeerBroadcastRequest": "PeerBroadcastRequest", "SessionPeerBroadcastResult": "PeerBroadcastResult", "SessionPeerBroadcastDelivery": "PeerBroadcastDelivery",
+ 	"SessionPeerIntegrationRequest": "PeerIntegrationRequest", "SessionPeerIntegrationResult": "PeerIntegrationResult",
+ 	"DomainPeerTask": "PeerTask", "DomainPeerTaskAction": "PeerTaskAction",
+ 	"DomainPeerRoom": "PeerRoom", "DomainPeerMessage": "PeerMessage", "ControllersPeerRoomIDParam": "PeerRoomIDParam", "ControllersPeerSendResponse": "PeerSendResponse", //nolint:gosec // Public OpenAPI type names include reset-credit contracts; no credential value is stored here.
+@@ -3741,6 +3742,8 @@ func sessionOperations() []operation {
+ 
+ 		{method: http.MethodPost, path: "/api/v1/peer-rooms/{roomId}/integrate", id: "integratePeerRoom", tag: "sessions", summary: "Create a candidate integration branch without changing the checkout", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: sessionsvc.PeerIntegrationRequest{}, resps: []respUnit{{200, sessionsvc.PeerIntegrationResult{}}, {400, envelope.APIError{}}, {409, envelope.APIError{}}}},
+ 
++		{method: http.MethodPost, path: "/api/v1/peer-rooms/{roomId}/broadcast", id: "broadcastPeerRoom", tag: "sessions", summary: "Broadcast a user message with per-recipient admission and receipts", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: sessionsvc.PeerBroadcastRequest{}, resps: []respUnit{{200, sessionsvc.PeerBroadcastResult{}}, {400, envelope.APIError{}}, {409, envelope.APIError{}}}},
++
+ 		{
+ 			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/send", id: "sendSessionMessage", tag: "sessions",
+ 			summary:    "Send a message to a running session's agent",
+diff --git a/backend/internal/httpd/controllers/peer_rooms.go b/backend/internal/httpd/controllers/peer_rooms.go
+index d29eb71..43d7798 100644
+--- a/backend/internal/httpd/controllers/peer_rooms.go
++++ b/backend/internal/httpd/controllers/peer_rooms.go
+@@ -131,3 +131,25 @@ func (c *SessionsController) peerIntegrate(w http.ResponseWriter, r *http.Reques
+ 	}
+ 	envelope.WriteJSON(w, 200, out)
+ }
++
++func (c *SessionsController) peerBroadcast(w http.ResponseWriter, r *http.Request) {
++	svc, ok := c.Svc.(interface {
++		BroadcastPeerRoom(context.Context, string, sessionsvc.PeerBroadcastRequest) (sessionsvc.PeerBroadcastResult, error)
++	})
++	if !ok {
++		http.Error(w, "unavailable", 503)
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, 4096)
++	var in sessionsvc.PeerBroadcastRequest
++	if err := decodeJSON(r, &in); err != nil {
++		envelope.WriteAPIError(w, r, 400, "bad_request", "INVALID_JSON", "invalid broadcast", nil)
++		return
++	}
++	out, err := svc.BroadcastPeerRoom(r.Context(), chi.URLParam(r, "roomId"), in)
++	if err != nil {
++		envelope.WriteAPIError(w, r, 409, "conflict", "PEER_BROADCAST_REJECTED", err.Error(), nil)
++		return
++	}
++	envelope.WriteJSON(w, 200, out)
++}
+diff --git a/backend/internal/httpd/controllers/sessions.go b/backend/internal/httpd/controllers/sessions.go
+index bb026bf..5be5b45 100644
+--- a/backend/internal/httpd/controllers/sessions.go
++++ b/backend/internal/httpd/controllers/sessions.go
+@@ -208,6 +208,7 @@ type SessionsController struct {
+ 
+ // Register mounts the session routes on the supplied router.
+ func (c *SessionsController) Register(r chi.Router) {
++	r.Post("/peer-rooms/{roomId}/broadcast", c.peerBroadcast)
+ 	r.Post("/peer-rooms/{roomId}/integrate", c.peerIntegrate)
+ 	r.Get("/peer-rooms/{roomId}/tasks", c.peerTasks)
+ 	r.Put("/peer-rooms/{roomId}/tasks", c.peerTasks)
+diff --git a/backend/internal/peerpolicy/guard.go b/backend/internal/peerpolicy/guard.go
+new file mode 100644
+index 0000000..7244f9d
+--- /dev/null
++++ b/backend/internal/peerpolicy/guard.go
+@@ -0,0 +1,41 @@
++// Package peerpolicy prevents legacy delivery from bypassing room admission.
++package peerpolicy
++
++import (
++	"context"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
++)
++
++type bindingStore interface {
++	PeerSessionBound(context.Context, string) (bool, error)
++}
++type admissionKey struct{}
++type admission struct{ sender, target string }
++
++// Admitted is used only after a durable room budget reservation. Never decode it from HTTP.
++func Admitted(ctx context.Context, sender, target string) context.Context {
++	return context.WithValue(ctx, admissionKey{}, admission{sender, target})
++}
++func Check(ctx context.Context, store any, sender, target string) error {
++	if a, ok := ctx.Value(admissionKey{}).(admission); ok && a.sender == sender && a.target == target {
++		return nil
++	}
++	s, ok := store.(bindingStore)
++	if !ok {
++		return nil
++	} // legacy test stores; production SQLite implements this port
++	for _, id := range []string{sender, target} {
++		if id == "" {
++			continue
++		}
++		bound, err := s.PeerSessionBound(ctx, id)
++		if err != nil {
++			return apierr.Unavailable("PEER_POLICY_UNAVAILABLE", "Cannot verify room binding")
++		}
++		if bound {
++			return apierr.Conflict("PEER_ROOM_REQUIRED", "This session requires room admission; use the bound peer-room channel", nil)
++		}
++	}
++	return nil
++}
+diff --git a/backend/internal/peerpolicy/guard_test.go b/backend/internal/peerpolicy/guard_test.go
+new file mode 100644
+index 0000000..78a2481
+--- /dev/null
++++ b/backend/internal/peerpolicy/guard_test.go
+@@ -0,0 +1,35 @@
++package peerpolicy
++
++import (
++	"context"
++	"errors"
++	"testing"
++)
++
++type fake struct{ err error }
++
++func (f fake) PeerSessionBound(_ context.Context, id string) (bool, error) {
++	return id == "bound", f.err
++}
++func TestAdmissionScope(t *testing.T) {
++	ctx := context.Background()
++	s := fake{}
++	for _, pair := range [][2]string{{"bound", "outside"}, {"outside", "bound"}, {"", "bound"}} {
++		if Check(ctx, s, pair[0], pair[1]) == nil {
++			t.Fatal("legacy bypass", pair)
++		}
++	}
++	if Check(ctx, s, "a", "b") != nil {
++		t.Fatal("unrelated session blocked")
++	}
++	admitted := Admitted(ctx, "bound", "outside")
++	if Check(admitted, s, "bound", "outside") != nil {
++		t.Fatal("reserved delivery blocked")
++	}
++	if Check(admitted, s, "bound", "another") == nil {
++		t.Fatal("admission escaped target")
++	}
++	if Check(ctx, fake{errors.New("db unavailable")}, "a", "b") == nil {
++		t.Fatal("lookup failure opened access")
++	}
++}
+diff --git a/backend/internal/service/chat/controller.go b/backend/internal/service/chat/controller.go
+index 90e8634..902f446 100644
+--- a/backend/internal/service/chat/controller.go
++++ b/backend/internal/service/chat/controller.go
+@@ -27,6 +27,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+ )
+ 
+@@ -1605,6 +1606,9 @@ func (c *Controller) sendLocked(
+ 	providerOverride *ports.ChatUserMessage,
+ 	followers []string,
+ ) (domain.ConversationTurn, error) {
++	if err := peerpolicy.Check(ctx, c.store, msg.SenderSessionID, string(c.sessionID)); err != nil {
++		return domain.ConversationTurn{}, err
++	}
+ 	if msg.ClientPayloadHash == "" {
+ 		var err error
+ 		msg.ClientPayloadHash, err = clientPayloadHash(msg)
+diff --git a/backend/internal/service/chat/history.go b/backend/internal/service/chat/history.go
+index 6c38df4..dc55299 100644
+--- a/backend/internal/service/chat/history.go
++++ b/backend/internal/service/chat/history.go
+@@ -13,6 +13,7 @@ import (
+ 	"unicode/utf8"
+ 
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+ )
+ 
+@@ -165,6 +166,9 @@ func (s *Service) EditMessage(
+ 	turnID string,
+ 	msg ports.ChatUserMessage,
+ ) (EditMessageResult, error) {
++	if err := peerpolicy.Check(ctx, s.store, msg.SenderSessionID, string(id)); err != nil {
++		return EditMessageResult{}, err
++	}
+ 	requestJSON, err := encodeEditDeliveryRequest(turnID, msg)
+ 	if err != nil {
+ 		return EditMessageResult{}, err
+diff --git a/backend/internal/service/chat/peer_policy_test.go b/backend/internal/service/chat/peer_policy_test.go
+new file mode 100644
+index 0000000..e0e700b
+--- /dev/null
++++ b/backend/internal/service/chat/peer_policy_test.go
+@@ -0,0 +1,43 @@
++package chat
++
++import (
++	"context"
++	"testing"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++)
++
++type roomGuardStore struct{ Store }
++
++func (roomGuardStore) PeerSessionBound(context.Context, string) (bool, error) { return true, nil }
++func TestBoundRoomRejectsLegacyChatBeforeProviderWork(t *testing.T) {
++	s := &Service{store: roomGuardStore{}}
++	ctx := context.Background()
++	msg := ports.ChatUserMessage{Text: "hello", ClientMessageID: "x"}
++	if _, err := s.Send(ctx, "member", msg); err == nil {
++		t.Fatal("send")
++	}
++	if _, err := s.Steer(ctx, "member", msg); err == nil {
++		t.Fatal("steer")
++	}
++	if _, err := s.SteerOrSend(ctx, "member", msg, false); err == nil {
++		t.Fatal("steer-or-send")
++	}
++	if _, err := s.EditMessage(ctx, "member", "turn", msg); err == nil {
++		t.Fatal("edit")
++	}
++	if _, _, err := s.SwitchProviderAndSend(ctx, "member", domain.ProviderSwitchRequest{}, msg); err == nil {
++		t.Fatal("switch")
++	}
++	if _, err := s.SendSideQuestion(ctx, "member", "side", msg); err == nil {
++		t.Fatal("side")
++	}
++	c := &Controller{sessionID: "member", store: roomGuardStore{}}
++	if _, err := c.Send(ctx, msg); err == nil {
++		t.Fatal("controller send")
++	}
++	if _, err := c.Steer(ctx, msg); err == nil {
++		t.Fatal("controller steer")
++	}
++}
+diff --git a/backend/internal/service/chat/provider_switch.go b/backend/internal/service/chat/provider_switch.go
+index 32cad7e..83e8bd6 100644
+--- a/backend/internal/service/chat/provider_switch.go
++++ b/backend/internal/service/chat/provider_switch.go
+@@ -11,6 +11,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+ )
+ 
+@@ -58,6 +59,9 @@ func (s *Service) SwitchProvider(ctx context.Context, id domain.SessionID, reque
+ // switched for again, so its retry cannot take the chat back from a later
+ // switch. switched says the chat is on the target, so a failure is the send's.
+ func (s *Service) SwitchProviderAndSend(ctx context.Context, id domain.SessionID, request domain.ProviderSwitchRequest, msg ports.ChatUserMessage) (turn domain.ConversationTurn, switched bool, err error) {
++	if err := peerpolicy.Check(ctx, s.store, msg.SenderSessionID, string(id)); err != nil {
++		return turn, false, err
++	}
+ 	if err := validateFileReferenceContent(msg, string(id)); err != nil {
+ 		return turn, false, err
+ 	}
+diff --git a/backend/internal/service/chat/service.go b/backend/internal/service/chat/service.go
+index bd9a226..67e5146 100644
+--- a/backend/internal/service/chat/service.go
++++ b/backend/internal/service/chat/service.go
+@@ -14,6 +14,7 @@ import (
+ 	"unicode/utf8"
+ 
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+ 	reportsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/report"
+ )
+@@ -1346,6 +1347,9 @@ func (s *Service) Send(
+ 	id domain.SessionID,
+ 	msg ports.ChatUserMessage,
+ ) (domain.ConversationTurn, error) {
++	if err := peerpolicy.Check(ctx, s.store, msg.SenderSessionID, string(id)); err != nil {
++		return domain.ConversationTurn{}, err
++	}
+ 	record, err := s.requireChatSession(ctx, id)
+ 	if err != nil {
+ 		return domain.ConversationTurn{}, err
+@@ -2859,6 +2863,9 @@ func (s *Service) relayChatTurn(
+ 	text, clientMessageID string,
+ 	options ports.MessageDeliveryOptions,
+ ) (string, error) {
++	if err := peerpolicy.Check(ctx, s.store, options.SenderSessionID, string(id)); err != nil {
++		return "", err
++	}
+ 	msg := s.resolveSteerSender(ctx, ports.ChatUserMessage{
+ 		Text: text, ClientMessageID: clientMessageID,
+ 		SenderSessionID: options.SenderSessionID, InteractionAt: options.InteractionAt,
+diff --git a/backend/internal/service/chat/side.go b/backend/internal/service/chat/side.go
+index ed438cb..88dacb5 100644
+--- a/backend/internal/service/chat/side.go
++++ b/backend/internal/service/chat/side.go
+@@ -10,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+ )
+ 
+@@ -1601,6 +1602,9 @@ func (m *sideManager) ownedSide(ctx context.Context, session domain.SessionID, s
+ 
+ // SendSideQuestion accepts a question for the side provider.
+ func (s *Service) SendSideQuestion(ctx context.Context, session domain.SessionID, sideID string, msg ports.ChatUserMessage) (domain.SideTurn, error) {
++	if err := peerpolicy.Check(ctx, s.store, msg.SenderSessionID, string(session)); err != nil {
++		return domain.SideTurn{}, err
++	}
+ 	if s.sides == nil {
+ 		return domain.SideTurn{}, ErrSideUnavailable
+ 	}
+diff --git a/backend/internal/service/chat/steer.go b/backend/internal/service/chat/steer.go
+index cabbf2e..667ecc0 100644
+--- a/backend/internal/service/chat/steer.go
++++ b/backend/internal/service/chat/steer.go
+@@ -9,6 +9,7 @@ import (
+ 	"unicode/utf8"
+ 
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+ )
+ 
+@@ -120,6 +121,9 @@ func (s *Service) Steer(
+ 	id domain.SessionID,
+ 	msg ports.ChatUserMessage,
+ ) (SteerResult, error) {
++	if err := peerpolicy.Check(ctx, s.store, msg.SenderSessionID, string(id)); err != nil {
++		return SteerResult{}, err
++	}
+ 	if strings.TrimSpace(msg.Text) == "" {
+ 		return SteerResult{}, ErrSteerTextRequired
+ 	}
+@@ -163,6 +167,11 @@ func (s *Service) SteerOrSend(
+ 	msg ports.ChatUserMessage,
+ 	recoverOnly bool,
+ ) (SteerOrSendResult, error) {
++	if !recoverOnly {
++		if err := peerpolicy.Check(ctx, s.store, msg.SenderSessionID, string(id)); err != nil {
++			return SteerOrSendResult{}, err
++		}
++	}
+ 	if strings.TrimSpace(msg.Text) == "" && !recoverOnly {
+ 		return SteerOrSendResult{}, ErrSteerTextRequired
+ 	}
+@@ -379,6 +388,9 @@ func (c *Controller) Steer(ctx context.Context, msg ports.ChatUserMessage) (Stee
+ }
+ 
+ func (c *Controller) steerLocked(ctx context.Context, msg ports.ChatUserMessage) (SteerResult, error) {
++	if err := peerpolicy.Check(ctx, c.store, msg.SenderSessionID, string(c.sessionID)); err != nil {
++		return SteerResult{}, err
++	}
+ 
+ 	requestJSON, err := encodeSteerDeliveryRequest(msg)
+ 	if err != nil {
+diff --git a/backend/internal/service/session/peer_broadcast.go b/backend/internal/service/session/peer_broadcast.go
+new file mode 100644
+index 0000000..2966813
+--- /dev/null
++++ b/backend/internal/service/session/peer_broadcast.go
+@@ -0,0 +1,83 @@
++package session
++
++import (
++	"context"
++	"crypto/sha256"
++	"fmt"
++	"strings"
++	"sync"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
++	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++)
++
++type PeerBroadcastRequest struct {
++	ID      string `json:"id"`
++	Epoch   int64  `json:"epoch"`
++	Message string `json:"message"`
++}
++type PeerBroadcastDelivery struct {
++	Session string `json:"session"`
++	State   string `json:"state"`
++	Detail  string `json:"detail,omitempty"`
++}
++type PeerBroadcastResult struct {
++	Deliveries []PeerBroadcastDelivery `json:"deliveries"`
++}
++type userRoomStore interface {
++	ReserveUserRoomMessage(context.Context, string, domain.PeerMessage) (bool, error)
++	FinishPeerMessage(context.Context, string, string, bool) error
++}
++
++// Each recipient has a stable durable delivery slot. Partial outcomes are explicit;
++// no all-or-nothing or exactly-once provider execution claim is made.
++func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroadcastRequest) (PeerBroadcastResult, error) {
++	out := PeerBroadcastResult{Deliveries: []PeerBroadcastDelivery{}}
++	if in.ID == "" || len(in.ID) > 100 || strings.TrimSpace(in.Message) == "" || len(in.Message) > 2000 {
++		return out, fmt.Errorf("invalid broadcast")
++	}
++	room, err := s.GetPeerRoom(ctx, id)
++	if err != nil {
++		return out, err
++	}
++	if room.Paused || room.Epoch != in.Epoch {
++		return out, fmt.Errorf("room paused or stale epoch")
++	}
++	store, ok := s.store.(userRoomStore)
++	if !ok {
++		return out, fmt.Errorf("broadcast unavailable")
++	}
++	out.Deliveries = make([]PeerBroadcastDelivery, len(room.Members))
++	var wg sync.WaitGroup
++	// Reservation order follows the visible member order. Budget exhaustion is deterministic.
++	for i, target := range room.Members {
++		receipt := fmt.Sprintf("user-%x", sha256.Sum256([]byte(in.ID+"\x00"+target)))
++		m := domain.PeerMessage{ID: receipt, Target: target, Epoch: in.Epoch, Message: in.Message}
++		admitted, err := store.ReserveUserRoomMessage(ctx, id, m)
++		out.Deliveries[i] = PeerBroadcastDelivery{Session: target}
++		if err != nil {
++			out.Deliveries[i].State = "blocked"
++			out.Deliveries[i].Detail = err.Error()
++			continue
++		}
++		if !admitted {
++			out.Deliveries[i].State = "already_accepted"
++			continue
++		}
++		wg.Add(1)
++		go func(i int, target, receipt string) {
++			defer wg.Done()
++			err := s.manager.SendWithOptions(peerpolicy.Admitted(ctx, "", target), domain.SessionID(target), in.Message, nil, ports.MessageDeliveryOptions{AuthoredByUser: true})
++			finishErr := store.FinishPeerMessage(context.WithoutCancel(ctx), id, receipt, err == nil)
++			if err != nil || finishErr != nil {
++				out.Deliveries[i].State = "uncertain"
++				out.Deliveries[i].Detail = "Delivery failed or could not be recorded; do not automatically replay"
++				return
++			}
++			out.Deliveries[i].State = "accepted"
++		}(i, target, receipt)
++	}
++	wg.Wait()
++	return out, nil
++}
+diff --git a/backend/internal/service/session/peer_broadcast_test.go b/backend/internal/service/session/peer_broadcast_test.go
+new file mode 100644
+index 0000000..106d43e
+--- /dev/null
++++ b/backend/internal/service/session/peer_broadcast_test.go
+@@ -0,0 +1,100 @@
++package session
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++)
++
++type broadcastStore struct {
++	peerStoreFake
++	mu     sync.Mutex
++	room   domain.PeerRoom
++	states map[string]string
++	used   int
++}
++
++func (p *broadcastStore) GetPeerRoom(context.Context, string) (domain.PeerRoom, error) {
++	return p.room, nil
++}
++func (p *broadcastStore) ReserveUserRoomMessage(_ context.Context, _ string, m domain.PeerMessage) (bool, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if state := p.states[m.ID]; state != "" {
++		if state == "accepted" {
++			return false, nil
++		}
++		return false, errors.New("uncertain")
++	}
++	if p.used >= p.room.Budget {
++		return false, errors.New("budget")
++	}
++	p.used++
++	p.states[m.ID] = "pending"
++	return true, nil
++}
++func (p *broadcastStore) FinishPeerMessage(_ context.Context, _, id string, ok bool) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.states[id] = "uncertain"
++	if ok {
++		p.states[id] = "accepted"
++	}
++	return nil
++}
++func TestPeerBroadcastParallelAndNoReplay(t *testing.T) {
++	p := &broadcastStore{room: domain.PeerRoom{Epoch: 1, Budget: 2, Members: []string{"a", "b"}}, states: map[string]string{}}
++	arrived := make(chan string, 2)
++	release := make(chan struct{})
++	var calls atomic.Int32
++	m := &fakeCommander{sendFunc: func(id domain.SessionID, _ string) error {
++		calls.Add(1)
++		arrived <- string(id)
++		<-release
++		if id == "b" {
++			return errors.New("lost receipt")
++		}
++		return nil
++	}}
++	s := NewWithDeps(Deps{Store: p, Manager: m})
++	in := PeerBroadcastRequest{ID: "broadcast", Epoch: 1, Message: "hello"}
++	done := make(chan PeerBroadcastResult, 1)
++	go func() {
++		out, err := s.BroadcastPeerRoom(context.Background(), "r", in)
++		if err != nil {
++			t.Error(err)
++		}
++		done <- out
++	}()
++	for i := 0; i < 2; i++ {
++		select {
++		case <-arrived:
++		case <-time.After(3 * time.Second):
++			close(release)
++			t.Fatal("fanout did not start both recipients")
++		}
++	}
++	close(release)
++	out := <-done
++	if out.Deliveries[0].State != "accepted" || out.Deliveries[1].State != "uncertain" {
++		t.Fatal(out)
++	}
++	again, err := s.BroadcastPeerRoom(context.Background(), "r", in)
++	if err != nil || calls.Load() != 2 || again.Deliveries[0].State != "already_accepted" || again.Deliveries[1].State != "blocked" {
++		t.Fatal(again, err, calls.Load())
++	}
++}
++func TestPeerBroadcastReportsPartialBudget(t *testing.T) {
++	p := &broadcastStore{room: domain.PeerRoom{Epoch: 1, Budget: 1, Members: []string{"a", "b"}}, states: map[string]string{}}
++	var calls atomic.Int32
++	s := NewWithDeps(Deps{Store: p, Manager: &fakeCommander{sendFunc: func(domain.SessionID, string) error { calls.Add(1); return nil }}})
++	out, err := s.BroadcastPeerRoom(context.Background(), "r", PeerBroadcastRequest{ID: "x", Epoch: 1, Message: "hi"})
++	if err != nil || calls.Load() != 1 || out.Deliveries[0].State != "accepted" || out.Deliveries[1].State != "blocked" {
++		t.Fatal(out, err)
++	}
++}
+diff --git a/backend/internal/service/session/peer_rooms.go b/backend/internal/service/session/peer_rooms.go
+index c9647b3..71b7889 100644
+--- a/backend/internal/service/session/peer_rooms.go
++++ b/backend/internal/service/session/peer_rooms.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+ )
+ 
+@@ -37,7 +38,7 @@ func (s *Service) SendPeerMessage(ctx context.Context, id string, m domain.PeerM
+ 	if err != nil || !admitted {
+ 		return err
+ 	}
+-	err = s.manager.SendWithOptions(ctx, domain.SessionID(m.Target), m.Message, nil, ports.MessageDeliveryOptions{SenderSessionID: m.Sender})
++	err = s.manager.SendWithOptions(peerpolicy.Admitted(ctx, m.Sender, m.Target), domain.SessionID(m.Target), m.Message, nil, ports.MessageDeliveryOptions{SenderSessionID: m.Sender})
+ 	finalErr := p.FinishPeerMessage(context.WithoutCancel(ctx), id, m.ID, err == nil)
+ 	if err != nil {
+ 		return fmt.Errorf("delivery failed or uncertain; no automatic replay: %w", err)
+diff --git a/backend/internal/session_manager/manager.go b/backend/internal/session_manager/manager.go
+index 7f27313..4755361 100644
+--- a/backend/internal/session_manager/manager.go
++++ b/backend/internal/session_manager/manager.go
+@@ -25,6 +25,7 @@ import (
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/attachmentstore"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+ 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionartifacts"
+@@ -5004,6 +5005,9 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string,
+ // SendWithOptions delivers a message with caller-supplied authorship facts that
+ // are independent of the mechanism AO uses to carry it.
+ func (m *Manager) SendWithOptions(ctx context.Context, id domain.SessionID, message string, attachment *ports.SpawnAttachment, options ports.MessageDeliveryOptions) error {
++	if err := peerpolicy.Check(ctx, m.store, options.SenderSessionID, string(id)); err != nil {
++		return err
++	}
+ 	if attachment != nil {
+ 		// Reuses StageAttachments rather than a bespoke writer: it already owns the
+ 		// empty-workspace guard (refusing beats writing under the daemon's cwd),
+@@ -5121,6 +5125,9 @@ func (m *Manager) InterruptTUI(ctx context.Context, id domain.SessionID) error {
+ // retries. Ordinary callers leave it empty; the outbox preserves the key across
+ // restart, rollback, and even a second overlapping handoff.
+ func (m *Manager) send(ctx context.Context, id domain.SessionID, message, clientMessageID string, options ports.MessageDeliveryOptions) error {
++	if err := peerpolicy.Check(ctx, m.store, options.SenderSessionID, string(id)); err != nil {
++		return err
++	}
+ 	// A controller transition deliberately has a short interval with no writer.
+ 	// Queue internal/lifecycle sends durably instead of racing either controller
+ 	// or dropping coordination work; the transition worker drains this outbox
+diff --git a/backend/internal/storage/sqlite/migrate_burned_versions_test.go b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+index d0e23ce..54ed418 100644
+--- a/backend/internal/storage/sqlite/migrate_burned_versions_test.go
++++ b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+@@ -20,6 +20,7 @@ import (
+ // session list). Renaming, renumbering, or deleting a shipped migration
+ // produces exactly that class of failure, so this list is append-only.
+ var shippedMigrations = map[int64]string{
++	20261111122043927: "20261111122043927_peer_session_bindings.sql",
+ 	20261111120338733: "20261111120338733_peer_tasks.sql",
+ 	20261111115713720: "20261111115713720_peer_rooms.sql",
+ 	1:                 "0001_init.sql",
+diff --git a/backend/internal/storage/sqlite/migrations/20261111122043927_peer_session_bindings.sql b/backend/internal/storage/sqlite/migrations/20261111122043927_peer_session_bindings.sql
+new file mode 100644
+index 0000000..0b4fb7f
+--- /dev/null
++++ b/backend/internal/storage/sqlite/migrations/20261111122043927_peer_session_bindings.sql
+@@ -0,0 +1,5 @@
++-- +goose Up
++CREATE TABLE peer_session_bindings(session_id TEXT PRIMARY KEY);
++INSERT OR IGNORE INTO peer_session_bindings SELECT j.value FROM peer_rooms r,json_each(r.members) j;
++-- +goose Down
++DROP TABLE peer_session_bindings;
+diff --git a/backend/internal/storage/sqlite/peer_rooms_test.go b/backend/internal/storage/sqlite/peer_rooms_test.go
+index a3a4d69..9f059df 100644
+--- a/backend/internal/storage/sqlite/peer_rooms_test.go
++++ b/backend/internal/storage/sqlite/peer_rooms_test.go
+@@ -191,4 +191,43 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 	if _, err = s.ActPeerTask(ctx, "r", a); err == nil {
+ 		t.Fatal("paused task mutation")
+ 	}
++
++	room.Members = nil
++	room, err = s.ConfigurePeerRoom(ctx, room)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, member := range []string{"a", "b"} {
++		bound, err := s.PeerSessionBound(ctx, member)
++		if err != nil || !bound {
++			t.Fatal("removal reopened legacy route", member, err)
++		}
++	}
++
++	human, err := s.ConfigurePeerRoom(ctx, domain.PeerRoom{ID: "human", ProjectID: "p", Members: []string{"a", "b"}, Budget: 1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	hm := domain.PeerMessage{ID: "user-broadcast", Target: "a", Epoch: human.Epoch, Message: "hello"}
++	if ok, err := s.ReserveUserRoomMessage(ctx, "human", hm); !ok || err != nil {
++		t.Fatal(ok, err)
++	}
++	if _, err = s.ReserveUserRoomMessage(ctx, "human", hm); err == nil {
++		t.Fatal("pending broadcast replay")
++	}
++	if err = s.FinishPeerMessage(ctx, "human", hm.ID, true); err != nil {
++		t.Fatal(err)
++	}
++	if ok, err := s.ReserveUserRoomMessage(ctx, "human", hm); ok || err != nil {
++		t.Fatal("broadcast duplicate", ok, err)
++	}
++	hm.ID = "other"
++	hm.Target = "b"
++	if _, err = s.ReserveUserRoomMessage(ctx, "human", hm); err == nil {
++		t.Fatal("human broadcast ignored budget")
++	}
++	hm.Sender = "a"
++	if _, err = s.ReserveUserRoomMessage(ctx, "human", hm); err == nil {
++		t.Fatal("forged human sender")
++	}
+ }
+diff --git a/backend/internal/storage/sqlite/store/peer_rooms.go b/backend/internal/storage/sqlite/store/peer_rooms.go
+index 8c6dad3..44834d8 100644
+--- a/backend/internal/storage/sqlite/store/peer_rooms.go
++++ b/backend/internal/storage/sqlite/store/peer_rooms.go
+@@ -82,11 +82,27 @@ func (s *Store) ConfigurePeerRoom(ctx context.Context, r domain.PeerRoom) (domai
+ 	if err != nil {
+ 		return r, err
+ 	}
++	for _, id := range r.Members {
++		if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO peer_session_bindings(session_id) VALUES(?)", id); err != nil {
++			return r, err
++		}
++	}
+ 	return r, tx.Commit()
+ }
+ 
+ // Reservation precedes external delivery; crashes never automatically replay.
+ func (s *Store) ReservePeerMessage(ctx context.Context, room string, m domain.PeerMessage) (bool, error) {
++	return s.reservePeerMessage(ctx, room, m, false)
++}
++
++// Only the trusted user broadcast service calls this; it is not a peer tool parameter.
++func (s *Store) ReserveUserRoomMessage(ctx context.Context, room string, m domain.PeerMessage) (bool, error) {
++	if m.Sender != "" {
++		return false, fmt.Errorf("user broadcast cannot impersonate a session")
++	}
++	return s.reservePeerMessage(ctx, room, m, true)
++}
++func (s *Store) reservePeerMessage(ctx context.Context, room string, m domain.PeerMessage, human bool) (bool, error) {
+ 	if m.ID == "" || len(m.ID) > 100 || m.Sender == m.Target || strings.TrimSpace(m.Message) == "" || len(m.Message) > 2000 {
+ 		return false, fmt.Errorf("invalid peer message")
+ 	}
+@@ -103,10 +119,14 @@ func (s *Store) ReservePeerMessage(ctx context.Context, room string, m domain.Pe
+ 	if err != nil {
+ 		return false, err
+ 	}
+-	if r.Paused || m.Epoch != r.Epoch || !slices.Contains(r.Members, m.Sender) || !slices.Contains(r.Members, m.Target) {
++	if r.Paused || m.Epoch != r.Epoch || (!human && !slices.Contains(r.Members, m.Sender)) || !slices.Contains(r.Members, m.Target) {
+ 		return false, fmt.Errorf("room paused, stale epoch or non-member")
+ 	}
+-	for _, id := range []string{m.Sender, m.Target} {
++	ids := []string{m.Target}
++	if !human {
++		ids = append(ids, m.Sender)
++	}
++	for _, id := range ids {
+ 		if err = peerMember(ctx, tx, id, r.ProjectID); err != nil {
+ 			return false, err
+ 		}
+@@ -146,3 +166,10 @@ func (s *Store) FinishPeerMessage(ctx context.Context, room, id string, accepted
+ 	_, err := s.writeDB.ExecContext(ctx, "UPDATE peer_deliveries SET state=? WHERE room_id=? AND id=? AND state='pending'", state, room, id)
+ 	return err
+ }
++
++// Binding history is sticky: removing a member or pausing cannot reopen a legacy channel.
++func (s *Store) PeerSessionBound(ctx context.Context, id string) (bool, error) {
++	var n int
++	err := s.readDB.QueryRowContext(ctx, "SELECT count(*) FROM peer_session_bindings WHERE session_id=?", id).Scan(&n)
++	return n > 0, err
++}
+diff --git a/frontend/src/api/schema.ts b/frontend/src/api/schema.ts
+index bfd259c..49cad24 100644
+--- a/frontend/src/api/schema.ts
++++ b/frontend/src/api/schema.ts
+@@ -1839,6 +1839,23 @@ export interface paths {
+         patch?: never;
+         trace?: never;
+     };
++    "/api/v1/peer-rooms/{roomId}/broadcast": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        get?: never;
++        put?: never;
++        /** Broadcast a user message with per-recipient admission and receipts */
++        post: operations["broadcastPeerRoom"];
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
+     "/api/v1/peer-rooms/{roomId}/integrate": {
+         parameters: {
+             query?: never;
+@@ -6700,6 +6717,20 @@ export interface components {
+             targetSha: string;
+             title: string;
+         };
++        PeerBroadcastDelivery: {
++            detail?: string;
++            session: string;
++            state: string;
++        };
++        PeerBroadcastRequest: {
++            /** Format: int64 */
++            epoch: number;
++            id: string;
++            message: string;
++        };
++        PeerBroadcastResult: {
++            deliveries: components["schemas"]["PeerBroadcastDelivery"][];
++        };
+         PeerIntegrationRequest: {
+             base: string;
+             /** Format: int64 */
+@@ -14419,6 +14450,50 @@ export interface operations {
+             };
+         };
+     };
++    broadcastPeerRoom: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                roomId: string;
++            };
++            cookie?: never;
++        };
++        requestBody: {
++            content: {
++                "application/json": components["schemas"]["PeerBroadcastRequest"];
++            };
++        };
++        responses: {
++            /** @description OK */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["PeerBroadcastResult"];
++                };
++            };
++            /** @description Bad Request */
++            400: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++            /** @description Conflict */
++            409: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++        };
++    };
+     integratePeerRoom: {
+         parameters: {
+             query?: never;
+-- 
+2.54.0 (Apple Git-157)
+

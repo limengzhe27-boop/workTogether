@@ -5,7 +5,7 @@
 ## 构建与保留
 
 上游固定 v0.14.10 / 033d597032e448a0ea16c298350e36b099f74106。
-依次应用 `ao-scoped-peer-mcp.patch` 以及本目录 experiments 下三个编号补丁。当前源码已位于 `~/Applications/worktogether-evaluation/source`，分支 `codex/scoped-peer-mcp`。
+依次应用 `ao-scoped-peer-mcp.patch` 以及本目录 experiments 下按编号顺序排列的补丁。当前源码已位于 `~/Applications/worktogether-evaluation/source`，分支 `codex/scoped-peer-mcp`。
 Go 1.27.1，在 backend 目录执行 `go build -o /absolute/evaluation/ao-room ./cmd/ao`。不替换签名应用内二进制，不覆盖用户真实 ~/.ao 数据。所有测试使用独立 AO_DATA_DIR 和 AO_RUN_FILE。
 
 ## 房间与消息
@@ -16,6 +16,7 @@ Go 1.27.1，在 backend 目录执行 `go build -o /absolute/evaluation/ao-room .
 | --- | --- |
 | GET /peer-rooms/{roomId} | 读取成员、epoch、预算与已用次数 |
 | PUT /peer-rooms/{roomId} | 用旧 epoch 做比较更新；首次 epoch=0；每次成功递增 |
+| POST /peer-rooms/{roomId}/broadcast | 用户消息按成员顺序预占预算，再并行投递，逐个返回结果 |
 | POST /peer-rooms/{roomId}/send | 事务性预占预算后投递，失败/不确定不重放 |
 | GET /peer-rooms/{roomId}/tasks | 读取任务清单和 revision |
 | PUT /peer-rooms/{roomId}/tasks | 创建开放任务，需唯一 id 与 goal |
@@ -41,6 +42,18 @@ integrate 请求：epoch、base（固定40位基线提交）、name（候选名�
 
 ## 信任边界与未完成部分
 
-AO 本机管理 API 继承其可信本地进程模型；本实验不把它宣传成抵御恶意本机进程的认证层。房间门禁尚未覆盖原有 send/steer 通道。普通原生终端的能力保持原配置，不能把工作目录隔离说成整个操作系统隔离。
+AO 本机管理 API 继承其可信本地进程模型；本实验不把它宣传成抵御恶意本机进程的认证层。绑定过房间的会话，其普通发送、追加指令、编辑重发、切换模型发送及侧边提问入口会返回 PEER_ROOM_REQUIRED；从房间移除也不恢复这些旧入口。绑定记录持久保存，目前没有解除绑定入口。已准入的房间发送凭后台内部上下文通过检查，HTTP 请求无法直接提供该上下文。此限制不是操作系统权限控制，也不代表所有本地管理能力均受房间约束。普通原生终端的能力保持原配置，不能把工作目录隔离说成整个操作系统隔离。
 
-当前没有房间 UI、自动拆分/依赖调度、统一广播入口或候选分支集成测试调度。不要把可调用后台 API 当作完整产品交付。正式迁移前须补齐这些入口和统一授权语义。
+当前没有房间 UI、自动拆分/依赖调度或候选分支集成测试调度。不要把可调用后台 API 当作完整产品交付。正式迁移前须补齐这些入口和统一授权语义。
+
+## 用户广播与重试语义
+
+`POST /peer-rooms/{roomId}/broadcast` 请求包含 `id`（1–100 字节稳定标识）、`epoch` 和 `message`（非空、最多 2000 字节）。用户广播不是模型 MCP 工具。每位接收者消耗同一房间总预算中的一次；预算不足时按成员顺序准入，返回部分成功，不假装全体接收。
+
+返回 `deliveries` 数组，每项包含 `session`、`state` 和可选 `detail`：
+- `accepted`：原生发送入口接受，不等于 Agent 已完成回答。
+- `already_accepted`：同一广播、成员和内容之前已接受，没有重复发送。
+- `blocked`：未获准入，包括预算不足、成员/代次变化及未决投递。
+- `uncertain`：发送失败或结果未能落库，禁止自动重放，需人工核查。
+
+收件人快照来自当前房间；每次预占还会重新验证房间状态、代次、成员与项目。并行发送已经获准的成员，暂停不强杀在途调用。重复请求须保持相同 id 与正文；不要为了绕过 uncertain 自动生成新 id。房间更新后旧 epoch 失效。
