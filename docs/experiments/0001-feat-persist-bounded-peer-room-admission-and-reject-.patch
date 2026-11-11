@@ -1,0 +1,1485 @@
+From 637e99124ff6f2bfa5a6a6c9c436eb09d0403bd7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Wed, 11 Nov 2026 20:03:19 +0800
+Subject: [PATCH 1/3] feat: persist bounded peer room admission and reject
+ stale deliveries
+
+---
+ backend/internal/cli/mcp_peer.go              |  26 +-
+ backend/internal/cli/mcp_peer_test.go         |  77 ++--
+ backend/internal/domain/peer_room.go          |  18 +
+ backend/internal/httpd/apispec/openapi.yaml   | 153 ++++++++
+ .../internal/httpd/apispec/specgen/build.go   |   7 +-
+ .../internal/httpd/controllers/peer_rooms.go  |  65 ++++
+ .../internal/httpd/controllers/sessions.go    |   3 +
+ .../internal/service/session/peer_rooms.go    |  46 +++
+ .../service/session/peer_rooms_test.go        |  71 ++++
+ .../internal/session_manager/chat_spawn.go    |   2 +
+ .../sqlite/migrate_burned_versions_test.go    | 337 +++++++++---------
+ .../20261111115713720_peer_rooms.sql          |   6 +
+ .../storage/sqlite/peer_rooms_test.go         | 129 +++++++
+ .../storage/sqlite/store/peer_rooms.go        | 148 ++++++++
+ frontend/src/api/schema.ts                    | 175 +++++++++
+ 15 files changed, 1033 insertions(+), 230 deletions(-)
+ create mode 100644 backend/internal/domain/peer_room.go
+ create mode 100644 backend/internal/httpd/controllers/peer_rooms.go
+ create mode 100644 backend/internal/service/session/peer_rooms.go
+ create mode 100644 backend/internal/service/session/peer_rooms_test.go
+ create mode 100644 backend/internal/storage/sqlite/migrations/20261111115713720_peer_rooms.sql
+ create mode 100644 backend/internal/storage/sqlite/peer_rooms_test.go
+ create mode 100644 backend/internal/storage/sqlite/store/peer_rooms.go
+
+diff --git a/backend/internal/cli/mcp_peer.go b/backend/internal/cli/mcp_peer.go
+index bab24c1..3bb0ee7 100644
+--- a/backend/internal/cli/mcp_peer.go
++++ b/backend/internal/cli/mcp_peer.go
+@@ -4,14 +4,16 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+ 	"net/url"
+ 	"os"
++	"strconv"
+ 	"strings"
+ )
+ 
+ var peerTool = map[string]any{
+ 	"name": "peer_send", "description": "Send a bounded message to another active member of this project's team. This starts a model turn and consumes account usage. Do not create reply loops. A receipt is not task completion. On failure do not automatically retry.",
+-	"inputSchema": map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"session": map[string]any{"type": "string"}, "message": map[string]any{"type": "string", "maxLength": 2000}}, "required": []string{"session", "message"}},
++	"inputSchema": map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"id": map[string]any{"type": "string", "description": "Stable unique delivery id; reuse only to check an identical request, never auto-replay failures."}, "session": map[string]any{"type": "string"}, "message": map[string]any{"type": "string", "maxLength": 2000}}, "required": []string{"id", "session", "message"}},
+ }
+ 
+ func (c *commandContext) callPeerSend(ctx context.Context, raw json.RawMessage) map[string]any {
+@@ -20,6 +22,7 @@ func (c *commandContext) callPeerSend(ctx context.Context, raw json.RawMessage)
+ 		return mcpToolError(fmt.Errorf("peer messaging is not enabled for this session"))
+ 	}
+ 	var args struct {
++		ID      string `json:"id"`
+ 		Session string `json:"session"`
+ 		Message string `json:"message"`
+ 	}
+@@ -31,18 +34,15 @@ func (c *commandContext) callPeerSend(ctx context.Context, raw json.RawMessage)
+ 	if args.Session == "" || args.Session == sender || len(args.Message) > 2000 || strings.TrimSpace(args.Message) == "" {
+ 		return mcpToolError(fmt.Errorf("invalid peer or message (maximum 2000 bytes; no self-send)"))
+ 	}
+-	for _, id := range []string{sender, args.Session} {
+-		var result sessionResponse
+-		if err := c.getJSON(ctx, "sessions/"+url.PathEscape(id), &result); err != nil {
+-			return mcpToolError(err)
+-		}
+-		if result.Session.ID != id || result.Session.ProjectID != project || result.Session.IsTerminated {
+-			return mcpToolError(fmt.Errorf("peer messaging requires active members of the enabled project"))
+-		}
++
++	room := os.Getenv("AO_PEER_ROOM")
++	epoch, err := strconv.ParseInt(os.Getenv("AO_PEER_EPOCH"), 10, 64)
++	if room == "" || epoch < 1 || err != nil || args.ID == "" {
++		return mcpToolError(fmt.Errorf("room binding and delivery id required"))
+ 	}
+-	// Reuse the daemon delivery path; never invoke a shell or change permissions.
+-	if err := c.sendMessage(ctx, sendOptions{session: args.Session, message: args.Message}); err != nil {
+-		return mcpToolError(fmt.Errorf("delivery failed or uncertain; do not automatically retry: %w", err))
++	msg := domain.PeerMessage{Sender: sender, Target: args.Session, ID: args.ID, Epoch: epoch, Message: args.Message}
++	if err = c.postJSON(ctx, "peer-rooms/"+url.PathEscape(room)+"/send", msg, nil); err != nil {
++		return mcpToolError(fmt.Errorf("delivery rejected or uncertain; do not automatically replay: %w", err))
+ 	}
+-	return map[string]any{"content": []any{mcpText("Message accepted. Recipient completion is not confirmed.")}}
++	return map[string]any{"content": []any{mcpText("Accepted or previously accepted. Recipient completion is not confirmed.")}}
+ }
+diff --git a/backend/internal/cli/mcp_peer_test.go b/backend/internal/cli/mcp_peer_test.go
+index e08dfbd..9bdc777 100644
+--- a/backend/internal/cli/mcp_peer_test.go
++++ b/backend/internal/cli/mcp_peer_test.go
+@@ -2,62 +2,43 @@ package cli
+ 
+ import (
+ 	"encoding/json"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+ 	"net/http"
+ 	"net/http/httptest"
+-	"strings"
+ 	"testing"
+ )
+ 
+-func TestPeerSendScope(t *testing.T) {
+-	for _, tc := range []struct {
+-		name, project, targetProject string
+-		terminated, allowed          bool
+-	}{
+-		{"same project", "p", "p", false, true}, {"disabled", "", "p", false, false}, {"other project", "p", "q", false, false}, {"terminated", "p", "p", true, false},
+-	} {
+-		t.Run(tc.name, func(t *testing.T) {
+-			t.Setenv("AO_SESSION_ID", "sender")
+-			t.Setenv("AO_PEER_PROJECT", tc.project)
+-			cfg := setConfigEnv(t)
+-			posts := 0
+-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-				w.Header().Set("Content-Type", "application/json")
+-				if r.Method == "GET" {
+-					id := strings.TrimPrefix(r.URL.Path, "/api/v1/sessions/")
+-					project := "p"
+-					if id == "receiver" {
+-						project = tc.targetProject
+-					}
+-					json.NewEncoder(w).Encode(map[string]any{"session": map[string]any{"id": id, "projectId": project, "isTerminated": tc.terminated}})
+-					return
+-				}
+-				posts++
+-				var body sendAPIRequest
+-				json.NewDecoder(r.Body).Decode(&body)
+-				if body.SenderSessionID != "sender" || body.UserAuthored {
+-					t.Error("sender provenance lost")
+-				}
+-				w.Write([]byte(`{}`))
+-			}))
+-			defer srv.Close()
+-			writeRunFileFor(t, cfg, srv)
+-			result := runMCP(t, mcpCall("peer_send", map[string]any{"session": "receiver", "message": "hello"}))[0]
+-			if tc.allowed {
+-				if result.Result.IsError || posts != 1 {
+-					t.Fatalf("expected one delivery: %+v posts=%d", result, posts)
+-				}
+-			} else if !result.Result.IsError || posts != 0 {
+-				t.Fatalf("expected rejection: %+v posts=%d", result, posts)
+-			}
+-		})
++func TestPeerSendUsesBoundRoom(t *testing.T) {
++	t.Setenv("AO_SESSION_ID", "sender")
++	t.Setenv("AO_PEER_PROJECT", "p")
++	t.Setenv("AO_PEER_ROOM", "r")
++	t.Setenv("AO_PEER_EPOCH", "7")
++	cfg := setConfigEnv(t)
++	calls := 0
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		calls++
++		if r.Method != "POST" || r.URL.Path != "/api/v1/peer-rooms/r/send" {
++			t.Error(r.URL)
++		}
++		var m domain.PeerMessage
++		json.NewDecoder(r.Body).Decode(&m)
++		if m.Sender != "sender" || m.Epoch != 7 || m.ID != "delivery-1" {
++			t.Error(m)
++		}
++		w.Write([]byte(`{}`))
++	}))
++	defer srv.Close()
++	writeRunFileFor(t, cfg, srv)
++	result := runMCP(t, mcpCall("peer_send", map[string]any{"id": "delivery-1", "session": "receiver", "message": "hello"}))[0]
++	if result.Result.IsError || calls != 1 {
++		t.Fatalf("%+v calls=%d", result, calls)
+ 	}
+ }
+-func TestPeerSendRejectsInvalidArguments(t *testing.T) {
++func TestPeerSendFailsClosed(t *testing.T) {
+ 	t.Setenv("AO_SESSION_ID", "sender")
+ 	t.Setenv("AO_PEER_PROJECT", "p")
+-	for _, args := range []map[string]any{{"session": "sender", "message": "x"}, {"session": "receiver", "message": ""}, {"session": "receiver", "message": strings.Repeat("x", 2001)}, {"session": "receiver", "message": "x", "sender": "spoof"}} {
+-		if !runMCP(t, mcpCall("peer_send", args))[0].Result.IsError {
+-			t.Fatal("invalid arguments accepted")
+-		}
++	t.Setenv("AO_PEER_ROOM", "")
++	if !runMCP(t, mcpCall("peer_send", map[string]any{"id": "x", "session": "receiver", "message": "hello"}))[0].Result.IsError {
++		t.Fatal("unbound room accepted")
+ 	}
+ }
+diff --git a/backend/internal/domain/peer_room.go b/backend/internal/domain/peer_room.go
+new file mode 100644
+index 0000000..ddb28a9
+--- /dev/null
++++ b/backend/internal/domain/peer_room.go
+@@ -0,0 +1,18 @@
++package domain
++
++type PeerRoom struct {
++	ID        string   `json:"id"`
++	ProjectID string   `json:"projectId"`
++	Members   []string `json:"members"`
++	Epoch     int64    `json:"epoch"`
++	Budget    int      `json:"budget"`
++	Used      int      `json:"used"`
++	Paused    bool     `json:"paused"`
++}
++type PeerMessage struct {
++	Sender  string `json:"sender"`
++	Target  string `json:"target"`
++	ID      string `json:"id"`
++	Epoch   int64  `json:"epoch"`
++	Message string `json:"message"`
++}
+diff --git a/backend/internal/httpd/apispec/openapi.yaml b/backend/internal/httpd/apispec/openapi.yaml
+index 87c0355..6f31de2 100644
+--- a/backend/internal/httpd/apispec/openapi.yaml
++++ b/backend/internal/httpd/apispec/openapi.yaml
+@@ -4474,6 +4474,104 @@ paths:
+       summary: Start a worker task and refine its title in the background
+       tags:
+       - sessions
++  /api/v1/peer-rooms/{roomId}:
++    get:
++      operationId: getPeerRoom
++      parameters:
++      - in: path
++        name: roomId
++        required: true
++        schema:
++          type: string
++      responses:
++        "200":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/PeerRoom'
++          description: OK
++        "404":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Not Found
++      summary: Read bounded peer room
++      tags:
++      - sessions
++    put:
++      operationId: configurePeerRoom
++      parameters:
++      - in: path
++        name: roomId
++        required: true
++        schema:
++          type: string
++      requestBody:
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/PeerRoom'
++        required: true
++      responses:
++        "200":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/PeerRoom'
++          description: OK
++        "400":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Bad Request
++        "409":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Conflict
++      summary: Configure peer room with expected epoch
++      tags:
++      - sessions
++  /api/v1/peer-rooms/{roomId}/send:
++    post:
++      operationId: sendPeerRoomMessage
++      parameters:
++      - in: path
++        name: roomId
++        required: true
++        schema:
++          type: string
++      requestBody:
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/PeerMessage'
++        required: true
++      responses:
++        "200":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/PeerSendResponse'
++          description: OK
++        "400":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Bad Request
++        "409":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Conflict
++      summary: Reserve budget and deliver once
++      tags:
++      - sessions
+   /api/v1/projects:
+     get:
+       operationId: listProjects
+@@ -19057,6 +19155,61 @@ components:
+       - targetSha
+       - status
+       type: object
++    PeerMessage:
++      properties:
++        epoch:
++          format: int64
++          type: integer
++        id:
++          type: string
++        message:
++          type: string
++        sender:
++          type: string
++        target:
++          type: string
++      required:
++      - sender
++      - target
++      - id
++      - epoch
++      - message
++      type: object
++    PeerRoom:
++      properties:
++        budget:
++          type: integer
++        epoch:
++          format: int64
++          type: integer
++        id:
++          type: string
++        members:
++          items:
++            type: string
++          type: array
++        paused:
++          type: boolean
++        projectId:
++          type: string
++        used:
++          type: integer
++      required:
++      - id
++      - projectId
++      - members
++      - epoch
++      - budget
++      - used
++      - paused
++      type: object
++    PeerSendResponse:
++      properties:
++        accepted:
++          type: boolean
++      required:
++      - accepted
++      type: object
+     PrepareTaskResponse:
+       properties:
+         ok:
+diff --git a/backend/internal/httpd/apispec/specgen/build.go b/backend/internal/httpd/apispec/specgen/build.go
+index e38b0d0..14d2d26 100644
+--- a/backend/internal/httpd/apispec/specgen/build.go
++++ b/backend/internal/httpd/apispec/specgen/build.go
+@@ -159,7 +159,8 @@ func schemaName(_ reflect.Type, defaultName string) string {
+ // schemaNames is the exhaustive default→clean mapping for every type reflected
+ // by projectOperations(). Add an entry when a new contract type is introduced;
+ // the drift test fails until the spec is regenerated, which flags the gap.
+-var schemaNames = map[string]string{ //nolint:gosec // Public OpenAPI type names include reset-credit contracts; no credential value is stored here.
++var schemaNames = map[string]string{
++	"DomainPeerRoom": "PeerRoom", "DomainPeerMessage": "PeerMessage", "ControllersPeerRoomIDParam": "PeerRoomIDParam", "ControllersPeerSendResponse": "PeerSendResponse", //nolint:gosec // Public OpenAPI type names include reset-credit contracts; no credential value is stored here.
+ 	"ControllersTelemetryIdentityResponse":                 "TelemetryIdentityResponse",
+ 	"ControllersAgentAccountIDParam":                       "AgentAccountIDParam",
+ 	"ControllersAgentAccountLoginIDParam":                  "AgentAccountLoginIDParam",
+@@ -3727,6 +3728,10 @@ func sessionOperations() []operation {
+ 				{http.StatusInternalServerError, envelope.APIError{}},
+ 			},
+ 		},
++		{method: http.MethodGet, path: "/api/v1/peer-rooms/{roomId}", id: "getPeerRoom", tag: "sessions", summary: "Read bounded peer room", pathParams: []any{controllers.PeerRoomIDParam{}}, resps: []respUnit{{200, domain.PeerRoom{}}, {404, envelope.APIError{}}}},
++		{method: http.MethodPut, path: "/api/v1/peer-rooms/{roomId}", id: "configurePeerRoom", tag: "sessions", summary: "Configure peer room with expected epoch", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: domain.PeerRoom{}, resps: []respUnit{{200, domain.PeerRoom{}}, {400, envelope.APIError{}}, {409, envelope.APIError{}}}},
++		{method: http.MethodPost, path: "/api/v1/peer-rooms/{roomId}/send", id: "sendPeerRoomMessage", tag: "sessions", summary: "Reserve budget and deliver once", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: domain.PeerMessage{}, resps: []respUnit{{200, controllers.PeerSendResponse{}}, {400, envelope.APIError{}}, {409, envelope.APIError{}}}},
++
+ 		{
+ 			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/send", id: "sendSessionMessage", tag: "sessions",
+ 			summary:    "Send a message to a running session's agent",
+diff --git a/backend/internal/httpd/controllers/peer_rooms.go b/backend/internal/httpd/controllers/peer_rooms.go
+new file mode 100644
+index 0000000..9d784a1
+--- /dev/null
++++ b/backend/internal/httpd/controllers/peer_rooms.go
+@@ -0,0 +1,65 @@
++package controllers
++
++import (
++	"context"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
++	"github.com/go-chi/chi/v5"
++	"net/http"
++)
++
++type PeerRoomIDParam struct {
++	RoomID string `path:"roomId"`
++}
++type PeerSendResponse struct {
++	Accepted bool `json:"accepted"`
++}
++type peerRoomService interface {
++	GetPeerRoom(context.Context, string) (domain.PeerRoom, error)
++	ConfigurePeerRoom(context.Context, domain.PeerRoom) (domain.PeerRoom, error)
++	SendPeerMessage(context.Context, string, domain.PeerMessage) error
++}
++
++func (c *SessionsController) peerRoom(w http.ResponseWriter, r *http.Request) {
++	svc, ok := c.Svc.(peerRoomService)
++	if !ok {
++		http.Error(w, "unavailable", 503)
++		return
++	}
++	id := chi.URLParam(r, "roomId")
++	if r.Method == "GET" {
++		room, err := svc.GetPeerRoom(r.Context(), id)
++		if err != nil {
++			envelope.WriteAPIError(w, r, 404, "not_found", "PEER_ROOM_NOT_FOUND", "room unavailable", nil)
++			return
++		}
++		envelope.WriteJSON(w, 200, room)
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, 8192)
++	if r.Method == "PUT" {
++		var room domain.PeerRoom
++		if err := decodeJSON(r, &room); err != nil {
++			envelope.WriteAPIError(w, r, 400, "bad_request", "INVALID_JSON", "invalid configuration", nil)
++			return
++		}
++		room.ID = id
++		result, err := svc.ConfigurePeerRoom(r.Context(), room)
++		if err != nil {
++			envelope.WriteAPIError(w, r, 409, "conflict", "PEER_ROOM_REJECTED", err.Error(), nil)
++			return
++		}
++		envelope.WriteJSON(w, 200, result)
++		return
++	}
++	var msg domain.PeerMessage
++	if err := decodeJSON(r, &msg); err != nil {
++		envelope.WriteAPIError(w, r, 400, "bad_request", "INVALID_JSON", "invalid message", nil)
++		return
++	}
++	if err := svc.SendPeerMessage(r.Context(), id, msg); err != nil {
++		envelope.WriteAPIError(w, r, 409, "conflict", "PEER_MESSAGE_REJECTED", err.Error(), nil)
++		return
++	}
++	envelope.WriteJSON(w, 200, PeerSendResponse{true})
++}
+diff --git a/backend/internal/httpd/controllers/sessions.go b/backend/internal/httpd/controllers/sessions.go
+index c7be471..b436a4d 100644
+--- a/backend/internal/httpd/controllers/sessions.go
++++ b/backend/internal/httpd/controllers/sessions.go
+@@ -208,6 +208,9 @@ type SessionsController struct {
+ 
+ // Register mounts the session routes on the supplied router.
+ func (c *SessionsController) Register(r chi.Router) {
++	r.Get("/peer-rooms/{roomId}", c.peerRoom)
++	r.Put("/peer-rooms/{roomId}", c.peerRoom)
++	r.Post("/peer-rooms/{roomId}/send", c.peerRoom)
+ 	r.Get("/sessions", c.list)
+ 	r.Post("/sessions", c.spawn)
+ 	r.Post("/sessions/cleanup", c.cleanup)
+diff --git a/backend/internal/service/session/peer_rooms.go b/backend/internal/service/session/peer_rooms.go
+new file mode 100644
+index 0000000..9d10c82
+--- /dev/null
++++ b/backend/internal/service/session/peer_rooms.go
+@@ -0,0 +1,46 @@
++package session
++
++import (
++	"context"
++	"fmt"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++)
++
++type peerRoomStore interface {
++	GetPeerRoom(context.Context, string) (domain.PeerRoom, error)
++	ConfigurePeerRoom(context.Context, domain.PeerRoom) (domain.PeerRoom, error)
++	ReservePeerMessage(context.Context, string, domain.PeerMessage) (bool, error)
++	FinishPeerMessage(context.Context, string, string, bool) error
++}
++
++func (s *Service) GetPeerRoom(ctx context.Context, id string) (domain.PeerRoom, error) {
++	p, ok := s.store.(peerRoomStore)
++	if !ok {
++		return domain.PeerRoom{}, fmt.Errorf("peer rooms unavailable")
++	}
++	return p.GetPeerRoom(ctx, id)
++}
++func (s *Service) ConfigurePeerRoom(ctx context.Context, r domain.PeerRoom) (domain.PeerRoom, error) {
++	p, ok := s.store.(peerRoomStore)
++	if !ok {
++		return r, fmt.Errorf("peer rooms unavailable")
++	}
++	return p.ConfigurePeerRoom(ctx, r)
++}
++func (s *Service) SendPeerMessage(ctx context.Context, id string, m domain.PeerMessage) error {
++	p, ok := s.store.(peerRoomStore)
++	if !ok {
++		return fmt.Errorf("peer rooms unavailable")
++	}
++	admitted, err := p.ReservePeerMessage(ctx, id, m)
++	if err != nil || !admitted {
++		return err
++	}
++	err = s.manager.SendWithOptions(ctx, domain.SessionID(m.Target), m.Message, nil, ports.MessageDeliveryOptions{SenderSessionID: m.Sender})
++	finalErr := p.FinishPeerMessage(context.WithoutCancel(ctx), id, m.ID, err == nil)
++	if err != nil {
++		return fmt.Errorf("delivery failed or uncertain; no automatic replay: %w", err)
++	}
++	return finalErr
++}
+diff --git a/backend/internal/service/session/peer_rooms_test.go b/backend/internal/service/session/peer_rooms_test.go
+new file mode 100644
+index 0000000..b6721ed
+--- /dev/null
++++ b/backend/internal/service/session/peer_rooms_test.go
+@@ -0,0 +1,71 @@
++package session
++
++import (
++	"context"
++	"errors"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"testing"
++)
++
++type peerStoreFake struct {
++	Store
++	pending, accepted bool
++	reserveErr        error
++}
++
++func (p *peerStoreFake) GetPeerRoom(context.Context, string) (domain.PeerRoom, error) {
++	return domain.PeerRoom{}, nil
++}
++func (p *peerStoreFake) ConfigurePeerRoom(_ context.Context, r domain.PeerRoom) (domain.PeerRoom, error) {
++	return r, nil
++}
++func (p *peerStoreFake) ReservePeerMessage(context.Context, string, domain.PeerMessage) (bool, error) {
++	if p.reserveErr != nil {
++		return false, p.reserveErr
++	}
++	if p.pending {
++		if p.accepted {
++			return false, nil
++		}
++		return false, errors.New("uncertain")
++	}
++	p.pending = true
++	return true, nil
++}
++func (p *peerStoreFake) FinishPeerMessage(_ context.Context, _, _ string, ok bool) error {
++	p.accepted = ok
++	return nil
++}
++func TestPeerRoomDeliveryDoesNotReplay(t *testing.T) {
++	for _, failure := range []bool{false, true} {
++		t.Run(map[bool]string{false: "accepted", true: "uncertain"}[failure], func(t *testing.T) {
++			p := &peerStoreFake{}
++			calls := 0
++			m := &fakeCommander{sendFunc: func(domain.SessionID, string) error {
++				calls++
++				if failure {
++					return errors.New("connection lost")
++				}
++				return nil
++			}}
++			s := NewWithDeps(Deps{Store: p, Manager: m})
++			msg := domain.PeerMessage{ID: "x", Sender: "a", Target: "b"}
++			err := s.SendPeerMessage(context.Background(), "r", msg)
++			if (err != nil) != failure {
++				t.Fatal(err)
++			}
++			s.SendPeerMessage(context.Background(), "r", msg)
++			if calls != 1 {
++				t.Fatal(calls)
++			}
++		})
++	}
++}
++func TestPeerRoomRejectionNeverCallsAgent(t *testing.T) {
++	p := &peerStoreFake{reserveErr: errors.New("paused")}
++	calls := 0
++	s := NewWithDeps(Deps{Store: p, Manager: &fakeCommander{sendFunc: func(domain.SessionID, string) error { calls++; return nil }}})
++	if s.SendPeerMessage(context.Background(), "r", domain.PeerMessage{}) == nil || calls != 0 {
++		t.Fatal("rejection failed")
++	}
++}
+diff --git a/backend/internal/session_manager/chat_spawn.go b/backend/internal/session_manager/chat_spawn.go
+index 81646b0..eb7156a 100644
+--- a/backend/internal/session_manager/chat_spawn.go
++++ b/backend/internal/session_manager/chat_spawn.go
+@@ -370,6 +370,8 @@ func (m *Manager) aoMCPServers(ctx context.Context, harness domain.AgentHarness,
+ 	}
+ 	if project := os.Getenv("AO_PEER_PROJECT"); project != "" {
+ 		serverEnv["AO_PEER_PROJECT"] = project
++		serverEnv["AO_PEER_ROOM"] = os.Getenv("AO_PEER_ROOM")
++		serverEnv["AO_PEER_EPOCH"] = os.Getenv("AO_PEER_EPOCH")
+ 	}
+ 	if m.computerUseEnabled(ctx) {
+ 		serverEnv[envComputerUse] = "1"
+diff --git a/backend/internal/storage/sqlite/migrate_burned_versions_test.go b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+index aab2603..f849a8c 100644
+--- a/backend/internal/storage/sqlite/migrate_burned_versions_test.go
++++ b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+@@ -20,174 +20,175 @@ import (
+ // session list). Renaming, renumbering, or deleting a shipped migration
+ // produces exactly that class of failure, so this list is append-only.
+ var shippedMigrations = map[int64]string{
+-	1:   "0001_init.sql",
+-	2:   "0002_remove_activity_source.sql",
+-	3:   "0003_add_session_display_name.sql",
+-	4:   "0004_scm_observer_schema.sql",
+-	5:   "0005_pr_last_nudge_signature.sql",
+-	6:   "0006_pr_session_changed_cdc.sql",
+-	7:   "0007_allow_implemented_harnesses.sql",
+-	8:   "0008_add_project_config.sql",
+-	9:   "0009_workspace_projects.sql",
+-	10:  "0010_add_first_signal_at.sql",
+-	11:  "0011_notifications.sql",
+-	12:  "0012_add_review_tables.sql",
+-	13:  "0013_review_run_unique_sha.sql",
+-	14:  "0014_review_run_retry_failed.sql",
+-	15:  "0015_telemetry_events.sql",
+-	16:  "0016_review_run_github_review_id.sql",
+-	17:  "0017_add_session_preview_url.sql",
+-	18:  "0018_review_run_delivered_at.sql",
+-	19:  "0019_add_session_preview_revision.sql",
+-	20:  "0020_review_run_unique_pr_sha.sql",
+-	21:  "0021_pr_reviews.sql",
+-	23:  "0023_review_run_retry_cancelled.sql",
+-	24:  "0024_session_rename_cdc.sql",
+-	25:  "0025_worker_idle_outbox.sql",
+-	26:  "0026_allow_fake_harness.sql",
+-	27:  "0027_shell_terminals.sql",
+-	28:  "0028_allow_scratch_projects.sql",
+-	29:  "0029_pr_reviews_body.sql",
+-	30:  "0030_session_cleanup_facts.sql",
+-	31:  "0031_notification_history_pagination.sql",
+-	32:  "0032_pr_state_changed_at.sql",
+-	33:  "0033_add_session_runtime_launch_id.sql",
+-	34:  "0034_add_session_workspace_repo_path.sql",
+-	35:  "0035_add_session_terminate_on_pr_merge.sql",
+-	36:  "0036_add_shell_terminal_session_id.sql",
+-	37:  "0037_drop_worker_idle_outbox.sql",
+-	38:  "0038_orchestrator_reengagement.sql",
+-	39:  "0039_drop_orchestrator_reengagement.sql",
+-	40:  "0040_add_session_diff_base.sql",
+-	41:  "0041_notification_resolution.sql",
+-	42:  "0042_review_run_unique_per_harness.sql",
+-	43:  "0043_add_session_pinned.sql",
+-	44:  "0044_backfill_review_run_batch_id.sql",
+-	47:  "0047_agent_model_catalog.sql",
+-	48:  "0048_review_agent_session_id.sql",
+-	49:  "0049_review_per_harness.sql",
+-	52:  "0052_model_usage.sql",
+-	53:  "0053_allow_muse_harness.sql",
+-	54:  "0054_allow_kimchi_harness.sql",
+-	66:  "0066_chat_session_mode.sql",
+-	67:  "0067_app_settings.sql",
+-	68:  "0068_conversation_turn_settings.sql",
+-	69:  "0069_conversation_compaction.sql",
+-	70:  "0070_command_output_and_diffs.sql",
+-	71:  "0071_conversation_usage.sql",
+-	72:  "0072_conversation_history_ops.sql",
+-	73:  "0073_conversation_provider_state.sql",
+-	74:  "0074_activity_kinds_mcp_and_auto_review.sql",
+-	75:  "0075_conversation_user_input.sql",
+-	76:  "0076_conversation_delivery_content_and_cost.sql",
+-	77:  "0077_cancelled_conversation_activities.sql",
+-	78:  "0078_session_interface_transitions.sql",
+-	79:  "0079_session_interface_transition_delivery.sql",
+-	80:  "0080_review_per_harness.sql",
+-	81:  "0081_browser_capability_verifier.sql",
+-	82:  "0082_allow_prime_agent_harness.sql",
+-	83:  "0083_reconcile_kimchi_prime_agent_harnesses.sql",
+-	84:  "0084_add_session_auto_inject_review.sql",
+-	85:  "0085_agent_switching.sql",
+-	86:  "0086_workspace_repo_default_branch.sql",
+-	87:  "0087_conversation_branches.sql",
+-	88:  "0088_add_auto_inject_ci_toggle.sql",
+-	89:  "0089_conversation_turn_promotion.sql",
+-	90:  "0090_workspace_git_status.sql",
+-	91:  "0091_session_auto_review.sql",
+-	92:  "0092_pr_reviews_target_sha.sql",
+-	93:  "0093_review_run_trigger_source.sql",
+-	94:  "0094_agent_switch_recovery.sql",
+-	95:  "0095_allow_omp_harness.sql",
+-	96:  "0096_session_worktree_base_ref.sql",
+-	97:  "0097_pr_provider_identity.sql",
+-	98:  "0098_session_native_identity_generation.sql",
+-	99:  "0099_interface_transition_notice_acknowledgement.sql",
+-	100: "0100_session_model.sql",
+-	101: "0101_conversation_provider_ownership_epochs.sql",
+-	102: "0102_canonical_usage.sql",
+-	103: "0103_review_run_cdc.sql",
+-	104: "0104_agent_inventory_cache.sql",
+-	105: "0105_default_session_mode_chat.sql",
+-	106: "0106_pr_comment_review_id.sql",
+-	107: "0107_recovered_conversation_turns.sql",
+-	108: "0108_conversation_retry_source.sql",
+-	109: "0109_session_latest_user_prompt_at.sql",
+-	110: "0110_approximate_conversation_branches.sql",
+-	111: "0111_pr_auto_inject_ci_cdc.sql",
+-	112: "0112_app_settings_cloud_offering.sql",
+-	113: "0113_usage_cost_estimation.sql",
+-	114: "0114_usage_cost_candidate_canonical_index.sql",
+-	115: "0115_usage_measurement_and_provider_usage.sql",
+-	116: "0116_usage_billing_provider_source.sql",
+-	117: "0117_allow_kimi_usage.sql",
+-	118: "0118_cancelled_conversation_turns.sql",
+-	119: "0119_finalize_completed_conversation_plans.sql",
+-	120: "0120_normalize_activity_last_at.sql",
+-	121: "0121_session_reviewer_agent_config.sql",
+-	122: "0122_drop_agent_inventory_cache.sql",
+-	123: "0123_agent_install_jobs.sql",
+-	124: "0124_codex_account_management.sql",
+-	125: "0125_agent_switch_failure_observability.sql",
+-	126: "0126_canonical_repository_identity.sql",
+-	127: "0127_session_permissions.sql",
+-	128: "0128_pr_author_avatar_url.sql",
+-	129: "0129_change_log_retention_index.sql",
+-	130: "0130_pr_review_partial.sql",
+-	131: "0131_repair_intermediate_pr_review_certainty.sql",
+-	132: "0132_conversation_opencode_mode.sql",
+-	133: "0133_shell_terminal_lifetime.sql",
+-	134: "0134_review_activity_state.sql",
+-	135: "0135_review_launch_id.sql",
+-	136: "0136_conversation_queued_edit_delivery.sql",
+-	137: "0137_conversation_edit_delivery.sql",
+-	138: "0138_conversation_edit_dispatch_boundary.sql",
+-	139: "0139_conversation_steer_delivery.sql",
+-	140: "0140_standalone_sessions.sql",
+-	141: "0141_conversation_checkpoint_provenance.sql",
+-	142: "0142_conversation_checkpoint_unsettled.sql",
+-	143: "0143_conversation_checkpoint_turn.sql",
+-	144: "0144_session_revision.sql",
+-	145: "0145_native_checkpoint_evidence.sql",
+-	146: "0146_codex_account_management_simplification.sql",
+-	147: "0147_native_history_provenance.sql",
+-	148: "0148_notification_dismissal.sql",
+-	149: "0149_reviewer_chat_conversations.sql",
+-	150: "0150_agent_model_catalog_cache_state.sql",
+-	151: "0151_global_agent_model_catalog_cdc.sql",
+-	152: "0152_session_effort.sql",
+-	153: "0153_reports.sql",
+-	154: "0154_report_delivery.sql",
+-	155: "0155_allow_unreal_agent_harness.sql",
+-	156: "0156_session_provisioning.sql",
+-	157: "0157_task_preparations.sql",
+-	158: "0158_prepared_worktree_creation_sha.sql",
+-	159: "0159_pr_discussion_comment_count.sql",
+-	160: "0160_pr_discussion_commenters.sql",
+-	161: "0161_automations.sql",
+-	162: "0162_drop_pr_discussion_columns.sql",
+-	163: "0163_allow_fx_harness.sql",
+-	164: "0164_allow_gemini_harness.sql",
+-	165: "0165_allow_mimo_code_harness.sql",
+-	166: "0166_allow_deepseek_harness.sql",
+-	167: "0167_allow_opencode_v2_harness.sql",
+-	168: "0168_cues.sql",
+-	169: "0169_reported_pr_cdc.sql",
+-	170: "0170_review_result_notifications.sql",
+-	171: "0171_shell_preview_capability.sql",
+-	172: "0172_client_task_requests.sql",
+-	173: "0173_chat_client_payload_hash.sql",
+-	174: "0174_conversation_account_cdc.sql",
+-	175: "0175_codex_subagent_activity.sql",
+-	176: "0176_claude_subagent_activity.sql",
+-	177: "0177_review_run_rerun_same_head.sql",
+-	178: "0178_archive_reviewers.sql",
+-	179: "0179_conversation_message_sender.sql",
+-	180: "0180_session_provision_steps.sql",
+-	181: "0181_session_artifacts.sql",
+-	185: "0185_worktree_startup_cues.sql",
+-	186: "0186_remove_cue_description.sql",
+-	187: "0187_remove_cue_startup_options.sql",
++	20261111115713720: "20261111115713720_peer_rooms.sql",
++	1:                 "0001_init.sql",
++	2:                 "0002_remove_activity_source.sql",
++	3:                 "0003_add_session_display_name.sql",
++	4:                 "0004_scm_observer_schema.sql",
++	5:                 "0005_pr_last_nudge_signature.sql",
++	6:                 "0006_pr_session_changed_cdc.sql",
++	7:                 "0007_allow_implemented_harnesses.sql",
++	8:                 "0008_add_project_config.sql",
++	9:                 "0009_workspace_projects.sql",
++	10:                "0010_add_first_signal_at.sql",
++	11:                "0011_notifications.sql",
++	12:                "0012_add_review_tables.sql",
++	13:                "0013_review_run_unique_sha.sql",
++	14:                "0014_review_run_retry_failed.sql",
++	15:                "0015_telemetry_events.sql",
++	16:                "0016_review_run_github_review_id.sql",
++	17:                "0017_add_session_preview_url.sql",
++	18:                "0018_review_run_delivered_at.sql",
++	19:                "0019_add_session_preview_revision.sql",
++	20:                "0020_review_run_unique_pr_sha.sql",
++	21:                "0021_pr_reviews.sql",
++	23:                "0023_review_run_retry_cancelled.sql",
++	24:                "0024_session_rename_cdc.sql",
++	25:                "0025_worker_idle_outbox.sql",
++	26:                "0026_allow_fake_harness.sql",
++	27:                "0027_shell_terminals.sql",
++	28:                "0028_allow_scratch_projects.sql",
++	29:                "0029_pr_reviews_body.sql",
++	30:                "0030_session_cleanup_facts.sql",
++	31:                "0031_notification_history_pagination.sql",
++	32:                "0032_pr_state_changed_at.sql",
++	33:                "0033_add_session_runtime_launch_id.sql",
++	34:                "0034_add_session_workspace_repo_path.sql",
++	35:                "0035_add_session_terminate_on_pr_merge.sql",
++	36:                "0036_add_shell_terminal_session_id.sql",
++	37:                "0037_drop_worker_idle_outbox.sql",
++	38:                "0038_orchestrator_reengagement.sql",
++	39:                "0039_drop_orchestrator_reengagement.sql",
++	40:                "0040_add_session_diff_base.sql",
++	41:                "0041_notification_resolution.sql",
++	42:                "0042_review_run_unique_per_harness.sql",
++	43:                "0043_add_session_pinned.sql",
++	44:                "0044_backfill_review_run_batch_id.sql",
++	47:                "0047_agent_model_catalog.sql",
++	48:                "0048_review_agent_session_id.sql",
++	49:                "0049_review_per_harness.sql",
++	52:                "0052_model_usage.sql",
++	53:                "0053_allow_muse_harness.sql",
++	54:                "0054_allow_kimchi_harness.sql",
++	66:                "0066_chat_session_mode.sql",
++	67:                "0067_app_settings.sql",
++	68:                "0068_conversation_turn_settings.sql",
++	69:                "0069_conversation_compaction.sql",
++	70:                "0070_command_output_and_diffs.sql",
++	71:                "0071_conversation_usage.sql",
++	72:                "0072_conversation_history_ops.sql",
++	73:                "0073_conversation_provider_state.sql",
++	74:                "0074_activity_kinds_mcp_and_auto_review.sql",
++	75:                "0075_conversation_user_input.sql",
++	76:                "0076_conversation_delivery_content_and_cost.sql",
++	77:                "0077_cancelled_conversation_activities.sql",
++	78:                "0078_session_interface_transitions.sql",
++	79:                "0079_session_interface_transition_delivery.sql",
++	80:                "0080_review_per_harness.sql",
++	81:                "0081_browser_capability_verifier.sql",
++	82:                "0082_allow_prime_agent_harness.sql",
++	83:                "0083_reconcile_kimchi_prime_agent_harnesses.sql",
++	84:                "0084_add_session_auto_inject_review.sql",
++	85:                "0085_agent_switching.sql",
++	86:                "0086_workspace_repo_default_branch.sql",
++	87:                "0087_conversation_branches.sql",
++	88:                "0088_add_auto_inject_ci_toggle.sql",
++	89:                "0089_conversation_turn_promotion.sql",
++	90:                "0090_workspace_git_status.sql",
++	91:                "0091_session_auto_review.sql",
++	92:                "0092_pr_reviews_target_sha.sql",
++	93:                "0093_review_run_trigger_source.sql",
++	94:                "0094_agent_switch_recovery.sql",
++	95:                "0095_allow_omp_harness.sql",
++	96:                "0096_session_worktree_base_ref.sql",
++	97:                "0097_pr_provider_identity.sql",
++	98:                "0098_session_native_identity_generation.sql",
++	99:                "0099_interface_transition_notice_acknowledgement.sql",
++	100:               "0100_session_model.sql",
++	101:               "0101_conversation_provider_ownership_epochs.sql",
++	102:               "0102_canonical_usage.sql",
++	103:               "0103_review_run_cdc.sql",
++	104:               "0104_agent_inventory_cache.sql",
++	105:               "0105_default_session_mode_chat.sql",
++	106:               "0106_pr_comment_review_id.sql",
++	107:               "0107_recovered_conversation_turns.sql",
++	108:               "0108_conversation_retry_source.sql",
++	109:               "0109_session_latest_user_prompt_at.sql",
++	110:               "0110_approximate_conversation_branches.sql",
++	111:               "0111_pr_auto_inject_ci_cdc.sql",
++	112:               "0112_app_settings_cloud_offering.sql",
++	113:               "0113_usage_cost_estimation.sql",
++	114:               "0114_usage_cost_candidate_canonical_index.sql",
++	115:               "0115_usage_measurement_and_provider_usage.sql",
++	116:               "0116_usage_billing_provider_source.sql",
++	117:               "0117_allow_kimi_usage.sql",
++	118:               "0118_cancelled_conversation_turns.sql",
++	119:               "0119_finalize_completed_conversation_plans.sql",
++	120:               "0120_normalize_activity_last_at.sql",
++	121:               "0121_session_reviewer_agent_config.sql",
++	122:               "0122_drop_agent_inventory_cache.sql",
++	123:               "0123_agent_install_jobs.sql",
++	124:               "0124_codex_account_management.sql",
++	125:               "0125_agent_switch_failure_observability.sql",
++	126:               "0126_canonical_repository_identity.sql",
++	127:               "0127_session_permissions.sql",
++	128:               "0128_pr_author_avatar_url.sql",
++	129:               "0129_change_log_retention_index.sql",
++	130:               "0130_pr_review_partial.sql",
++	131:               "0131_repair_intermediate_pr_review_certainty.sql",
++	132:               "0132_conversation_opencode_mode.sql",
++	133:               "0133_shell_terminal_lifetime.sql",
++	134:               "0134_review_activity_state.sql",
++	135:               "0135_review_launch_id.sql",
++	136:               "0136_conversation_queued_edit_delivery.sql",
++	137:               "0137_conversation_edit_delivery.sql",
++	138:               "0138_conversation_edit_dispatch_boundary.sql",
++	139:               "0139_conversation_steer_delivery.sql",
++	140:               "0140_standalone_sessions.sql",
++	141:               "0141_conversation_checkpoint_provenance.sql",
++	142:               "0142_conversation_checkpoint_unsettled.sql",
++	143:               "0143_conversation_checkpoint_turn.sql",
++	144:               "0144_session_revision.sql",
++	145:               "0145_native_checkpoint_evidence.sql",
++	146:               "0146_codex_account_management_simplification.sql",
++	147:               "0147_native_history_provenance.sql",
++	148:               "0148_notification_dismissal.sql",
++	149:               "0149_reviewer_chat_conversations.sql",
++	150:               "0150_agent_model_catalog_cache_state.sql",
++	151:               "0151_global_agent_model_catalog_cdc.sql",
++	152:               "0152_session_effort.sql",
++	153:               "0153_reports.sql",
++	154:               "0154_report_delivery.sql",
++	155:               "0155_allow_unreal_agent_harness.sql",
++	156:               "0156_session_provisioning.sql",
++	157:               "0157_task_preparations.sql",
++	158:               "0158_prepared_worktree_creation_sha.sql",
++	159:               "0159_pr_discussion_comment_count.sql",
++	160:               "0160_pr_discussion_commenters.sql",
++	161:               "0161_automations.sql",
++	162:               "0162_drop_pr_discussion_columns.sql",
++	163:               "0163_allow_fx_harness.sql",
++	164:               "0164_allow_gemini_harness.sql",
++	165:               "0165_allow_mimo_code_harness.sql",
++	166:               "0166_allow_deepseek_harness.sql",
++	167:               "0167_allow_opencode_v2_harness.sql",
++	168:               "0168_cues.sql",
++	169:               "0169_reported_pr_cdc.sql",
++	170:               "0170_review_result_notifications.sql",
++	171:               "0171_shell_preview_capability.sql",
++	172:               "0172_client_task_requests.sql",
++	173:               "0173_chat_client_payload_hash.sql",
++	174:               "0174_conversation_account_cdc.sql",
++	175:               "0175_codex_subagent_activity.sql",
++	176:               "0176_claude_subagent_activity.sql",
++	177:               "0177_review_run_rerun_same_head.sql",
++	178:               "0178_archive_reviewers.sql",
++	179:               "0179_conversation_message_sender.sql",
++	180:               "0180_session_provision_steps.sql",
++	181:               "0181_session_artifacts.sql",
++	185:               "0185_worktree_startup_cues.sql",
++	186:               "0186_remove_cue_description.sql",
++	187:               "0187_remove_cue_startup_options.sql",
+ 	// 188 removes the obsolete cue worktree-startup schema; project setup now
+ 	// owns automatic workspace initialization.
+ 	188: "0188_remove_worktree_startup_cues.sql",
+diff --git a/backend/internal/storage/sqlite/migrations/20261111115713720_peer_rooms.sql b/backend/internal/storage/sqlite/migrations/20261111115713720_peer_rooms.sql
+new file mode 100644
+index 0000000..e8b825b
+--- /dev/null
++++ b/backend/internal/storage/sqlite/migrations/20261111115713720_peer_rooms.sql
+@@ -0,0 +1,6 @@
++-- +goose Up
++CREATE TABLE peer_rooms (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), members TEXT NOT NULL, epoch INTEGER NOT NULL, budget INTEGER NOT NULL CHECK(budget BETWEEN 1 AND 100), used INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0);
++CREATE TABLE peer_deliveries (room_id TEXT NOT NULL REFERENCES peer_rooms(id), id TEXT NOT NULL, digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','accepted','uncertain')), PRIMARY KEY(room_id,id));
++-- +goose Down
++DROP TABLE peer_deliveries;
++DROP TABLE peer_rooms;
+diff --git a/backend/internal/storage/sqlite/peer_rooms_test.go b/backend/internal/storage/sqlite/peer_rooms_test.go
+new file mode 100644
+index 0000000..2d4bd91
+--- /dev/null
++++ b/backend/internal/storage/sqlite/peer_rooms_test.go
+@@ -0,0 +1,129 @@
++package sqlite
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestPeerRoomDurableAdmission(t *testing.T) {
++	ctx := context.Background()
++	dir := t.TempDir()
++	s, err := Open(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	db, err := sql.Open("sqlite", filepath.Join(dir, "ao.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	now := time.Now().UTC()
++	for _, p := range []string{"p", "q"} {
++		if _, err = db.Exec("INSERT INTO projects(id,path,display_name,registered_at) VALUES(?,?,?,?)", p, "/tmp/"+p, p, now); err != nil {
++			t.Fatal(err)
++		}
++	}
++	for i, id := range []string{"a", "b", "outsider", "cross"} {
++		p := "p"
++		if id == "cross" {
++			p = "q"
++		}
++		_, err = db.Exec("INSERT INTO sessions(id,project_id,num,kind,activity_state,activity_last_at,created_at,updated_at) VALUES(?,?,?,'worker','idle',?,?,?)", id, p, i+1, now, now, now)
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	room, err := s.ConfigurePeerRoom(ctx, domain.PeerRoom{ID: "r", ProjectID: "p", Members: []string{"a", "b"}, Budget: 2})
++	if err != nil {
++		t.Fatal(err)
++	}
++	msg := domain.PeerMessage{Sender: "a", Target: "b", ID: "one", Epoch: room.Epoch, Message: "hello"}
++	for _, target := range []string{"outsider", "cross", "a"} {
++		bad := msg
++		bad.Target = target
++		if _, err = s.ReservePeerMessage(ctx, "r", bad); err == nil {
++			t.Fatalf("accepted %s", target)
++		}
++	}
++	var winners atomic.Int32
++	var wg sync.WaitGroup
++	for i := 0; i < 12; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			ok, _ := s.ReservePeerMessage(ctx, "r", msg)
++			if ok {
++				winners.Add(1)
++			}
++		}()
++	}
++	wg.Wait()
++	if winners.Load() != 1 {
++		t.Fatal(winners.Load())
++	}
++	s.Close()
++	s, err = Open(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer s.Close()
++	if _, err = s.ReservePeerMessage(ctx, "r", msg); err == nil {
++		t.Fatal("pending delivery replayed after restart")
++	}
++	if err = s.FinishPeerMessage(ctx, "r", "one", true); err != nil {
++		t.Fatal(err)
++	}
++	if ok, err := s.ReservePeerMessage(ctx, "r", msg); ok || err != nil {
++		t.Fatalf("accepted duplicate should not deliver: %v %v", ok, err)
++	}
++	changed := msg
++	changed.Message = "different"
++	if _, err = s.ReservePeerMessage(ctx, "r", changed); err == nil {
++		t.Fatal("id conflict accepted")
++	}
++	room.Paused = true
++	room, err = s.ConfigurePeerRoom(ctx, room)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = s.ReservePeerMessage(ctx, "r", msg); err == nil {
++		t.Fatal("paused room accepted")
++	}
++	room.Paused = false
++	room, err = s.ConfigurePeerRoom(ctx, room)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = s.ReservePeerMessage(ctx, "r", msg); err == nil {
++		t.Fatal("old epoch revived")
++	}
++	msg.Epoch = room.Epoch
++	msg.ID = "two"
++	if ok, err := s.ReservePeerMessage(ctx, "r", msg); !ok || err != nil {
++		t.Fatal(ok, err)
++	}
++	msg.ID = "three"
++	if _, err = s.ReservePeerMessage(ctx, "r", msg); err == nil {
++		t.Fatal("budget reset")
++	}
++	saved, _ := s.GetPeerRoom(ctx, "r")
++	if saved.Used != 2 {
++		t.Fatal(saved)
++	}
++	if _, err = s.ConfigurePeerRoom(ctx, domain.PeerRoom{ID: "r", ProjectID: "p", Members: []string{"a", "b"}, Budget: 100}); err == nil {
++		t.Fatal("stale overwrite")
++	}
++	for i, members := range [][]string{{"a", "a"}, {"a", "cross"}} {
++		_, err = s.ConfigurePeerRoom(ctx, domain.PeerRoom{ID: fmt.Sprint("bad", i), ProjectID: "p", Members: members, Budget: 2})
++		if err == nil {
++			t.Fatal("invalid membership")
++		}
++	}
++}
+diff --git a/backend/internal/storage/sqlite/store/peer_rooms.go b/backend/internal/storage/sqlite/store/peer_rooms.go
+new file mode 100644
+index 0000000..8c6dad3
+--- /dev/null
++++ b/backend/internal/storage/sqlite/store/peer_rooms.go
+@@ -0,0 +1,148 @@
++package store
++
++import (
++	"context"
++	"crypto/sha256"
++	"database/sql"
++	"encoding/json"
++	"fmt"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"slices"
++	"strings"
++)
++
++func readPeerRoom(ctx context.Context, q interface {
++	QueryRowContext(context.Context, string, ...any) *sql.Row
++}, id string) (domain.PeerRoom, error) {
++	var r domain.PeerRoom
++	var members string
++	err := q.QueryRowContext(ctx, "SELECT id,project_id,members,epoch,budget,used,paused FROM peer_rooms WHERE id=?", id).Scan(&r.ID, &r.ProjectID, &members, &r.Epoch, &r.Budget, &r.Used, &r.Paused)
++	if err == nil {
++		err = json.Unmarshal([]byte(members), &r.Members)
++	}
++	return r, err
++}
++func (s *Store) GetPeerRoom(ctx context.Context, id string) (domain.PeerRoom, error) {
++	return readPeerRoom(ctx, s.readDB, id)
++}
++func peerMember(ctx context.Context, tx *sql.Tx, id, project string) error {
++	var actual string
++	var terminated bool
++	if err := tx.QueryRowContext(ctx, "SELECT project_id,is_terminated FROM sessions WHERE id=?", id).Scan(&actual, &terminated); err != nil {
++		return err
++	}
++	if actual != project || terminated {
++		return fmt.Errorf("member is outside project or terminated")
++	}
++	return nil
++}
++
++// Updates revoke old epochs and never reset usage.
++func (s *Store) ConfigurePeerRoom(ctx context.Context, r domain.PeerRoom) (domain.PeerRoom, error) {
++	if r.ID == "" || len(r.ID) > 100 || r.ProjectID == "" || r.Budget < 1 || r.Budget > 100 || (!r.Paused && len(r.Members) < 2) || len(r.Members) > 16 {
++		return r, fmt.Errorf("invalid room configuration")
++	}
++	if err := s.writeMu.LockContext(ctx); err != nil {
++		return r, err
++	}
++	defer s.writeMu.Unlock()
++	tx, err := s.writeDB.BeginTx(ctx, nil)
++	if err != nil {
++		return r, err
++	}
++	defer tx.Rollback()
++	seen := map[string]bool{}
++	for _, id := range r.Members {
++		if id == "" || seen[id] {
++			return r, fmt.Errorf("duplicate or empty member")
++		}
++		seen[id] = true
++		if err = peerMember(ctx, tx, id, r.ProjectID); err != nil && !r.Paused {
++			return r, err
++		}
++	}
++	old, err := readPeerRoom(ctx, tx, r.ID)
++	if err != nil && err != sql.ErrNoRows {
++		return r, err
++	}
++	if err == sql.ErrNoRows {
++		if r.Epoch != 0 {
++			return r, fmt.Errorf("stale room epoch")
++		}
++		r.Used = 0
++	} else {
++		if old.Epoch != r.Epoch || old.ProjectID != r.ProjectID {
++			return r, fmt.Errorf("stale epoch or changed project")
++		}
++		r.Used = old.Used
++	}
++	r.Epoch++
++	members, _ := json.Marshal(r.Members)
++	_, err = tx.ExecContext(ctx, "INSERT INTO peer_rooms(id,project_id,members,epoch,budget,used,paused) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET members=excluded.members,epoch=excluded.epoch,budget=excluded.budget,paused=excluded.paused", r.ID, r.ProjectID, string(members), r.Epoch, r.Budget, r.Used, r.Paused)
++	if err != nil {
++		return r, err
++	}
++	return r, tx.Commit()
++}
++
++// Reservation precedes external delivery; crashes never automatically replay.
++func (s *Store) ReservePeerMessage(ctx context.Context, room string, m domain.PeerMessage) (bool, error) {
++	if m.ID == "" || len(m.ID) > 100 || m.Sender == m.Target || strings.TrimSpace(m.Message) == "" || len(m.Message) > 2000 {
++		return false, fmt.Errorf("invalid peer message")
++	}
++	if err := s.writeMu.LockContext(ctx); err != nil {
++		return false, err
++	}
++	defer s.writeMu.Unlock()
++	tx, err := s.writeDB.BeginTx(ctx, nil)
++	if err != nil {
++		return false, err
++	}
++	defer tx.Rollback()
++	r, err := readPeerRoom(ctx, tx, room)
++	if err != nil {
++		return false, err
++	}
++	if r.Paused || m.Epoch != r.Epoch || !slices.Contains(r.Members, m.Sender) || !slices.Contains(r.Members, m.Target) {
++		return false, fmt.Errorf("room paused, stale epoch or non-member")
++	}
++	for _, id := range []string{m.Sender, m.Target} {
++		if err = peerMember(ctx, tx, id, r.ProjectID); err != nil {
++			return false, err
++		}
++	}
++	raw, _ := json.Marshal(m)
++	digest := fmt.Sprintf("%x", sha256.Sum256(raw))
++	var prior, state string
++	err = tx.QueryRowContext(ctx, "SELECT digest,state FROM peer_deliveries WHERE room_id=? AND id=?", room, m.ID).Scan(&prior, &state)
++	if err == nil {
++		if prior != digest {
++			return false, fmt.Errorf("message id reused with different content")
++		}
++		if state != "accepted" {
++			return false, fmt.Errorf("delivery unresolved; do not replay")
++		}
++		return false, nil
++	}
++	if err != sql.ErrNoRows {
++		return false, err
++	}
++	if r.Used >= r.Budget {
++		return false, fmt.Errorf("room message budget exhausted")
++	}
++	if _, err = tx.ExecContext(ctx, "INSERT INTO peer_deliveries(room_id,id,digest,state) VALUES(?,?,?,'pending')", room, m.ID, digest); err != nil {
++		return false, err
++	}
++	if _, err = tx.ExecContext(ctx, "UPDATE peer_rooms SET used=used+1 WHERE id=?", room); err != nil {
++		return false, err
++	}
++	return true, tx.Commit()
++}
++func (s *Store) FinishPeerMessage(ctx context.Context, room, id string, accepted bool) error {
++	state := "uncertain"
++	if accepted {
++		state = "accepted"
++	}
++	_, err := s.writeDB.ExecContext(ctx, "UPDATE peer_deliveries SET state=? WHERE room_id=? AND id=? AND state='pending'", state, room, id)
++	return err
++}
+diff --git a/frontend/src/api/schema.ts b/frontend/src/api/schema.ts
+index ca51892..6f37c34 100644
+--- a/frontend/src/api/schema.ts
++++ b/frontend/src/api/schema.ts
+@@ -1821,6 +1821,41 @@ export interface paths {
+         patch?: never;
+         trace?: never;
+     };
++    "/api/v1/peer-rooms/{roomId}": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        /** Read bounded peer room */
++        get: operations["getPeerRoom"];
++        /** Configure peer room with expected epoch */
++        put: operations["configurePeerRoom"];
++        post?: never;
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
++    "/api/v1/peer-rooms/{roomId}/send": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        get?: never;
++        put?: never;
++        /** Reserve budget and deliver once */
++        post: operations["sendPeerRoomMessage"];
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
+     "/api/v1/projects": {
+         parameters: {
+             query?: never;
+@@ -6629,6 +6664,27 @@ export interface components {
+             targetSha: string;
+             title: string;
+         };
++        PeerMessage: {
++            /** Format: int64 */
++            epoch: number;
++            id: string;
++            message: string;
++            sender: string;
++            target: string;
++        };
++        PeerRoom: {
++            budget: number;
++            /** Format: int64 */
++            epoch: number;
++            id: string;
++            members: string[];
++            paused: boolean;
++            projectId: string;
++            used: number;
++        };
++        PeerSendResponse: {
++            accepted: boolean;
++        };
+         PrepareTaskResponse: {
+             ok: boolean;
+             taskPreparation?: string;
+@@ -14219,6 +14275,125 @@ export interface operations {
+             };
+         };
+     };
++    getPeerRoom: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                roomId: string;
++            };
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description OK */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["PeerRoom"];
++                };
++            };
++            /** @description Not Found */
++            404: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++        };
++    };
++    configurePeerRoom: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                roomId: string;
++            };
++            cookie?: never;
++        };
++        requestBody: {
++            content: {
++                "application/json": components["schemas"]["PeerRoom"];
++            };
++        };
++        responses: {
++            /** @description OK */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["PeerRoom"];
++                };
++            };
++            /** @description Bad Request */
++            400: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++            /** @description Conflict */
++            409: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++        };
++    };
++    sendPeerRoomMessage: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                roomId: string;
++            };
++            cookie?: never;
++        };
++        requestBody: {
++            content: {
++                "application/json": components["schemas"]["PeerMessage"];
++            };
++        };
++        responses: {
++            /** @description OK */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["PeerSendResponse"];
++                };
++            };
++            /** @description Bad Request */
++            400: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++            /** @description Conflict */
++            409: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++        };
++    };
+     listProjects: {
+         parameters: {
+             query?: never;
+-- 
+2.54.0 (Apple Git-157)
+

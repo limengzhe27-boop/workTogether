@@ -1,0 +1,488 @@
+From 0bdebea9ef3682621f28923d0b104168e2e6a10c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Wed, 11 Nov 2026 20:12:47 +0800
+Subject: [PATCH 3/3] feat: integrate independently reviewed commits into a new
+ candidate branch
+
+---
+ backend/internal/httpd/apispec/openapi.yaml   |  66 +++++++++
+ .../internal/httpd/apispec/specgen/build.go   |   4 +
+ .../internal/httpd/controllers/peer_rooms.go  |  23 ++++
+ .../internal/httpd/controllers/sessions.go    |   1 +
+ .../service/session/peer_integration.go       | 128 ++++++++++++++++++
+ .../service/session/peer_integration_test.go  |  66 +++++++++
+ frontend/src/api/schema.ts                    |  72 ++++++++++
+ 7 files changed, 360 insertions(+)
+ create mode 100644 backend/internal/service/session/peer_integration.go
+ create mode 100644 backend/internal/service/session/peer_integration_test.go
+
+diff --git a/backend/internal/httpd/apispec/openapi.yaml b/backend/internal/httpd/apispec/openapi.yaml
+index a3b9310..38a6a65 100644
+--- a/backend/internal/httpd/apispec/openapi.yaml
++++ b/backend/internal/httpd/apispec/openapi.yaml
+@@ -4535,6 +4535,43 @@ paths:
+       summary: Configure peer room with expected epoch
+       tags:
+       - sessions
++  /api/v1/peer-rooms/{roomId}/integrate:
++    post:
++      operationId: integratePeerRoom
++      parameters:
++      - in: path
++        name: roomId
++        required: true
++        schema:
++          type: string
++      requestBody:
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/PeerIntegrationRequest'
++        required: true
++      responses:
++        "200":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/PeerIntegrationResult'
++          description: OK
++        "400":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Bad Request
++        "409":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Conflict
++      summary: Create a candidate integration branch without changing the checkout
++      tags:
++      - sessions
+   /api/v1/peer-rooms/{roomId}/send:
+     post:
+       operationId: sendPeerRoomMessage
+@@ -19236,6 +19273,35 @@ components:
+       - targetSha
+       - status
+       type: object
++    PeerIntegrationRequest:
++      properties:
++        base:
++          type: string
++        epoch:
++          format: int64
++          type: integer
++        name:
++          type: string
++      required:
++      - epoch
++      - base
++      - name
++      type: object
++    PeerIntegrationResult:
++      properties:
++        branch:
++          type: string
++        commit:
++          type: string
++        tasks:
++          items:
++            type: string
++          type: array
++      required:
++      - branch
++      - commit
++      - tasks
++      type: object
+     PeerMessage:
+       properties:
+         epoch:
+diff --git a/backend/internal/httpd/apispec/specgen/build.go b/backend/internal/httpd/apispec/specgen/build.go
+index 73ae888..d8937f8 100644
+--- a/backend/internal/httpd/apispec/specgen/build.go
++++ b/backend/internal/httpd/apispec/specgen/build.go
+@@ -7,6 +7,7 @@ package specgen
+ 
+ import (
+ 	"fmt"
++	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
+ 	"net/http"
+ 	"reflect"
+ 	"strings"
+@@ -160,6 +161,7 @@ func schemaName(_ reflect.Type, defaultName string) string {
+ // by projectOperations(). Add an entry when a new contract type is introduced;
+ // the drift test fails until the spec is regenerated, which flags the gap.
+ var schemaNames = map[string]string{
++	"SessionPeerIntegrationRequest": "PeerIntegrationRequest", "SessionPeerIntegrationResult": "PeerIntegrationResult",
+ 	"DomainPeerTask": "PeerTask", "DomainPeerTaskAction": "PeerTaskAction",
+ 	"DomainPeerRoom": "PeerRoom", "DomainPeerMessage": "PeerMessage", "ControllersPeerRoomIDParam": "PeerRoomIDParam", "ControllersPeerSendResponse": "PeerSendResponse", //nolint:gosec // Public OpenAPI type names include reset-credit contracts; no credential value is stored here.
+ 	"ControllersTelemetryIdentityResponse":                 "TelemetryIdentityResponse",
+@@ -3737,6 +3739,8 @@ func sessionOperations() []operation {
+ 		{method: http.MethodPut, path: "/api/v1/peer-rooms/{roomId}/tasks", id: "createPeerTask", tag: "sessions", summary: "Create open task", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: domain.PeerTask{}, resps: []respUnit{{200, domain.PeerTask{}}, {409, envelope.APIError{}}}},
+ 		{method: http.MethodPost, path: "/api/v1/peer-rooms/{roomId}/tasks", id: "actPeerTask", tag: "sessions", summary: "Claim submit or independently review task", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: domain.PeerTaskAction{}, resps: []respUnit{{200, domain.PeerTask{}}, {409, envelope.APIError{}}}},
+ 
++		{method: http.MethodPost, path: "/api/v1/peer-rooms/{roomId}/integrate", id: "integratePeerRoom", tag: "sessions", summary: "Create a candidate integration branch without changing the checkout", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: sessionsvc.PeerIntegrationRequest{}, resps: []respUnit{{200, sessionsvc.PeerIntegrationResult{}}, {400, envelope.APIError{}}, {409, envelope.APIError{}}}},
++
+ 		{
+ 			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/send", id: "sendSessionMessage", tag: "sessions",
+ 			summary:    "Send a message to a running session's agent",
+diff --git a/backend/internal/httpd/controllers/peer_rooms.go b/backend/internal/httpd/controllers/peer_rooms.go
+index 77bc2b2..d29eb71 100644
+--- a/backend/internal/httpd/controllers/peer_rooms.go
++++ b/backend/internal/httpd/controllers/peer_rooms.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
++	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
+ 	"github.com/go-chi/chi/v5"
+ 	"net/http"
+ )
+@@ -108,3 +109,25 @@ func (c *SessionsController) peerTasks(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	envelope.WriteJSON(w, 200, result)
+ }
++
++func (c *SessionsController) peerIntegrate(w http.ResponseWriter, r *http.Request) {
++	svc, ok := c.Svc.(interface {
++		IntegratePeerRoom(context.Context, string, sessionsvc.PeerIntegrationRequest) (sessionsvc.PeerIntegrationResult, error)
++	})
++	if !ok {
++		http.Error(w, "unavailable", 503)
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, 2048)
++	var in sessionsvc.PeerIntegrationRequest
++	if err := decodeJSON(r, &in); err != nil {
++		envelope.WriteAPIError(w, r, 400, "bad_request", "INVALID_JSON", "invalid integration request", nil)
++		return
++	}
++	out, err := svc.IntegratePeerRoom(r.Context(), chi.URLParam(r, "roomId"), in)
++	if err != nil {
++		envelope.WriteAPIError(w, r, 409, "conflict", "PEER_INTEGRATION_REJECTED", err.Error(), nil)
++		return
++	}
++	envelope.WriteJSON(w, 200, out)
++}
+diff --git a/backend/internal/httpd/controllers/sessions.go b/backend/internal/httpd/controllers/sessions.go
+index 4fc55fe..bb026bf 100644
+--- a/backend/internal/httpd/controllers/sessions.go
++++ b/backend/internal/httpd/controllers/sessions.go
+@@ -208,6 +208,7 @@ type SessionsController struct {
+ 
+ // Register mounts the session routes on the supplied router.
+ func (c *SessionsController) Register(r chi.Router) {
++	r.Post("/peer-rooms/{roomId}/integrate", c.peerIntegrate)
+ 	r.Get("/peer-rooms/{roomId}/tasks", c.peerTasks)
+ 	r.Put("/peer-rooms/{roomId}/tasks", c.peerTasks)
+ 	r.Post("/peer-rooms/{roomId}/tasks", c.peerTasks)
+diff --git a/backend/internal/service/session/peer_integration.go b/backend/internal/service/session/peer_integration.go
+new file mode 100644
+index 0000000..2ecbd7a
+--- /dev/null
++++ b/backend/internal/service/session/peer_integration.go
+@@ -0,0 +1,128 @@
++package session
++
++import (
++	"context"
++	"encoding/hex"
++	"fmt"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"os"
++	"os/exec"
++	"regexp"
++	"strings"
++	"time"
++)
++
++type PeerIntegrationRequest struct {
++	Epoch int64  `json:"epoch"`
++	Base  string `json:"base"`
++	Name  string `json:"name"`
++}
++type PeerIntegrationResult struct {
++	Branch string   `json:"branch"`
++	Commit string   `json:"commit"`
++	Tasks  []string `json:"tasks"`
++}
++
++func gitPeer(ctx context.Context, repo string, args ...string) (string, error) {
++	argv := append([]string{"-C", repo}, args...)
++	cmd := exec.CommandContext(ctx, "git", argv...)
++	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		return "", fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(string(out)))
++	}
++	return strings.TrimSpace(string(out)), nil
++}
++func validPeerSHA(s string) bool {
++	if len(s) != 40 {
++		return false
++	}
++	_, err := hex.DecodeString(s)
++	return err == nil
++}
++
++// Only immutable objects and a new candidate ref are written. No checkout/index/main mutation.
++func buildPeerCandidate(ctx context.Context, repo, base, name string, commits []string) (PeerIntegrationResult, error) {
++	result := PeerIntegrationResult{Branch: "codex/integration-" + name}
++	if !validPeerSHA(base) || !regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,60}$`).MatchString(name) || len(commits) == 0 {
++		return result, fmt.Errorf("invalid candidate request")
++	}
++	if _, err := gitPeer(ctx, repo, "cat-file", "-e", base+"^{commit}"); err != nil {
++		return result, err
++	}
++	current := base
++	for _, candidate := range commits {
++		if !validPeerSHA(candidate) {
++			return result, fmt.Errorf("invalid candidate commit")
++		}
++		if _, err := gitPeer(ctx, repo, "merge-base", "--is-ancestor", base, candidate); err != nil {
++			return result, fmt.Errorf("candidate does not descend from fixed base: %w", err)
++		}
++		if candidate == current {
++			continue
++		}
++		tree, err := gitPeer(ctx, repo, "merge-tree", "--write-tree", current, candidate)
++		if err != nil {
++			return result, fmt.Errorf("integration conflict or unsupported merge; no branch published: %w", err)
++		}
++		if !validPeerSHA(tree) {
++			return result, fmt.Errorf("unexpected merge-tree output")
++		}
++		current, err = gitPeer(ctx, repo, "commit-tree", tree, "-p", current, "-p", candidate, "-m", "Integrate independently reviewed peer task candidates")
++		if err != nil {
++			return result, err
++		}
++	}
++	if _, err := gitPeer(ctx, repo, "update-ref", "refs/heads/"+result.Branch, current, strings.Repeat("0", 40)); err != nil {
++		return result, fmt.Errorf("candidate branch already exists or publication failed: %w", err)
++	}
++	result.Commit = current
++	return result, nil
++}
++func (s *Service) IntegratePeerRoom(ctx context.Context, id string, in PeerIntegrationRequest) (PeerIntegrationResult, error) {
++	var result PeerIntegrationResult
++	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
++	defer cancel()
++	room, err := s.GetPeerRoom(ctx, id)
++	if err != nil {
++		return result, err
++	}
++	if room.Paused || room.Epoch != in.Epoch {
++		return result, fmt.Errorf("paused room or stale epoch")
++	}
++	tasks, err := s.ListPeerTasks(ctx, id)
++	if err != nil || len(tasks) == 0 {
++		return result, fmt.Errorf("room has no integrable tasks: %v", err)
++	}
++	project, ok, err := s.store.GetProject(ctx, room.ProjectID)
++	if err != nil || !ok {
++		return result, fmt.Errorf("project unavailable")
++	}
++	common, err := gitPeer(ctx, project.Path, "rev-parse", "--path-format=absolute", "--git-common-dir")
++	if err != nil {
++		return result, err
++	}
++	commits := []string{}
++	ids := []string{}
++	for _, task := range tasks {
++		if task.State != "accepted" || task.Owner == "" || task.Reviewer == "" || task.Owner == task.Reviewer || !validPeerSHA(task.Commit) {
++			return result, fmt.Errorf("task %s requires independent acceptance of a fixed commit", task.ID)
++		}
++		owner, ok, err := s.store.GetSession(ctx, domain.SessionID(task.Owner))
++		if err != nil || !ok || string(owner.ProjectID) != room.ProjectID {
++			return result, fmt.Errorf("task owner unavailable")
++		}
++		ownerCommon, err := gitPeer(ctx, owner.Metadata.WorkspacePath, "rev-parse", "--path-format=absolute", "--git-common-dir")
++		if err != nil || ownerCommon != common {
++			return result, fmt.Errorf("task workspace belongs to another repository")
++		}
++		if _, err = gitPeer(ctx, owner.Metadata.WorkspacePath, "merge-base", "--is-ancestor", task.Commit, "HEAD"); err != nil {
++			return result, fmt.Errorf("reviewed commit is absent from owner history")
++		}
++		commits = append(commits, task.Commit)
++		ids = append(ids, task.ID)
++	}
++	result, err = buildPeerCandidate(ctx, project.Path, in.Base, in.Name, commits)
++	result.Tasks = ids
++	return result, err
++}
+diff --git a/backend/internal/service/session/peer_integration_test.go b/backend/internal/service/session/peer_integration_test.go
+new file mode 100644
+index 0000000..7d8770d
+--- /dev/null
++++ b/backend/internal/service/session/peer_integration_test.go
+@@ -0,0 +1,66 @@
++package session
++
++import (
++	"context"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestPeerIntegrationPreservesMainAndRejectsConflicts(t *testing.T) {
++	ctx := context.Background()
++	repo := t.TempDir()
++	git := func(input string, args ...string) string {
++		t.Helper()
++		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
++		cmd.Stdin = strings.NewReader(input)
++		out, err := cmd.CombinedOutput()
++		if err != nil {
++			t.Fatalf("%v: %v %s", args, err, out)
++		}
++		return strings.TrimSpace(string(out))
++	}
++	git("", "init", "-q")
++	git("", "config", "user.name", "Fixture")
++	git("", "config", "user.email", "fixture@example.invalid")
++	empty := git("", "mktree")
++	base := git("", "commit-tree", empty, "-m", "base")
++	git("", "update-ref", "refs/heads/main", base)
++	git("", "symbolic-ref", "HEAD", "refs/heads/main")
++	makeCommit := func(file, content string) string {
++		blob := git(content, "hash-object", "-w", "--stdin")
++		tree := git("100644 blob "+blob+"\t"+file+"\n", "mktree")
++		return git("", "commit-tree", tree, "-p", base, "-m", file)
++	}
++	a := makeCommit("a.txt", "alpha")
++	b := makeCommit("b.txt", "beta")
++	conflict := makeCommit("a.txt", "different")
++	if err := os.WriteFile(filepath.Join(repo, "user-draft.txt"), []byte("keep my draft"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	before := git("", "status", "--porcelain")
++	result, err := buildPeerCandidate(ctx, repo, base, "fixture", []string{a, b})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if git("", "rev-parse", "HEAD") != base || git("", "status", "--porcelain") != before {
++		t.Fatal("original checkout changed")
++	}
++	if git("", "show", result.Commit+":a.txt") != "alpha" || git("", "show", result.Commit+":b.txt") != "beta" {
++		t.Fatal("integration content")
++	}
++	if _, err = buildPeerCandidate(ctx, repo, base, "fixture", []string{a, b}); err == nil {
++		t.Fatal("existing ref overwritten")
++	}
++	if _, err = buildPeerCandidate(ctx, repo, base, "conflict", []string{a, conflict}); err == nil {
++		t.Fatal("conflict accepted")
++	}
++	if cmd := exec.Command("git", "-C", repo, "show-ref", "--verify", "refs/heads/codex/integration-conflict"); cmd.Run() == nil {
++		t.Fatal("conflicting candidate published")
++	}
++	if _, err = buildPeerCandidate(ctx, repo, base, "../../main", []string{a}); err == nil {
++		t.Fatal("unsafe ref accepted")
++	}
++}
+diff --git a/frontend/src/api/schema.ts b/frontend/src/api/schema.ts
+index e33be86..bfd259c 100644
+--- a/frontend/src/api/schema.ts
++++ b/frontend/src/api/schema.ts
+@@ -1839,6 +1839,23 @@ export interface paths {
+         patch?: never;
+         trace?: never;
+     };
++    "/api/v1/peer-rooms/{roomId}/integrate": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        get?: never;
++        put?: never;
++        /** Create a candidate integration branch without changing the checkout */
++        post: operations["integratePeerRoom"];
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
+     "/api/v1/peer-rooms/{roomId}/send": {
+         parameters: {
+             query?: never;
+@@ -6683,6 +6700,17 @@ export interface components {
+             targetSha: string;
+             title: string;
+         };
++        PeerIntegrationRequest: {
++            base: string;
++            /** Format: int64 */
++            epoch: number;
++            name: string;
++        };
++        PeerIntegrationResult: {
++            branch: string;
++            commit: string;
++            tasks: string[];
++        };
+         PeerMessage: {
+             /** Format: int64 */
+             epoch: number;
+@@ -14391,6 +14419,50 @@ export interface operations {
+             };
+         };
+     };
++    integratePeerRoom: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                roomId: string;
++            };
++            cookie?: never;
++        };
++        requestBody: {
++            content: {
++                "application/json": components["schemas"]["PeerIntegrationRequest"];
++            };
++        };
++        responses: {
++            /** @description OK */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["PeerIntegrationResult"];
++                };
++            };
++            /** @description Bad Request */
++            400: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++            /** @description Conflict */
++            409: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++        };
++    };
+     sendPeerRoomMessage: {
+         parameters: {
+             query?: never;
+-- 
+2.54.0 (Apple Git-157)
+
