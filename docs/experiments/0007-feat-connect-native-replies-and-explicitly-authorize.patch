@@ -1,0 +1,1831 @@
+From 4f282c8f4a02f8b093c3f4fedba37d66a5843d39 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 04:34:27 +0800
+Subject: [PATCH 7/8] feat: connect native replies and explicitly authorized
+ team task tools
+
+Carry stable delivery keys into native turns, expose exact replies, and let current members propose and claim work. Persist explicit epoch grants so pause or membership changes cannot silently renew tools. Verify durable broadcast, duplicate handling, revocation and reply association with SQLite fixtures; no model calls.
+---
+ backend/internal/cli/mcp.go                   |   2 +-
+ backend/internal/cli/mcp_binding.go           |  35 ++++
+ backend/internal/cli/mcp_peer.go              |  15 +-
+ backend/internal/cli/mcp_peer_test.go         |  32 +++
+ backend/internal/cli/mcp_tasks.go             |  20 +-
+ backend/internal/domain/peer_room.go          |  38 +++-
+ backend/internal/httpd/apispec/openapi.yaml   | 112 +++++++++++
+ .../internal/httpd/apispec/specgen/build.go   |   4 +
+ .../internal/httpd/controllers/peer_rooms.go  |  37 ++++
+ .../internal/httpd/controllers/sessions.go    |   2 +
+ backend/internal/ports/chat.go                |   4 +-
+ .../service/session/peer_broadcast.go         |   2 +-
+ .../internal/service/session/peer_rooms.go    |  22 ++-
+ .../service/session/peer_workflow_test.go     | 140 ++++++++++++++
+ .../session_manager/chat_spawn_test.go        |   7 +
+ backend/internal/session_manager/manager.go   |   2 +-
+ .../internal/session_manager/manager_test.go  |   2 +
+ .../sqlite/migrate_burned_versions_test.go    |   1 +
+ .../20261111201016434_peer_tool_grants.sql    |   4 +
+ .../storage/sqlite/peer_rooms_test.go         |  55 +++++-
+ .../storage/sqlite/store/peer_bindings.go     |  72 +++++++
+ .../storage/sqlite/store/peer_rooms.go        |  38 +++-
+ .../storage/sqlite/store/peer_tasks.go        |  24 ++-
+ frontend/src/api/schema.ts                    | 129 ++++++++++++
+ .../src/renderer/components/PeerRoom.test.tsx |  76 +++++---
+ frontend/src/renderer/components/PeerRoom.tsx |  90 ++++++++-
+ .../renderer/components/PeerTasks.test.tsx    |  76 ++++++++
+ .../src/renderer/components/PeerTasks.tsx     | 183 ++++++++++++++++++
+ .../routes/_shell.projects.$projectId.tsx     |   3 +
+ 29 files changed, 1169 insertions(+), 58 deletions(-)
+ create mode 100644 backend/internal/cli/mcp_binding.go
+ create mode 100644 backend/internal/service/session/peer_workflow_test.go
+ create mode 100644 backend/internal/storage/sqlite/migrations/20261111201016434_peer_tool_grants.sql
+ create mode 100644 backend/internal/storage/sqlite/store/peer_bindings.go
+ create mode 100644 frontend/src/renderer/components/PeerTasks.test.tsx
+ create mode 100644 frontend/src/renderer/components/PeerTasks.tsx
+
+diff --git a/backend/internal/cli/mcp.go b/backend/internal/cli/mcp.go
+index 1d08ead..e8f46f6 100644
+--- a/backend/internal/cli/mcp.go
++++ b/backend/internal/cli/mcp.go
+@@ -120,7 +120,7 @@ func (c *commandContext) handleMCP(ctx context.Context, state *mcpState, line []
+ 		resp.Result = map[string]any{}
+ 	case "tools/list":
+ 		tools := append(append([]map[string]any{}, mcpTools...), c.cuaTools(ctx, state)...)
+-		if os.Getenv("AO_PEER_PROJECT") != "" {
++		if os.Getenv("AO_SESSION_ID") != "" || os.Getenv("AO_PEER_PROJECT") != "" {
+ 			tools = append(tools, peerTool, peerTasksTool, peerTaskTool)
+ 		}
+ 		resp.Result = map[string]any{"tools": tools}
+diff --git a/backend/internal/cli/mcp_binding.go b/backend/internal/cli/mcp_binding.go
+new file mode 100644
+index 0000000..6ac4a04
+--- /dev/null
++++ b/backend/internal/cli/mcp_binding.go
+@@ -0,0 +1,35 @@
++package cli
++
++import (
++	"context"
++	"fmt"
++	"net/url"
++	"os"
++	"strconv"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++)
++
++func (c *commandContext) peerBinding(ctx context.Context) (domain.PeerToolBinding, error) {
++	if os.Getenv("AO_SESSION_ID") == "" {
++		return domain.PeerToolBinding{}, fmt.Errorf("session identity required")
++	}
++	// Preserve explicit legacy fixed bindings; never silently upgrade their epoch.
++	if room := os.Getenv("AO_PEER_ROOM"); room != "" {
++		epoch, err := strconv.ParseInt(os.Getenv("AO_PEER_EPOCH"), 10, 64)
++		project := os.Getenv("AO_PEER_PROJECT")
++		if err != nil || epoch < 1 || project == "" {
++			return domain.PeerToolBinding{}, fmt.Errorf("invalid fixed binding")
++		}
++		return domain.PeerToolBinding{RoomID: room, ProjectID: project, Epoch: epoch}, nil
++	}
++	if os.Getenv("AO_PEER_PROJECT") != "" {
++		return domain.PeerToolBinding{}, fmt.Errorf("incomplete fixed binding")
++	}
++	var binding domain.PeerToolBinding
++	err := c.getJSON(ctx, "sessions/"+url.PathEscape(os.Getenv("AO_SESSION_ID"))+"/peer-binding", &binding)
++	if err == nil && (binding.RoomID == "" || binding.ProjectID == "" || binding.Epoch < 1) {
++		err = fmt.Errorf("invalid tool binding")
++	}
++	return binding, err
++}
+diff --git a/backend/internal/cli/mcp_peer.go b/backend/internal/cli/mcp_peer.go
+index 3bb0ee7..992deb2 100644
+--- a/backend/internal/cli/mcp_peer.go
++++ b/backend/internal/cli/mcp_peer.go
+@@ -7,7 +7,6 @@ import (
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+ 	"net/url"
+ 	"os"
+-	"strconv"
+ 	"strings"
+ )
+ 
+@@ -17,9 +16,10 @@ var peerTool = map[string]any{
+ }
+ 
+ func (c *commandContext) callPeerSend(ctx context.Context, raw json.RawMessage) map[string]any {
+-	project, sender := os.Getenv("AO_PEER_PROJECT"), os.Getenv("AO_SESSION_ID")
+-	if project == "" || sender == "" {
+-		return mcpToolError(fmt.Errorf("peer messaging is not enabled for this session"))
++	sender := os.Getenv("AO_SESSION_ID")
++	binding, err := c.peerBinding(ctx)
++	if err != nil {
++		return mcpToolError(err)
+ 	}
+ 	var args struct {
+ 		ID      string `json:"id"`
+@@ -35,10 +35,9 @@ func (c *commandContext) callPeerSend(ctx context.Context, raw json.RawMessage)
+ 		return mcpToolError(fmt.Errorf("invalid peer or message (maximum 2000 bytes; no self-send)"))
+ 	}
+ 
+-	room := os.Getenv("AO_PEER_ROOM")
+-	epoch, err := strconv.ParseInt(os.Getenv("AO_PEER_EPOCH"), 10, 64)
+-	if room == "" || epoch < 1 || err != nil || args.ID == "" {
+-		return mcpToolError(fmt.Errorf("room binding and delivery id required"))
++	room, epoch := binding.RoomID, binding.Epoch
++	if args.ID == "" {
++		return mcpToolError(fmt.Errorf("delivery id required"))
+ 	}
+ 	msg := domain.PeerMessage{Sender: sender, Target: args.Session, ID: args.ID, Epoch: epoch, Message: args.Message}
+ 	if err = c.postJSON(ctx, "peer-rooms/"+url.PathEscape(room)+"/send", msg, nil); err != nil {
+diff --git a/backend/internal/cli/mcp_peer_test.go b/backend/internal/cli/mcp_peer_test.go
+index 9bdc777..0f07fd8 100644
+--- a/backend/internal/cli/mcp_peer_test.go
++++ b/backend/internal/cli/mcp_peer_test.go
+@@ -42,3 +42,35 @@ func TestPeerSendFailsClosed(t *testing.T) {
+ 		t.Fatal("unbound room accepted")
+ 	}
+ }
++
++func TestPeerSendReadsExplicitServerGrant(t *testing.T) {
++	t.Setenv("AO_SESSION_ID", "sender")
++	t.Setenv("AO_PEER_PROJECT", "")
++	t.Setenv("AO_PEER_ROOM", "")
++	cfg := setConfigEnv(t)
++	sent := 0
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/api/v1/sessions/sender/peer-binding" {
++			w.Write([]byte(`{"roomId":"room","projectId":"p","epoch":4}`))
++			return
++		}
++		if r.URL.Path != "/api/v1/peer-rooms/room/send" {
++			t.Error(r.URL)
++			http.Error(w, "bad", 400)
++			return
++		}
++		var m domain.PeerMessage
++		json.NewDecoder(r.Body).Decode(&m)
++		if m.Epoch != 4 || m.Sender != "sender" {
++			t.Error(m)
++		}
++		sent++
++		w.Write([]byte(`{}`))
++	}))
++	defer srv.Close()
++	writeRunFileFor(t, cfg, srv)
++	result := runMCP(t, mcpCall("peer_send", map[string]any{"id": "d", "session": "other", "message": "hello"}))[0]
++	if result.Result.IsError || sent != 1 {
++		t.Fatal(result, sent)
++	}
++}
+diff --git a/backend/internal/cli/mcp_tasks.go b/backend/internal/cli/mcp_tasks.go
+index f9328c5..198c733 100644
+--- a/backend/internal/cli/mcp_tasks.go
++++ b/backend/internal/cli/mcp_tasks.go
+@@ -8,30 +8,31 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"slices"
+-	"strconv"
+ 	"strings"
+ )
+ 
+ var peerTasksTool = map[string]any{"name": "peer_tasks", "description": "Read team tasks and revisions. Choose work suited to your abilities; claim before editing. Submitted work still needs independent review; acceptance does not merge code.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}}
+-var peerTaskTool = map[string]any{"name": "peer_task", "description": "Claim an open task, submit your work with evidence and candidate commit, or independently accept/reject a submission. Use the last observed revision. Read again on conflict; never steal a claim. Only edit after claim succeeds.", "inputSchema": map[string]any{"type": "object", "additionalProperties": false, "required": []string{"id", "revision", "action"}, "properties": map[string]any{"id": map[string]any{"type": "string"}, "revision": map[string]any{"type": "integer"}, "action": map[string]any{"type": "string", "enum": []string{"claim", "submit", "accept", "reject"}}, "evidence": map[string]any{"type": "string"}, "commit": map[string]any{"type": "string"}}}}
++var peerTaskTool = map[string]any{"name": "peer_task", "description": "Propose a task with goal and revision zero (read existing tasks to avoid duplicates), claim an open task, submit your work with evidence and candidate commit, or independently accept/reject a submission. Use the last observed revision. Read again on conflict; never steal a claim. Only edit after claim succeeds.", "inputSchema": map[string]any{"type": "object", "additionalProperties": false, "required": []string{"id", "revision", "action"}, "properties": map[string]any{"id": map[string]any{"type": "string"}, "revision": map[string]any{"type": "integer"}, "action": map[string]any{"type": "string", "enum": []string{"propose", "claim", "submit", "accept", "reject"}}, "goal": map[string]any{"type": "string"}, "evidence": map[string]any{"type": "string"}, "commit": map[string]any{"type": "string"}}}}
+ 
+ func (c *commandContext) callPeerTasks(ctx context.Context, raw json.RawMessage, act bool) map[string]any {
+-	room, actor := os.Getenv("AO_PEER_ROOM"), os.Getenv("AO_SESSION_ID")
+-	epoch, err := strconv.ParseInt(os.Getenv("AO_PEER_EPOCH"), 10, 64)
+-	if os.Getenv("AO_PEER_PROJECT") == "" || room == "" || actor == "" || epoch < 1 || err != nil {
+-		return mcpToolError(fmt.Errorf("room binding required"))
++	actor := os.Getenv("AO_SESSION_ID")
++	binding, err := c.peerBinding(ctx)
++	if err != nil {
++		return mcpToolError(err)
+ 	}
++	room, epoch := binding.RoomID, binding.Epoch
+ 	path := "peer-rooms/" + url.PathEscape(room)
+ 	var r domain.PeerRoom
+ 	if err = c.getJSON(ctx, path, &r); err != nil {
+ 		return mcpToolError(err)
+ 	}
+-	if r.Paused || r.Epoch != epoch || !slices.Contains(r.Members, actor) {
++	if r.ProjectID != binding.ProjectID || r.Paused || r.Epoch != epoch || !slices.Contains(r.Members, actor) {
+ 		return mcpToolError(fmt.Errorf("room paused, revoked or non-member"))
+ 	}
+ 	var result any
+ 	if act {
+ 		var input struct {
++			Goal     string `json:"goal"`
+ 			ID       string `json:"id"`
+ 			Revision int64  `json:"revision"`
+ 			Action   string `json:"action"`
+@@ -43,7 +44,7 @@ func (c *commandContext) callPeerTasks(ctx context.Context, raw json.RawMessage,
+ 		if err = d.Decode(&input); err != nil {
+ 			return mcpToolError(err)
+ 		}
+-		a := domain.PeerTaskAction{ID: input.ID, Actor: actor, Epoch: epoch, Revision: input.Revision, Action: input.Action, Evidence: input.Evidence, Commit: input.Commit}
++		a := domain.PeerTaskAction{Goal: input.Goal, ID: input.ID, Actor: actor, Epoch: epoch, Revision: input.Revision, Action: input.Action, Evidence: input.Evidence, Commit: input.Commit}
+ 		err = c.postJSON(ctx, path+"/tasks", a, &result)
+ 	} else {
+ 		err = c.getJSON(ctx, path+"/tasks", &result)
+@@ -51,6 +52,9 @@ func (c *commandContext) callPeerTasks(ctx context.Context, raw json.RawMessage,
+ 	if err != nil {
+ 		return mcpToolError(err)
+ 	}
++	if !act {
++		result = map[string]any{"room": r, "tasks": result}
++	}
+ 	data, _ := json.Marshal(result)
+ 	return map[string]any{"content": []any{mcpText(string(data))}}
+ }
+diff --git a/backend/internal/domain/peer_room.go b/backend/internal/domain/peer_room.go
+index fdb58ba..888a2f9 100644
+--- a/backend/internal/domain/peer_room.go
++++ b/backend/internal/domain/peer_room.go
+@@ -1,5 +1,10 @@
+ package domain
+ 
++import (
++	"crypto/sha256"
++	"fmt"
++)
++
+ type PeerRoom struct {
+ 	ID        string   `json:"id"`
+ 	ProjectID string   `json:"projectId"`
+@@ -28,6 +33,7 @@ type PeerTask struct {
+ 	Reviewer string `json:"reviewer"`
+ }
+ type PeerTaskAction struct {
++	Goal     string `json:"goal,omitempty"`
+ 	ID       string `json:"id"`
+ 	Actor    string `json:"actor"`
+ 	Epoch    int64  `json:"epoch"`
+@@ -40,11 +46,33 @@ type PeerTaskAction struct {
+ // PeerDelivery describes durable admission, not a completed agent turn.
+ // Empty metadata belongs to a delivery recorded before history support.
+ type PeerDelivery struct {
++	Replies          []PeerReply `json:"replies"`
++	RepliesTruncated bool        `json:"repliesTruncated"`
++	ID               string      `json:"id"`
++	Sender           string      `json:"sender"`
++	Target           string      `json:"target"`
++	Message          string      `json:"message"`
++	Epoch            int64       `json:"epoch"`
++	State            string      `json:"state"`
++	CreatedAt        string      `json:"createdAt"`
++}
++
++func PeerDeliveryKey(room, id string) string {
++	return fmt.Sprintf("peer:%x", sha256.Sum256([]byte(room+"\x00"+id)))
++}
++
++type PeerReply struct {
+ 	ID        string `json:"id"`
+-	Sender    string `json:"sender"`
+-	Target    string `json:"target"`
+-	Message   string `json:"message"`
++	Text      string `json:"text"`
++	Streaming bool   `json:"streaming"`
++	TurnState string `json:"turnState"`
++}
++
++type PeerToolBinding struct {
++	RoomID    string `json:"roomId"`
++	ProjectID string `json:"projectId"`
+ 	Epoch     int64  `json:"epoch"`
+-	State     string `json:"state"`
+-	CreatedAt string `json:"createdAt"`
++}
++type PeerBindRequest struct {
++	Epoch int64 `json:"epoch"`
+ }
+diff --git a/backend/internal/httpd/apispec/openapi.yaml b/backend/internal/httpd/apispec/openapi.yaml
+index f6d7143..ed72414 100644
+--- a/backend/internal/httpd/apispec/openapi.yaml
++++ b/backend/internal/httpd/apispec/openapi.yaml
+@@ -4535,6 +4535,43 @@ paths:
+       summary: Configure peer room with expected epoch
+       tags:
+       - sessions
++  /api/v1/peer-rooms/{roomId}/bind:
++    post:
++      operationId: bindPeerTools
++      parameters:
++      - in: path
++        name: roomId
++        required: true
++        schema:
++          type: string
++      requestBody:
++        content:
++          application/json:
++            schema:
++              $ref: '#/components/schemas/PeerBindRequest'
++        required: true
++      responses:
++        "200":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/PeerToolBinding'
++          description: OK
++        "400":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Bad Request
++        "409":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Conflict
++      summary: Explicitly grant current room tool epoch
++      tags:
++      - sessions
+   /api/v1/peer-rooms/{roomId}/broadcast:
+     post:
+       operationId: broadcastPeerRoom
+@@ -9748,6 +9785,33 @@ paths:
+       summary: Configure whether PR completion terminates the session
+       tags:
+       - sessions
++  /api/v1/sessions/{sessionId}/peer-binding:
++    get:
++      operationId: getPeerToolBinding
++      parameters:
++      - description: Session identifier, e.g. project-1.
++        in: path
++        name: sessionId
++        required: true
++        schema:
++          description: Session identifier, e.g. project-1.
++          type: string
++      responses:
++        "200":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/PeerToolBinding'
++          description: OK
++        "409":
++          content:
++            application/json:
++              schema:
++                $ref: '#/components/schemas/APIError'
++          description: Conflict
++      summary: Read a non-upgrading native tool binding
++      tags:
++      - sessions
+   /api/v1/sessions/{sessionId}/pin:
+     delete:
+       operationId: unpinSession
+@@ -19337,6 +19401,14 @@ components:
+       - targetSha
+       - status
+       type: object
++    PeerBindRequest:
++      properties:
++        epoch:
++          format: int64
++          type: integer
++      required:
++      - epoch
++      type: object
+     PeerBroadcastDelivery:
+       properties:
+         detail:
+@@ -19383,6 +19455,12 @@ components:
+           type: string
+         message:
+           type: string
++        replies:
++          items:
++            $ref: '#/components/schemas/PeerReply'
++          type: array
++        repliesTruncated:
++          type: boolean
+         sender:
+           type: string
+         state:
+@@ -19390,6 +19468,8 @@ components:
+         target:
+           type: string
+       required:
++      - replies
++      - repliesTruncated
+       - id
+       - sender
+       - target
+@@ -19447,6 +19527,22 @@ components:
+       - epoch
+       - message
+       type: object
++    PeerReply:
++      properties:
++        id:
++          type: string
++        streaming:
++          type: boolean
++        text:
++          type: string
++        turnState:
++          type: string
++      required:
++      - id
++      - text
++      - streaming
++      - turnState
++      type: object
+     PeerRoom:
+       properties:
+         budget:
+@@ -19524,6 +19620,8 @@ components:
+           type: integer
+         evidence:
+           type: string
++        goal:
++          type: string
+         id:
+           type: string
+         revision:
+@@ -19538,6 +19636,20 @@ components:
+       - evidence
+       - commit
+       type: object
++    PeerToolBinding:
++      properties:
++        epoch:
++          format: int64
++          type: integer
++        projectId:
++          type: string
++        roomId:
++          type: string
++      required:
++      - roomId
++      - projectId
++      - epoch
++      type: object
+     PrepareTaskResponse:
+       properties:
+         ok:
+diff --git a/backend/internal/httpd/apispec/specgen/build.go b/backend/internal/httpd/apispec/specgen/build.go
+index 1f86f7d..b1eaa48 100644
+--- a/backend/internal/httpd/apispec/specgen/build.go
++++ b/backend/internal/httpd/apispec/specgen/build.go
+@@ -161,6 +161,8 @@ func schemaName(_ reflect.Type, defaultName string) string {
+ // by projectOperations(). Add an entry when a new contract type is introduced;
+ // the drift test fails until the spec is regenerated, which flags the gap.
+ var schemaNames = map[string]string{
++	"DomainPeerToolBinding": "PeerToolBinding", "DomainPeerBindRequest": "PeerBindRequest",
++	"DomainPeerReply":             "PeerReply",
+ 	"DomainPeerDelivery":          "PeerDelivery",
+ 	"SessionPeerBroadcastRequest": "PeerBroadcastRequest", "SessionPeerBroadcastResult": "PeerBroadcastResult", "SessionPeerBroadcastDelivery": "PeerBroadcastDelivery",
+ 	"SessionPeerIntegrationRequest": "PeerIntegrationRequest", "SessionPeerIntegrationResult": "PeerIntegrationResult",
+@@ -3743,6 +3745,8 @@ func sessionOperations() []operation {
+ 
+ 		{method: http.MethodPost, path: "/api/v1/peer-rooms/{roomId}/integrate", id: "integratePeerRoom", tag: "sessions", summary: "Create a candidate integration branch without changing the checkout", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: sessionsvc.PeerIntegrationRequest{}, resps: []respUnit{{200, sessionsvc.PeerIntegrationResult{}}, {400, envelope.APIError{}}, {409, envelope.APIError{}}}},
+ 
++		{method: http.MethodPost, path: "/api/v1/peer-rooms/{roomId}/bind", id: "bindPeerTools", tag: "sessions", summary: "Explicitly grant current room tool epoch", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: domain.PeerBindRequest{}, resps: []respUnit{{200, domain.PeerToolBinding{}}, {400, envelope.APIError{}}, {409, envelope.APIError{}}}},
++		{method: http.MethodGet, path: "/api/v1/sessions/{sessionId}/peer-binding", id: "getPeerToolBinding", tag: "sessions", summary: "Read a non-upgrading native tool binding", pathParams: []any{controllers.SessionIDParam{}}, resps: []respUnit{{200, domain.PeerToolBinding{}}, {409, envelope.APIError{}}}},
+ 		{method: http.MethodGet, path: "/api/v1/peer-rooms/{roomId}/history", id: "getPeerHistory", tag: "sessions", summary: "Read durable room delivery history", pathParams: []any{controllers.PeerRoomIDParam{}}, resps: []respUnit{{200, []domain.PeerDelivery{}}, {503, envelope.APIError{}}}},
+ 		{method: http.MethodPost, path: "/api/v1/peer-rooms/{roomId}/broadcast", id: "broadcastPeerRoom", tag: "sessions", summary: "Broadcast a user message with per-recipient admission and receipts", pathParams: []any{controllers.PeerRoomIDParam{}}, reqBody: sessionsvc.PeerBroadcastRequest{}, resps: []respUnit{{200, sessionsvc.PeerBroadcastResult{}}, {400, envelope.APIError{}}, {409, envelope.APIError{}}}},
+ 
+diff --git a/backend/internal/httpd/controllers/peer_rooms.go b/backend/internal/httpd/controllers/peer_rooms.go
+index a3cfe41..30d11ec 100644
+--- a/backend/internal/httpd/controllers/peer_rooms.go
++++ b/backend/internal/httpd/controllers/peer_rooms.go
+@@ -169,3 +169,40 @@ func (c *SessionsController) peerHistory(w http.ResponseWriter, r *http.Request)
+ 	}
+ 	envelope.WriteJSON(w, 200, out)
+ }
++
++func (c *SessionsController) peerBind(w http.ResponseWriter, r *http.Request) {
++	svc, ok := c.Svc.(interface {
++		BindPeerTools(context.Context, string, int64) (domain.PeerToolBinding, error)
++	})
++	if !ok {
++		http.Error(w, "unavailable", 503)
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, 1024)
++	var in domain.PeerBindRequest
++	if err := decodeJSON(r, &in); err != nil {
++		envelope.WriteAPIError(w, r, 400, "bad_request", "INVALID_JSON", "invalid binding request", nil)
++		return
++	}
++	out, err := svc.BindPeerTools(r.Context(), chi.URLParam(r, "roomId"), in.Epoch)
++	if err != nil {
++		envelope.WriteAPIError(w, r, 409, "conflict", "PEER_BINDING_REJECTED", err.Error(), nil)
++		return
++	}
++	envelope.WriteJSON(w, 200, out)
++}
++func (c *SessionsController) peerBinding(w http.ResponseWriter, r *http.Request) {
++	svc, ok := c.Svc.(interface {
++		GetPeerToolBinding(context.Context, string) (domain.PeerToolBinding, error)
++	})
++	if !ok {
++		http.Error(w, "unavailable", 503)
++		return
++	}
++	out, err := svc.GetPeerToolBinding(r.Context(), chi.URLParam(r, "sessionId"))
++	if err != nil {
++		envelope.WriteAPIError(w, r, 409, "conflict", "PEER_BINDING_UNAVAILABLE", "Tool binding unavailable or revoked; ask the user to reconnect room tools", nil)
++		return
++	}
++	envelope.WriteJSON(w, 200, out)
++}
+diff --git a/backend/internal/httpd/controllers/sessions.go b/backend/internal/httpd/controllers/sessions.go
+index 5a462d3..91a3101 100644
+--- a/backend/internal/httpd/controllers/sessions.go
++++ b/backend/internal/httpd/controllers/sessions.go
+@@ -209,6 +209,8 @@ type SessionsController struct {
+ // Register mounts the session routes on the supplied router.
+ func (c *SessionsController) Register(r chi.Router) {
+ 	r.Get("/peer-rooms/{roomId}/history", c.peerHistory)
++	r.Post("/peer-rooms/{roomId}/bind", c.peerBind)
++	r.Get("/sessions/{sessionId}/peer-binding", c.peerBinding)
+ 	r.Post("/peer-rooms/{roomId}/broadcast", c.peerBroadcast)
+ 	r.Post("/peer-rooms/{roomId}/integrate", c.peerIntegrate)
+ 	r.Get("/peer-rooms/{roomId}/tasks", c.peerTasks)
+diff --git a/backend/internal/ports/chat.go b/backend/internal/ports/chat.go
+index fbbe1a9..c789a3b 100644
+--- a/backend/internal/ports/chat.go
++++ b/backend/internal/ports/chat.go
+@@ -498,7 +498,9 @@ type ChatUserMessage struct {
+ // MessageDeliveryOptions describes facts about the message independent of the
+ // mechanism AO uses to deliver it.
+ type MessageDeliveryOptions struct {
+-	InteractionAt time.Time
++	// ClientMessageID correlates durable caller delivery with a native conversation turn.
++	ClientMessageID string
++	InteractionAt   time.Time
+ 	// SenderSessionID is cooperative local identity, resolved from stored metadata.
+ 	SenderSessionID string
+ 	AuthoredByUser  bool
+diff --git a/backend/internal/service/session/peer_broadcast.go b/backend/internal/service/session/peer_broadcast.go
+index 2966813..a46258e 100644
+--- a/backend/internal/service/session/peer_broadcast.go
++++ b/backend/internal/service/session/peer_broadcast.go
+@@ -68,7 +68,7 @@ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroad
+ 		wg.Add(1)
+ 		go func(i int, target, receipt string) {
+ 			defer wg.Done()
+-			err := s.manager.SendWithOptions(peerpolicy.Admitted(ctx, "", target), domain.SessionID(target), in.Message, nil, ports.MessageDeliveryOptions{AuthoredByUser: true})
++			err := s.manager.SendWithOptions(peerpolicy.Admitted(ctx, "", target), domain.SessionID(target), in.Message, nil, ports.MessageDeliveryOptions{AuthoredByUser: true, ClientMessageID: domain.PeerDeliveryKey(id, receipt)})
+ 			finishErr := store.FinishPeerMessage(context.WithoutCancel(ctx), id, receipt, err == nil)
+ 			if err != nil || finishErr != nil {
+ 				out.Deliveries[i].State = "uncertain"
+diff --git a/backend/internal/service/session/peer_rooms.go b/backend/internal/service/session/peer_rooms.go
+index 9d0408a..a1261eb 100644
+--- a/backend/internal/service/session/peer_rooms.go
++++ b/backend/internal/service/session/peer_rooms.go
+@@ -38,7 +38,7 @@ func (s *Service) SendPeerMessage(ctx context.Context, id string, m domain.PeerM
+ 	if err != nil || !admitted {
+ 		return err
+ 	}
+-	err = s.manager.SendWithOptions(peerpolicy.Admitted(ctx, m.Sender, m.Target), domain.SessionID(m.Target), m.Message, nil, ports.MessageDeliveryOptions{SenderSessionID: m.Sender})
++	err = s.manager.SendWithOptions(peerpolicy.Admitted(ctx, m.Sender, m.Target), domain.SessionID(m.Target), m.Message, nil, ports.MessageDeliveryOptions{SenderSessionID: m.Sender, ClientMessageID: domain.PeerDeliveryKey(id, m.ID)})
+ 	finalErr := p.FinishPeerMessage(context.WithoutCancel(ctx), id, m.ID, err == nil)
+ 	if err != nil {
+ 		return fmt.Errorf("delivery failed or uncertain; no automatic replay: %w", err)
+@@ -83,3 +83,23 @@ func (s *Service) ListPeerDeliveries(ctx context.Context, id string) ([]domain.P
+ 	}
+ 	return p.ListPeerDeliveries(ctx, id)
+ }
++
++type peerBindingStore interface {
++	BindPeerTools(context.Context, string, int64) (domain.PeerToolBinding, error)
++	GetPeerToolBinding(context.Context, string) (domain.PeerToolBinding, error)
++}
++
++func (s *Service) BindPeerTools(ctx context.Context, id string, epoch int64) (domain.PeerToolBinding, error) {
++	p, ok := s.store.(peerBindingStore)
++	if !ok {
++		return domain.PeerToolBinding{}, fmt.Errorf("bindings unavailable")
++	}
++	return p.BindPeerTools(ctx, id, epoch)
++}
++func (s *Service) GetPeerToolBinding(ctx context.Context, id string) (domain.PeerToolBinding, error) {
++	p, ok := s.store.(peerBindingStore)
++	if !ok {
++		return domain.PeerToolBinding{}, fmt.Errorf("bindings unavailable")
++	}
++	return p.GetPeerToolBinding(ctx, id)
++}
+diff --git a/backend/internal/service/session/peer_workflow_test.go b/backend/internal/service/session/peer_workflow_test.go
+new file mode 100644
+index 0000000..22ea2b2
+--- /dev/null
++++ b/backend/internal/service/session/peer_workflow_test.go
+@@ -0,0 +1,140 @@
++package session
++
++import (
++	"context"
++	"database/sql"
++	"path/filepath"
++	"sync"
++	"testing"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
++	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
++)
++
++type nativeFixture struct {
++	*fakeCommander
++	db      *sql.DB
++	store   any
++	mu      sync.Mutex
++	pending []func() error
++}
++
++func (n *nativeFixture) SendWithOptions(ctx context.Context, id domain.SessionID, text string, _ *ports.SpawnAttachment, o ports.MessageDeliveryOptions) error {
++	if err := peerpolicy.Check(ctx, n.store, o.SenderSessionID, string(id)); err != nil {
++		return err
++	}
++	n.mu.Lock()
++	defer n.mu.Unlock()
++	n.pending = append(n.pending, func() error { return n.reply(ctx, id, text, o) })
++	return nil
++}
++func (n *nativeFixture) reply(ctx context.Context, id domain.SessionID, text string, o ports.MessageDeliveryOptions) error {
++	tx, err := n.db.BeginTx(ctx, nil)
++	if err != nil {
++		return err
++	}
++	defer tx.Rollback()
++	key := o.ClientMessageID
++	for _, q := range []struct {
++		sql  string
++		args []any
++	}{
++		{"INSERT INTO conversations(id,scope,project_id,session_id,current_session_id,created_at,updated_at) VALUES(?,'session','p',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{string(id), string(id), string(id)}},
++		{"INSERT INTO conversation_turns(id,conversation_id,handled_by_session_id,state,requested_at) VALUES(?,?,?,'completed',CURRENT_TIMESTAMP)", []any{key, string(id), string(id)}},
++		{"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,client_message_id,created_at,updated_at) VALUES(?,?,?,1,'user','human',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{key + ":input", string(id), key, text, key}},
++		{"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,created_at,updated_at) VALUES(?,?,?,2,'assistant','provider',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{key + ":reply", string(id), key, "answer from " + string(id)}},
++	} {
++		if _, err = tx.ExecContext(ctx, q.sql, q.args...); err != nil {
++			return err
++		}
++	}
++	return tx.Commit()
++}
++func TestPeerWorkflowBroadcastRepliesAndRevocation(t *testing.T) {
++	ctx := context.Background()
++	dir := t.TempDir()
++	store := sqlitetest.MustOpenAt(t, dir)
++	db, err := sql.Open("sqlite", filepath.Join(dir, "ao.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	db.SetMaxOpenConns(1)
++	if _, err = db.Exec("PRAGMA busy_timeout=5000"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec("INSERT INTO projects(id,path,display_name,registered_at) VALUES('p','/tmp/p','p',CURRENT_TIMESTAMP)"); err != nil {
++		t.Fatal(err)
++	}
++	for i, id := range []string{"a", "b"} {
++		if _, err = db.Exec("INSERT INTO sessions(id,project_id,num,kind,activity_state,activity_last_at,created_at,updated_at) VALUES(?,'p',?,'worker','idle',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", id, i+1); err != nil {
++			t.Fatal(err)
++		}
++	}
++	fixture := &nativeFixture{fakeCommander: &fakeCommander{}, db: db, store: store}
++	svc := NewWithDeps(Deps{Store: store, Manager: fixture})
++	room, err := svc.ConfigurePeerRoom(ctx, domain.PeerRoom{ID: "r", ProjectID: "p", Members: []string{"a", "b"}, Budget: 4})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = svc.BindPeerTools(ctx, "r", room.Epoch); err != nil {
++		t.Fatal(err)
++	}
++	input := PeerBroadcastRequest{ID: "broadcast", Epoch: room.Epoch, Message: "discuss and propose tasks"}
++	result, err := svc.BroadcastPeerRoom(ctx, "r", input)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, d := range result.Deliveries {
++		if d.State != "accepted" {
++			t.Fatal(result)
++		}
++	}
++	for _, reply := range fixture.pending {
++		if err := reply(); err != nil {
++			t.Fatal(err)
++		}
++	}
++	history, err := svc.ListPeerDeliveries(ctx, "r")
++	if err != nil || len(history) != 2 {
++		t.Fatal(history, err)
++	}
++	for _, d := range history {
++		if len(d.Replies) != 1 || d.Replies[0].Text != "answer from "+d.Target {
++			t.Fatal(d)
++		}
++	}
++	duplicate, err := svc.BroadcastPeerRoom(ctx, "r", input)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, d := range duplicate.Deliveries {
++		if d.State != "already_accepted" {
++			t.Fatal(duplicate)
++		}
++	}
++	room.Paused = true
++	room, err = svc.ConfigurePeerRoom(ctx, room)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = svc.GetPeerToolBinding(ctx, "a"); err == nil {
++		t.Fatal("paused grant still valid")
++	}
++	room.Paused = false
++	room, err = svc.ConfigurePeerRoom(ctx, room)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = svc.GetPeerToolBinding(ctx, "a"); err == nil {
++		t.Fatal("resume silently upgraded grant")
++	}
++	if _, err = svc.BindPeerTools(ctx, "r", room.Epoch); err != nil {
++		t.Fatal(err)
++	}
++	if binding, err := svc.GetPeerToolBinding(ctx, "a"); err != nil || binding.Epoch != room.Epoch {
++		t.Fatal(binding, err)
++	}
++}
+diff --git a/backend/internal/session_manager/chat_spawn_test.go b/backend/internal/session_manager/chat_spawn_test.go
+index 623582d..9ffcf52 100644
+--- a/backend/internal/session_manager/chat_spawn_test.go
++++ b/backend/internal/session_manager/chat_spawn_test.go
+@@ -1726,6 +1726,13 @@ func TestSendRoutesIntoTheChatConversation(t *testing.T) {
+ 	if len(launcher.relayed) != 1 || launcher.relayed[0] != "relayed from an orchestrator" {
+ 		t.Fatalf("relayed = %v, want the message routed to the conversation", launcher.relayed)
+ 	}
++
++	if err := mgr.SendWithOptions(ctx, rec.ID, "room prompt", nil, ports.MessageDeliveryOptions{AuthoredByUser: true, ClientMessageID: "peer:stable"}); err != nil {
++		t.Fatal(err)
++	}
++	if launcher.relayIDs[len(launcher.relayIDs)-1] != "peer:stable" {
++		t.Fatal("room correlation lost before native controller")
++	}
+ 	// The initial prompt is a different thing and must not be conflated with it.
+ 	if len(launcher.turns) != 1 || launcher.turns[0] != "initial brief" {
+ 		t.Errorf("initial prompt turns = %v", launcher.turns)
+diff --git a/backend/internal/session_manager/manager.go b/backend/internal/session_manager/manager.go
+index 4755361..7e8e81d 100644
+--- a/backend/internal/session_manager/manager.go
++++ b/backend/internal/session_manager/manager.go
+@@ -5020,7 +5020,7 @@ func (m *Manager) SendWithOptions(ctx context.Context, id domain.SessionID, mess
+ 		message = appendAttachmentReferences(message, refs)
+ 	}
+ 	options.InteractionAt = m.clock()
+-	return m.send(ctx, id, message, "", options)
++	return m.send(ctx, id, message, options.ClientMessageID, options)
+ }
+ 
+ // SendSemantic delivers an internal message and returns only after the target
+diff --git a/backend/internal/session_manager/manager_test.go b/backend/internal/session_manager/manager_test.go
+index 1c5f715..beb10a2 100644
+--- a/backend/internal/session_manager/manager_test.go
++++ b/backend/internal/session_manager/manager_test.go
+@@ -7595,6 +7595,8 @@ func TestSpawn_EarlyFailurePreservesNonEmptyScratchWorkspace(t *testing.T) {
+ 		Messenger: &fakeMessenger{},
+ 		Lifecycle: &fakeLCM{store: st},
+ 		DataDir:   t.TempDir(),
++		// This fake runtime test must reach provisioning without a host tmux dependency.
++		LookPath: func(name string) (string, error) { return "/bin/" + name, nil },
+ 	})
+ 
+ 	_, _, _, err = m.Spawn(ctx, ports.SpawnConfig{ProjectID: "scratch", Kind: domain.KindOrchestrator})
+diff --git a/backend/internal/storage/sqlite/migrate_burned_versions_test.go b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+index d0e2d88..5992937 100644
+--- a/backend/internal/storage/sqlite/migrate_burned_versions_test.go
++++ b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+@@ -20,6 +20,7 @@ import (
+ // session list). Renaming, renumbering, or deleting a shipped migration
+ // produces exactly that class of failure, so this list is append-only.
+ var shippedMigrations = map[int64]string{
++	20261111201016434: "20261111201016434_peer_tool_grants.sql",
+ 	20261111182908940: "20261111182908940_peer_delivery_history.sql",
+ 	20261111122043927: "20261111122043927_peer_session_bindings.sql",
+ 	20261111120338733: "20261111120338733_peer_tasks.sql",
+diff --git a/backend/internal/storage/sqlite/migrations/20261111201016434_peer_tool_grants.sql b/backend/internal/storage/sqlite/migrations/20261111201016434_peer_tool_grants.sql
+new file mode 100644
+index 0000000..bb96e83
+--- /dev/null
++++ b/backend/internal/storage/sqlite/migrations/20261111201016434_peer_tool_grants.sql
+@@ -0,0 +1,4 @@
++-- +goose Up
++CREATE TABLE peer_tool_grants(session_id TEXT PRIMARY KEY REFERENCES sessions(id),room_id TEXT NOT NULL REFERENCES peer_rooms(id),epoch INTEGER NOT NULL);
++-- +goose Down
++DROP TABLE peer_tool_grants;
+diff --git a/backend/internal/storage/sqlite/peer_rooms_test.go b/backend/internal/storage/sqlite/peer_rooms_test.go
+index 8fd5a13..b7bb8a3 100644
+--- a/backend/internal/storage/sqlite/peer_rooms_test.go
++++ b/backend/internal/storage/sqlite/peer_rooms_test.go
+@@ -44,6 +44,26 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
++
++	if _, err = s.GetPeerToolBinding(ctx, "a"); err == nil {
++		t.Fatal("ungranted tools allowed")
++	}
++	if _, err = s.BindPeerTools(ctx, "r", room.Epoch+1); err == nil {
++		t.Fatal("stale bind allowed")
++	}
++	if _, err = s.BindPeerTools(ctx, "r", room.Epoch); err != nil {
++		t.Fatal(err)
++	}
++	if binding, err := s.GetPeerToolBinding(ctx, "a"); err != nil || binding.Epoch != room.Epoch {
++		t.Fatal(binding, err)
++	}
++	proposed, err := s.ActPeerTask(ctx, "r", domain.PeerTaskAction{ID: "proposal", Actor: "a", Epoch: room.Epoch, Action: "propose", Goal: "independent task"})
++	if err != nil || proposed.State != "open" {
++		t.Fatal(proposed, err)
++	}
++	if _, err = s.ActPeerTask(ctx, "r", domain.PeerTaskAction{ID: "bad-proposal", Actor: "outsider", Epoch: room.Epoch, Action: "propose", Goal: "no"}); err == nil {
++		t.Fatal("nonmember proposed")
++	}
+ 	msg := domain.PeerMessage{Sender: "a", Target: "b", ID: "one", Epoch: room.Epoch, Message: "hello"}
+ 	for _, target := range []string{"outsider", "cross", "a"} {
+ 		bad := msg
+@@ -78,6 +98,31 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 	if err != nil || len(history) != 1 || history[0].Message != "hello" || history[0].Sender != "a" || history[0].Target != "b" || history[0].State != "pending" || history[0].CreatedAt == "" {
+ 		t.Fatalf("lost history after restart: %+v %v", history, err)
+ 	}
++
++	// Same-text unrelated turns must not appear; the persisted client key is the join.
++	for _, q := range []string{
++		"INSERT INTO conversations(id,scope,project_id,session_id,current_session_id,created_at,updated_at) VALUES('conv','session','p','b','b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
++		"INSERT INTO conversation_turns(id,conversation_id,handled_by_session_id,state,requested_at) VALUES('turn','conv','b','completed',CURRENT_TIMESTAMP),('unrelated','conv','b','completed',CURRENT_TIMESTAMP)",
++		"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,created_at,updated_at) VALUES('reply','conv','turn',2,'assistant','provider','room answer',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other-reply','conv','unrelated',4,'assistant','provider','unrelated answer',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
++	} {
++		if _, err = db.Exec(q); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if _, err = db.Exec("INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,client_message_id,created_at,updated_at) VALUES('input','conv','turn',1,'user','human','hello',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", domain.PeerDeliveryKey("r", "one")); err != nil {
++		t.Fatal(err)
++	}
++	joined, err := s.ListPeerDeliveries(ctx, "r")
++	if err != nil || len(joined[0].Replies) != 1 || joined[0].Replies[0].Text != "room answer" {
++		t.Fatal(joined, err)
++	}
++	if _, err = db.Exec("UPDATE conversation_turns SET rolled_back_at=CURRENT_TIMESTAMP WHERE id='turn'"); err != nil {
++		t.Fatal(err)
++	}
++	joined, err = s.ListPeerDeliveries(ctx, "r")
++	if err != nil || len(joined[0].Replies) != 0 {
++		t.Fatal("rolled-back reply leaked", joined, err)
++	}
+ 	if _, err = s.ListPeerDeliveries(ctx, "missing"); err == nil {
+ 		t.Fatal("missing room reported as empty history")
+ 	}
+@@ -174,10 +219,10 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 		t.Fatal("claim winners", winners.Load())
+ 	}
+ 	tasks, err := s.ListPeerTasks(ctx, "r")
+-	if err != nil || len(tasks) != 1 {
++	if err != nil || len(tasks) != 2 {
+ 		t.Fatal(tasks, err)
+ 	}
+-	task = tasks[0]
++	task = tasks[1]
+ 	other := "a"
+ 	if task.Owner == "a" {
+ 		other = "b"
+@@ -213,6 +258,12 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
++	if _, err = s.GetPeerToolBinding(ctx, "a"); err == nil {
++		t.Fatal("paused binding allowed")
++	}
++	if _, err = s.BindPeerTools(ctx, "r", room.Epoch); err == nil {
++		t.Fatal("paused rebind allowed")
++	}
+ 	a.Epoch = room.Epoch
+ 	a.Revision = task.Revision
+ 	if _, err = s.ActPeerTask(ctx, "r", a); err == nil {
+diff --git a/backend/internal/storage/sqlite/store/peer_bindings.go b/backend/internal/storage/sqlite/store/peer_bindings.go
+new file mode 100644
+index 0000000..6532d91
+--- /dev/null
++++ b/backend/internal/storage/sqlite/store/peer_bindings.go
+@@ -0,0 +1,72 @@
++package store
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"slices"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++)
++
++// Explicit user action grants the current epoch. Reading a binding never upgrades it.
++func (s *Store) BindPeerTools(ctx context.Context, room string, epoch int64) (domain.PeerToolBinding, error) {
++	var out domain.PeerToolBinding
++	if err := s.writeMu.LockContext(ctx); err != nil {
++		return out, err
++	}
++	defer s.writeMu.Unlock()
++	tx, err := s.writeDB.BeginTx(ctx, nil)
++	if err != nil {
++		return out, err
++	}
++	defer tx.Rollback()
++	r, err := readPeerRoom(ctx, tx, room)
++	if err != nil {
++		return out, err
++	}
++	if r.Paused || r.Epoch != epoch {
++		return out, fmt.Errorf("paused room or stale epoch")
++	}
++	for _, id := range r.Members {
++		if err = peerMember(ctx, tx, id, r.ProjectID); err != nil {
++			return out, err
++		}
++		var prior string
++		err = tx.QueryRowContext(ctx, "SELECT room_id FROM peer_tool_grants WHERE session_id=?", id).Scan(&prior)
++		if err != nil && err != sql.ErrNoRows {
++			return out, err
++		}
++		if err == nil && prior != room {
++			return out, fmt.Errorf("session already bound to another room")
++		}
++		if _, err = tx.ExecContext(ctx, "INSERT INTO peer_tool_grants(session_id,room_id,epoch) VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET epoch=excluded.epoch", id, room, epoch); err != nil {
++			return out, err
++		}
++	}
++	return domain.PeerToolBinding{RoomID: room, ProjectID: r.ProjectID, Epoch: epoch}, tx.Commit()
++}
++func (s *Store) GetPeerToolBinding(ctx context.Context, id string) (domain.PeerToolBinding, error) {
++	var out domain.PeerToolBinding
++	err := s.readDB.QueryRowContext(ctx, "SELECT room_id,epoch FROM peer_tool_grants WHERE session_id=?", id).Scan(&out.RoomID, &out.Epoch)
++	if err != nil {
++		return out, err
++	}
++	r, err := s.GetPeerRoom(ctx, out.RoomID)
++	if err != nil {
++		return out, err
++	}
++	if r.Paused || r.Epoch != out.Epoch || !slices.Contains(r.Members, id) {
++		return out, fmt.Errorf("binding revoked; explicit user rebind required")
++	}
++	var project string
++	var terminated bool
++	if err = s.readDB.QueryRowContext(ctx, "SELECT project_id,is_terminated FROM sessions WHERE id=?", id).Scan(&project, &terminated); err != nil {
++		return out, err
++	}
++	if terminated || project != r.ProjectID {
++		return out, fmt.Errorf("session unavailable")
++	}
++	out.ProjectID = r.ProjectID
++	return out, nil
++}
+diff --git a/backend/internal/storage/sqlite/store/peer_rooms.go b/backend/internal/storage/sqlite/store/peer_rooms.go
+index 74b6947..cb4d537 100644
+--- a/backend/internal/storage/sqlite/store/peer_rooms.go
++++ b/backend/internal/storage/sqlite/store/peer_rooms.go
+@@ -193,5 +193,41 @@ func (s *Store) ListPeerDeliveries(ctx context.Context, room string) ([]domain.P
+ 		}
+ 		out = append(out, d)
+ 	}
+-	return out, rows.Err()
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	rows.Close()
++	for i := range out {
++		out[i].Replies = []domain.PeerReply{}
++		// Match a persisted input key and native turn, never text similarity or a time window.
++		replies, err := s.readDB.QueryContext(ctx, `SELECT DISTINCT a.id,a.text,a.streaming,t.state,a.sequence
++   FROM conversation_messages u JOIN conversations c ON c.id=u.conversation_id
++   JOIN conversation_turns t ON t.id=u.turn_id AND t.conversation_id=c.id
++   JOIN conversation_messages a ON a.conversation_id=c.id AND a.turn_id=t.id
++   WHERE u.client_message_id=? AND u.role='user' AND t.handled_by_session_id=?
++   AND a.role='assistant' AND t.rolled_back_at IS NULL AND t.promoted_to_turn_id IS NULL
++   ORDER BY a.sequence LIMIT 101`, domain.PeerDeliveryKey(room, out[i].ID), out[i].Target)
++		if err != nil {
++			return nil, err
++		}
++		for replies.Next() {
++			var reply domain.PeerReply
++			var seq int64
++			if err := replies.Scan(&reply.ID, &reply.Text, &reply.Streaming, &reply.TurnState, &seq); err != nil {
++				replies.Close()
++				return nil, err
++			}
++			out[i].Replies = append(out[i].Replies, reply)
++		}
++		err = replies.Err()
++		replies.Close()
++		if err != nil {
++			return nil, err
++		}
++		if len(out[i].Replies) > 100 {
++			out[i].RepliesTruncated = true
++			out[i].Replies = out[i].Replies[:100]
++		}
++	}
++	return out, nil
+ }
+diff --git a/backend/internal/storage/sqlite/store/peer_tasks.go b/backend/internal/storage/sqlite/store/peer_tasks.go
+index 5215376..30348fc 100644
+--- a/backend/internal/storage/sqlite/store/peer_tasks.go
++++ b/backend/internal/storage/sqlite/store/peer_tasks.go
+@@ -57,7 +57,7 @@ func (s *Store) CreatePeerTask(ctx context.Context, room string, t domain.PeerTa
+ }
+ func (s *Store) ActPeerTask(ctx context.Context, room string, a domain.PeerTaskAction) (domain.PeerTask, error) {
+ 	var t domain.PeerTask
+-	if len(a.Evidence) > 4000 || len(a.Commit) > 40 {
++	if len(a.Evidence) > 4000 || len(a.Commit) > 40 || len(a.Goal) > 4000 || a.ID == "" || len(a.ID) > 100 {
+ 		return t, fmt.Errorf("oversized task evidence")
+ 	}
+ 	if err := s.writeMu.LockContext(ctx); err != nil {
+@@ -79,6 +79,28 @@ func (s *Store) ActPeerTask(ctx context.Context, room string, a domain.PeerTaskA
+ 	if err = peerMember(ctx, tx, a.Actor, r.ProjectID); err != nil {
+ 		return t, err
+ 	}
++
++	if a.Action == "propose" {
++		if a.Revision != 0 || strings.TrimSpace(a.Goal) == "" {
++			return t, fmt.Errorf("new task needs goal and revision zero")
++		}
++		var count int
++		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM peer_tasks WHERE room_id=?", room).Scan(&count); err != nil {
++			return t, err
++		}
++		if count >= 100 {
++			return t, fmt.Errorf("room task limit reached")
++		}
++		t = domain.PeerTask{ID: a.ID, Goal: a.Goal, State: "open"}
++		if _, err = tx.ExecContext(ctx, "INSERT INTO peer_tasks(room_id,id,goal,state) VALUES(?,?,?,'open')", room, t.ID, t.Goal); err != nil {
++			return t, err
++		}
++		raw, _ := json.Marshal(a)
++		if _, err = tx.ExecContext(ctx, "INSERT INTO peer_task_events(room_id,task_id,revision,action_json) VALUES(?,?,0,?)", room, t.ID, string(raw)); err != nil {
++			return t, err
++		}
++		return t, tx.Commit()
++	}
+ 	if err = tx.QueryRowContext(ctx, "SELECT id,goal,state,owner,revision,evidence,candidate_commit,reviewer FROM peer_tasks WHERE room_id=? AND id=?", room, a.ID).Scan(&t.ID, &t.Goal, &t.State, &t.Owner, &t.Revision, &t.Evidence, &t.Commit, &t.Reviewer); err != nil {
+ 		return t, err
+ 	}
+diff --git a/frontend/src/api/schema.ts b/frontend/src/api/schema.ts
+index 3df905e..201d556 100644
+--- a/frontend/src/api/schema.ts
++++ b/frontend/src/api/schema.ts
+@@ -1839,6 +1839,23 @@ export interface paths {
+         patch?: never;
+         trace?: never;
+     };
++    "/api/v1/peer-rooms/{roomId}/bind": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        get?: never;
++        put?: never;
++        /** Explicitly grant current room tool epoch */
++        post: operations["bindPeerTools"];
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
+     "/api/v1/peer-rooms/{roomId}/broadcast": {
+         parameters: {
+             query?: never;
+@@ -3456,6 +3473,23 @@ export interface paths {
+         patch: operations["setSessionMergePolicy"];
+         trace?: never;
+     };
++    "/api/v1/sessions/{sessionId}/peer-binding": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        /** Read a non-upgrading native tool binding */
++        get: operations["getPeerToolBinding"];
++        put?: never;
++        post?: never;
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
+     "/api/v1/sessions/{sessionId}/pin": {
+         parameters: {
+             query?: never;
+@@ -6734,6 +6768,10 @@ export interface components {
+             targetSha: string;
+             title: string;
+         };
++        PeerBindRequest: {
++            /** Format: int64 */
++            epoch: number;
++        };
+         PeerBroadcastDelivery: {
+             detail?: string;
+             session: string;
+@@ -6754,6 +6792,8 @@ export interface components {
+             epoch: number;
+             id: string;
+             message: string;
++            replies: components["schemas"]["PeerReply"][];
++            repliesTruncated: boolean;
+             sender: string;
+             state: string;
+             target: string;
+@@ -6777,6 +6817,12 @@ export interface components {
+             sender: string;
+             target: string;
+         };
++        PeerReply: {
++            id: string;
++            streaming: boolean;
++            text: string;
++            turnState: string;
++        };
+         PeerRoom: {
+             budget: number;
+             /** Format: int64 */
+@@ -6808,10 +6854,17 @@ export interface components {
+             /** Format: int64 */
+             epoch: number;
+             evidence: string;
++            goal?: string;
+             id: string;
+             /** Format: int64 */
+             revision: number;
+         };
++        PeerToolBinding: {
++            /** Format: int64 */
++            epoch: number;
++            projectId: string;
++            roomId: string;
++        };
+         PrepareTaskResponse: {
+             ok: boolean;
+             taskPreparation?: string;
+@@ -14477,6 +14530,50 @@ export interface operations {
+             };
+         };
+     };
++    bindPeerTools: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                roomId: string;
++            };
++            cookie?: never;
++        };
++        requestBody: {
++            content: {
++                "application/json": components["schemas"]["PeerBindRequest"];
++            };
++        };
++        responses: {
++            /** @description OK */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["PeerToolBinding"];
++                };
++            };
++            /** @description Bad Request */
++            400: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++            /** @description Conflict */
++            409: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++        };
++    };
+     broadcastPeerRoom: {
+         parameters: {
+             query?: never;
+@@ -20711,6 +20808,38 @@ export interface operations {
+             };
+         };
+     };
++    getPeerToolBinding: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                /** @description Session identifier, e.g. project-1. */
++                sessionId: string;
++            };
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description OK */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["PeerToolBinding"];
++                };
++            };
++            /** @description Conflict */
++            409: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["APIError"];
++                };
++            };
++        };
++    };
+     pinSession: {
+         parameters: {
+             query?: never;
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index 3fc6668..7106316 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -49,37 +49,49 @@ beforeEach(() => {
+ 		paused: false,
+ 	};
+ 	api.GET.mockImplementation(async (path: string) =>
+-		path.endsWith("/history")
+-			? {
+-					data: [
+-						{
+-							id: "receipt",
+-							sender: "",
+-							target: "a",
+-							message: "本房间的消息",
+-							state: "uncertain",
+-							createdAt: "2026-11-11T10:00:00Z",
+-							epoch: 1,
+-						},
+-					],
+-				}
+-			: path.includes("peer-rooms")
+-				? { data: room, response: { status: room ? 200 : 404 } }
+-				: {
+-						data: {
+-							controller: "ready",
+-							messages: [
++		path.endsWith("/tasks")
++			? { data: [] }
++			: path.endsWith("/peer-binding")
++				? { error: { message: "unbound" } }
++				: path.endsWith("/history")
++					? {
++							data: [
+ 								{
+-									id: "1",
+-									role: "assistant",
+-									text: "原生回复",
++									replies: [
++										{
++											id: "answer",
++											text: "准确关联的回复",
++											streaming: false,
++											turnState: "completed",
++										},
++									],
++									id: "receipt",
++									sender: "",
++									target: "a",
++									message: "本房间的消息",
++									state: "uncertain",
+ 									createdAt: "2026-11-11T10:00:00Z",
+-									sequence: 1,
++									epoch: 1,
+ 								},
+ 							],
+-							hasMoreBefore: false,
+-						},
+-					},
++						}
++					: path.includes("peer-rooms")
++						? { data: room, response: { status: room ? 200 : 404 } }
++						: {
++								data: {
++									controller: "ready",
++									messages: [
++										{
++											id: "1",
++											role: "assistant",
++											text: "原生回复",
++											createdAt: "2026-11-11T10:00:00Z",
++											sequence: 1,
++										},
++									],
++									hasMoreBefore: false,
++								},
++							},
+ 	);
+ 	api.PUT.mockImplementation(async (_path, { body }) => {
+ 		room = { ...body, epoch: body.epoch + 1 };
+@@ -182,3 +194,13 @@ it("keeps durable receipts after remount and labels native history separately",
+ 	expect(screen.getByText(/结果不确定，请核查/)).toBeInTheDocument();
+ 	expect(api.POST).not.toHaveBeenCalled();
+ });
++
++it("renders exact correlated replies in the room and grants tools only on explicit click", async () => {
++	mount();
++	await screen.findByText("准确关联的回复");
++	expect(api.POST).not.toHaveBeenCalled();
++	fireEvent.click(screen.getByRole("button", { name: "连接 / 更新同伴工具" }));
++	await waitFor(() => expect(api.POST).toHaveBeenCalledTimes(1));
++	expect(api.POST.mock.calls[0][0]).toContain("/bind");
++	expect(api.POST.mock.calls[0][1].body).toEqual({ epoch: 1 });
++});
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index 0e3b2c5..9445b35 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -4,6 +4,7 @@ import type { components } from "../../api/schema";
+ import { apiClient } from "../lib/api-client";
+ import type { WorkspaceSession } from "../types/workspace";
+ import { Button } from "./ui/button";
++import { PeerTasks } from "./PeerTasks";
+ import { ChatMarkdown } from "./chat/ChatMarkdown";
+ 
+ type Room = components["schemas"]["PeerRoom"];
+@@ -15,6 +16,7 @@ const states: Record<string, string> = {
+ 	blocked: "未发送",
+ 	uncertain: "结果不确定，请核查",
+ };
++const replyStates:Record<string,string>={queued:"等待处理",running:"正在工作",completed:"本轮已回复",recovered:"已恢复",interrupted:"已中断",failed:"本轮失败",cancelled:"已取消"};
+ const controllerStates: Record<string, string> = {
+ 	busy: "正在工作",
+ 	ready: "就绪",
+@@ -36,10 +38,12 @@ export function PeerRoom({
+ 	projectId,
+ 	sessions,
+ 	onManageSessions,
++	onOpenSession,
+ }: {
+ 	projectId: string;
+ 	sessions: WorkspaceSession[];
+ 	onManageSessions: () => void;
++	onOpenSession?: (id: string) => void;
+ }) {
+ 	const roomId = `project-${projectId}`;
+ 	const cache = useQueryClient();
+@@ -96,6 +100,38 @@ export function PeerRoom({
+ 		},
+ 	});
+ 
++	const bindings = useQueries({
++		queries: members.map((sessionId) => ({
++			queryKey: ["peer-binding", sessionId],
++			retry: false,
++			refetchInterval: 3000,
++			queryFn: async () => {
++				const r = await apiClient.GET(
++					"/api/v1/sessions/{sessionId}/peer-binding",
++					{ params: { path: { sessionId } } },
++				);
++				return r.error ? null : (r.data ?? null);
++			},
++		})),
++	});
++	async function bindTools() {
++		if (!room.data) return;
++		setBusy(true);
++		setError("");
++		try {
++			const r = await apiClient.POST("/api/v1/peer-rooms/{roomId}/bind", {
++				params: { path: { roomId } },
++				body: { epoch: room.data.epoch },
++			});
++			if (r.error) throw failure(r.error);
++			await cache.invalidateQueries({ queryKey: ["peer-binding"] });
++		} catch (e) {
++			setError(failure(e).message);
++		} finally {
++			setBusy(false);
++		}
++	}
++
+ 	const conversations = useQueries({
+ 		queries: members.map((sessionId) => ({
+ 			queryKey: ["peer-room-conversation", roomId, sessionId],
+@@ -287,7 +323,7 @@ export function PeerRoom({
+ 					/>
+ 				</label>
+ 				<p className="my-3 text-sm text-muted-foreground">
+-					加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员后，原生同伴工具需重新绑定才能继续互发消息。
++					加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员或恢复房间后，请点击连接按钮明确更新同伴工具授权。
+ 				</p>
+ 				<Button
+ 					disabled={
+@@ -306,6 +342,36 @@ export function PeerRoom({
+ 					{room.data ? "保存成员" : "创建项目房间"}
+ 				</Button>
+ 			</details>
++			{room.data && (
++				<div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
++					<Button
++						variant="secondary"
++						disabled={busy || room.data.paused}
++						onClick={bindTools}
++					>
++						连接 / 更新同伴工具
++					</Button>
++					<p className="text-xs text-muted-foreground">
++						{
++							members.filter(
++								(_, i) =>
++									bindings[i]?.data?.roomId === roomId &&
++									bindings[i]?.data?.epoch === room.data?.epoch,
++							).length
++						}{" "}
++						/ {members.length} 位成员已授权当前房间。此操作不会启动模型。
++					</p>
++				</div>
++			)}
++			{room.data && (
++				<PeerTasks
++					key={roomId}
++					roomId={roomId}
++					epoch={room.data.epoch}
++					paused={room.data.paused}
++				/>
++			)}
++
+ 			{(error || room.isError) && (
+ 				<p role="alert" className="p-4 text-destructive">
+ 					{error || failure(room.error).message}
+@@ -341,6 +407,23 @@ export function PeerRoom({
+ 									: ""}
+ 							</p>
+ 							{d.message && <ChatMarkdown text={d.message} />}
++							{(d.replies ?? []).map((reply) => (
++								<section
++									key={reply.id}
++									className="mt-4 border-t border-border pt-3"
++								>
++									<p className="mb-2 text-xs text-muted-foreground">
++										{label(d.target)} ·{" "}
++										{reply.streaming ? "正在回复" : (replyStates[reply.turnState] ?? "状态待确认")}
++									</p>
++									<ChatMarkdown text={reply.text} streaming={reply.streaming} />
++								</section>
++							))}
++							{d.repliesTruncated && (
++								<p className="text-xs text-muted-foreground">
++									此轮回复较长，更多内容请查看原生会话。
++								</p>
++							)}
+ 						</article>
+ 					))}
+ 					<details>
+@@ -351,6 +434,11 @@ export function PeerRoom({
+ 						{members.map((id, i) => (
+ 							<p key={id} className="text-sm text-muted-foreground">
+ 								{label(id)}：
++								{onOpenSession && (
++									<Button variant="quiet" onClick={() => onOpenSession(id)}>
++										打开原生会话 / 处理授权
++									</Button>
++								)}
+ 								{conversations[i]?.isError
+ 									? "记录加载失败，不能确认当前状态"
+ 									: (controllerStates[
+diff --git a/frontend/src/renderer/components/PeerTasks.test.tsx b/frontend/src/renderer/components/PeerTasks.test.tsx
+new file mode 100644
+index 0000000..3c04fba
+--- /dev/null
++++ b/frontend/src/renderer/components/PeerTasks.test.tsx
+@@ -0,0 +1,76 @@
++import {
++  render,
++  screen,
++  fireEvent,
++  waitFor,
++  cleanup,
++} from "@testing-library/react";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { afterEach, it, expect, vi } from "vitest";
++import { PeerTasks } from "./PeerTasks";
++const api = vi.hoisted(() => ({ GET: vi.fn(), PUT: vi.fn(), POST: vi.fn() }));
++vi.mock("../lib/api-client", () => ({ apiClient: api }));
++afterEach(cleanup);
++it("shows ownership and creates an open task without impersonating an agent", async () => {
++  api.GET.mockResolvedValue({
++    data: [
++      {
++        id: "t",
++        goal: "检查刷新恢复",
++        state: "claimed",
++        owner: "codex-2",
++        evidence: "",
++        reviewer: "",
++      },
++    ],
++  });
++  api.PUT.mockResolvedValue({ data: {} });
++  render(
++    <QueryClientProvider client={new QueryClient()}>
++      <PeerTasks roomId="r" />
++    </QueryClientProvider>,
++  );
++  fireEvent.click(screen.getByText(/团队任务/));
++  await screen.findByText("检查刷新恢复");
++  expect(screen.getByText(/codex-2/)).toBeInTheDocument();
++  fireEvent.change(screen.getByLabelText("任务目标"), {
++    target: { value: "检查边界输入" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "添加任务" }));
++  await waitFor(() => expect(api.PUT).toHaveBeenCalledTimes(1));
++  expect(api.PUT.mock.calls[0][1].body).toMatchObject({
++    goal: "检查边界输入",
++    owner: "",
++    state: "open",
++  });
++});
++
++it("only offers candidate integration after independent acceptance", async () => {
++  api.GET.mockResolvedValue({
++    data: [
++      {
++        id: "t",
++        goal: "已完成任务",
++        state: "submitted",
++        owner: "codex-1",
++        evidence: "tests passed",
++        reviewer: "",
++      },
++    ],
++  });
++  render(
++    <QueryClientProvider client={new QueryClient()}>
++      <PeerTasks roomId="r" epoch={2} />
++    </QueryClientProvider>,
++  );
++  fireEvent.click(screen.getByText(/团队任务/));
++  await screen.findByText("已完成任务");
++  fireEvent.click(screen.getByText("生成候选版本"));
++  fireEvent.change(screen.getByLabelText("基线提交（完整提交编号）"), {
++    target: { value: "a".repeat(40) },
++  });
++  fireEvent.change(screen.getByLabelText("候选名称"), {
++    target: { value: "candidate" },
++  });
++  expect(screen.getByRole("button", { name: "生成候选分支" })).toBeDisabled();
++});
+diff --git a/frontend/src/renderer/components/PeerTasks.tsx b/frontend/src/renderer/components/PeerTasks.tsx
+new file mode 100644
+index 0000000..fed921c
+--- /dev/null
++++ b/frontend/src/renderer/components/PeerTasks.tsx
+@@ -0,0 +1,183 @@
++import { useState } from "react";
++import { useQuery, useQueryClient } from "@tanstack/react-query";
++import { apiClient } from "../lib/api-client";
++import { Button } from "./ui/button";
++const labels: Record<string, string> = {
++	open: "待认领",
++	claimed: "进行中",
++	submitted: "待独立验收",
++	accepted: "已验收（尚未集成）",
++};
++export function PeerTasks({
++	roomId,
++	epoch = 0,
++	paused = false,
++}: {
++	roomId: string;
++	epoch?: number;
++	paused?: boolean;
++}) {
++	const cache = useQueryClient();
++	const [goal, setGoal] = useState("");
++	const [base, setBase] = useState("");
++	const [name, setName] = useState("");
++	const [candidate, setCandidate] = useState("");
++	async function integrate() {
++		setBusy(true);
++		setError("");
++		try {
++			const r = await apiClient.POST("/api/v1/peer-rooms/{roomId}/integrate", {
++				params: { path: { roomId } },
++				body: { epoch, base, name },
++			});
++			if (r.error || !r.data)
++				throw new Error("候选集成未完成，请检查冲突或版本。不会覆盖现有分支。");
++			setCandidate(`${r.data.branch} · ${r.data.commit}`);
++		} catch (e) {
++			setError(String(e));
++		} finally {
++			setBusy(false);
++		}
++	}
++	const [busy, setBusy] = useState(false);
++	const [error, setError] = useState("");
++	const key = ["peer-tasks", roomId];
++	const query = useQuery({
++		queryKey: key,
++		refetchInterval: 3000,
++		retry: false,
++		queryFn: async () => {
++			const r = await apiClient.GET("/api/v1/peer-rooms/{roomId}/tasks", {
++				params: { path: { roomId } },
++			});
++			if (r.error || !r.data) throw new Error("任务读取失败");
++			return r.data;
++		},
++	});
++	async function add() {
++		setBusy(true);
++		setError("");
++		try {
++			const r = await apiClient.PUT("/api/v1/peer-rooms/{roomId}/tasks", {
++				params: { path: { roomId } },
++				body: {
++					id: crypto.randomUUID(),
++					goal,
++					state: "open",
++					owner: "",
++					revision: 0,
++					evidence: "",
++					commit: "",
++					reviewer: "",
++				},
++			});
++			if (r.error) throw new Error("创建失败，请刷新核查，避免重复创建。");
++			setGoal("");
++			await cache.invalidateQueries({ queryKey: key });
++		} catch (e) {
++			setError(String(e));
++		} finally {
++			setBusy(false);
++		}
++	}
++	return (
++		<details className="border-b border-border p-4">
++			<summary className="cursor-pointer text-sm">
++				团队任务（{query.data?.length ?? 0}）
++			</summary>
++			<p className="my-3 text-xs text-muted-foreground">
++				成员可通过同伴工具提出并认领任务。这里只创建待办，不冒充成员认领，也不会自动启动模型。
++			</p>
++			{(error || query.isError) && (
++				<p role="alert">{error || "任务读取失败，请稍后重试。"}</p>
++			)}
++			<ul className="space-y-3">
++				{(query.data ?? []).map((t) => (
++					<li key={t.id} className="border-b border-border pb-3">
++						<p>{t.goal}</p>
++						<p className="text-sm text-muted-foreground">
++							{labels[t.state] ?? t.state} · {t.owner || "尚未认领"}
++							{t.reviewer ? ` · 验收：${t.reviewer}` : ""}
++						</p>
++						{t.evidence && (
++							<details>
++								<summary>交付与验收证据</summary>
++								<pre className="whitespace-pre-wrap break-words text-sm">
++									{t.evidence}
++								</pre>
++								{t.commit && <code className="break-all">{t.commit}</code>}
++							</details>
++						)}
++					</li>
++				))}
++			</ul>
++			<form
++				className="mt-3 flex flex-wrap gap-2"
++				onSubmit={(e) => {
++					e.preventDefault();
++					if (goal.trim() && !busy) void add();
++				}}
++			>
++				<label className="sr-only" htmlFor="peer-goal">
++					任务目标
++				</label>
++				<input
++					id="peer-goal"
++					value={goal}
++					onChange={(e) => setGoal(e.target.value)}
++					placeholder="添加目标和验收标准，让成员自行认领"
++					className="min-w-0 flex-1 rounded border border-border bg-secondary p-2"
++				/>
++				<Button
++					type="submit"
++					disabled={
++						busy || !goal.trim() || new TextEncoder().encode(goal).length > 4000
++					}
++				>
++					添加任务
++				</Button>
++			</form>
++			<details className="mt-4">
++				<summary>生成候选版本</summary>
++				<p className="my-2 text-xs text-muted-foreground">
++					全部任务经另一成员验收后，生成独立候选分支。不会修改主分支或替代最终测试。
++				</p>
++				<label className="block text-sm">
++					基线提交（完整提交编号）
++					<input
++						className="my-1 w-full rounded border border-border bg-secondary p-2"
++						value={base}
++						onChange={(e) => setBase(e.target.value.trim())}
++					/>
++				</label>
++				<label className="block text-sm">
++					候选名称
++					<input
++						className="my-1 w-full rounded border border-border bg-secondary p-2"
++						value={name}
++						onChange={(e) => setName(e.target.value.trim())}
++					/>
++				</label>
++				<Button
++					disabled={
++						busy ||
++						paused ||
++						!epoch ||
++						!/^[a-f0-9]{40}$/i.test(base) ||
++						!name ||
++						!query.data?.length ||
++						query.data.some((t) => t.state !== "accepted")
++					}
++					onClick={integrate}
++				>
++					生成候选分支
++				</Button>
++				{candidate && (
++					<p className="mt-2 break-all" role="status">
++						已生成待测试候选：{candidate}
++					</p>
++				)}
++			</details>
++		</details>
++	);
++}
+diff --git a/frontend/src/renderer/routes/_shell.projects.$projectId.tsx b/frontend/src/renderer/routes/_shell.projects.$projectId.tsx
+index 8beb780..6240059 100644
+--- a/frontend/src/renderer/routes/_shell.projects.$projectId.tsx
++++ b/frontend/src/renderer/routes/_shell.projects.$projectId.tsx
+@@ -1,4 +1,5 @@
+ import { createFileRoute } from "@tanstack/react-router";
++import { useNavigateToSession } from "../lib/navigate-to-session";
+ import { useState } from "react";
+ import { PeerRoom } from "../components/PeerRoom";
+ import { useWorkspaceQuery } from "../hooks/useWorkspaceQuery";
+@@ -11,6 +12,7 @@ export const Route = createFileRoute("/_shell/projects/$projectId")({
+ 
+ function ProjectBoardRoute() {
+ 	const { projectId } = Route.useParams();
++	const openSession = useNavigateToSession();
+ 	const [room, setRoom] = useState(false);
+ 	const workspace = useWorkspaceQuery({ includeCloud: false });
+ 	const project = workspace.data?.find(
+@@ -42,6 +44,7 @@ function ProjectBoardRoute() {
+ 					projectId={projectId}
+ 					sessions={project.sessions}
+ 					onManageSessions={() => setRoom(false)}
++					onOpenSession={(id) => openSession(projectId, id)}
+ 				/>
+ 			) : (
+ 				<SessionsBoard projectId={projectId} />
+-- 
+2.54.0 (Apple Git-157)
+

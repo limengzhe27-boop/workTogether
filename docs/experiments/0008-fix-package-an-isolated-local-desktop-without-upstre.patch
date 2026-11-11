@@ -1,0 +1,169 @@
+From 34e8be5263c53281dde1421aa9f6f1f8616c0553 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 04:34:27 +0800
+Subject: [PATCH 8/8] fix: package an isolated local desktop without upstream
+ update collisions
+
+Give the local fork a distinct bundle, profile and update source. Disable SDK-only pipe2 detection in bundled libevent to prevent terminal startup crashes on this macOS runtime. Packaging succeeds with the prepared Node 22 runtime; frontend regression has 680 passing files.
+---
+ frontend/assets/mac/en.lproj/InfoPlist.strings |  4 ++--
+ frontend/forge.config.test.ts                  |  6 +++---
+ frontend/forge.config.ts                       |  6 +++---
+ frontend/scripts/build-tmux.mjs                | 11 ++++++++---
+ frontend/src/main.ts                           |  9 ++++++++-
+ frontend/src/main/desktop-version-floor.ts     |  4 ++--
+ 6 files changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/frontend/assets/mac/en.lproj/InfoPlist.strings b/frontend/assets/mac/en.lproj/InfoPlist.strings
+index 8d55362..4c24eec 100644
+--- a/frontend/assets/mac/en.lproj/InfoPlist.strings
++++ b/frontend/assets/mac/en.lproj/InfoPlist.strings
+@@ -1,2 +1,2 @@
+-CFBundleDisplayName = "Orchestrator";
+-CFBundleName = "Orchestrator";
++CFBundleDisplayName = "WorkTogether Local";
++CFBundleName = "WorkTogether Local";
+diff --git a/frontend/forge.config.test.ts b/frontend/forge.config.test.ts
+index a62502c..38dd955 100644
+--- a/frontend/forge.config.test.ts
++++ b/frontend/forge.config.test.ts
+@@ -74,7 +74,7 @@ let fixtureDir: string;
+ function acpNodeWith(contents: Buffer): string {
+ 	const binDir = join(
+ 		fixtureDir,
+-		"Agent Orchestrator.app",
++		"WorkTogether Local.app",
+ 		"Contents",
+ 		"Resources",
+ 		"acp-runtime",
+@@ -376,8 +376,8 @@ describe("Windows app labels", () => {
+ 		expect(appPackage.name).toBe("agent-orchestrator");
+ 		expect(appPackage.productName).toBe("Orchestrator");
+ 		expect(config.packagerConfig?.executableName).toBe("agent-orchestrator");
+-		expect(config.packagerConfig?.name).toBe("Agent Orchestrator");
+-		expect(config.packagerConfig?.appBundleId).toBe("dev.agent-orchestrator.desktop");
++		expect(config.packagerConfig?.name).toBe("WorkTogether Local");
++		expect(config.packagerConfig?.appBundleId).toBe("local.worktogether.desktop");
+ 	});
+ });
+ 
+diff --git a/frontend/forge.config.ts b/frontend/forge.config.ts
+index a63a11e..47e6115 100644
+--- a/frontend/forge.config.ts
++++ b/frontend/forge.config.ts
+@@ -23,7 +23,7 @@ import { checkMacDmgLayout } from "./scripts/build-mac-dmg.mjs";
+ // workflows set AO_RELEASE_REPO to the repo they run in, and build-artifacts.yml
+ // asserts the baked app-update.yml matches it, so a future org/repo rename
+ // fails the build instead of stranding the fleet on a redirect (#3523).
+-const DEFAULT_RELEASE_REPO = "Untrivial-ai/agent-orchestrator";
++const DEFAULT_RELEASE_REPO = "limengzhe27-boop/workTogether";
+ 
+ // The packaged binary name (no extension). Single source of truth: the packager
+ // names the exe/ELF from this, and the NSIS + deb makers must point their
+@@ -68,7 +68,7 @@ async function prepareNativeDependencies(platform: NodeJS.Platform, arch: string
+ // Packager app name. It sets the bundle filename ("<name>.app"), which the
+ // installed path, updater, and `ao start` keep using, so it is not the label
+ // people see in Finder.
+-const PACKAGER_NAME = "Agent Orchestrator";
++const PACKAGER_NAME = "WorkTogether Local";
+ 
+ // Finder uses the localized label only when the base display name matches the
+ // bundle filename, but the packager defaults it to the executable name. Set it,
+@@ -175,7 +175,7 @@ const config: ForgeConfig = {
+ 		// runtime dependency tree explicitly; AutoUnpackNativesPlugin then places
+ 		// the .node binary outside app.asar.
+ 		ignore: ignoreFromVitePackage,
+-		appBundleId: "dev.agent-orchestrator.desktop",
++		appBundleId: "local.worktogether.desktop",
+ 		name: PACKAGER_NAME,
+ 		executableName: EXECUTABLE_NAME,
+ 		// Match the Windows installer without changing the executable name.
+diff --git a/frontend/scripts/build-tmux.mjs b/frontend/scripts/build-tmux.mjs
+index 73e5e05..8424830 100644
+--- a/frontend/scripts/build-tmux.mjs
++++ b/frontend/scripts/build-tmux.mjs
+@@ -51,7 +51,7 @@ const SOURCES = [TMUX, LIBEVENT, NCURSES, UTF8PROC];
+ // Linux intentionally links glibc dynamically. A fully static glibc tmux can
+ // enter __libc_early_init with an unset page size and SIGFPE on new-session
+ // even though `tmux -V` succeeds (#4616).
+-const BUILD_REVISION = 5;
++const BUILD_REVISION = 6;
+ 
+ const scriptsDir = dirname(fileURLToPath(import.meta.url));
+ const frontendRoot = resolve(scriptsDir, "..");
+@@ -130,7 +130,12 @@ async function build() {
+ 	const commonEnv = {
+ 		...process.env,
+ 		...(process.platform === "darwin"
+-			? { MACOSX_DEPLOYMENT_TARGET: process.arch === "arm64" ? "11.0" : "10.15" }
++			? {
++ MACOSX_DEPLOYMENT_TARGET: process.arch === "arm64" ? "11.0" : "10.15",
++ // New SDKs weak-link pipe2 even when the deployment target cannot run it.
++ // libevent 2.1.12 calls it without an availability check; use its pipe fallback.
++ ac_cv_func_pipe2: "no",
++ }
+ 			: {}),
+ 		CPPFLAGS: `-I${join(prefix, "include")} -I${join(prefix, "include", "ncursesw")}`,
+ 		LDFLAGS: `-L${join(prefix, "lib")}`,
+@@ -337,7 +342,7 @@ function run(command, args, options = {}) {
+ 			if (result.stdout) process.stderr.write(result.stdout);
+ 			if (result.stderr) process.stderr.write(result.stderr);
+ 		}
+-		fail(`${command} exited with status ${result.status}`);
++		fail(`${command} exited with status ${result.status}, signal ${result.signal ?? "none"}`);
+ 	}
+ 	return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+ }
+diff --git a/frontend/src/main.ts b/frontend/src/main.ts
+index 305db63..931b316 100644
+--- a/frontend/src/main.ts
++++ b/frontend/src/main.ts
+@@ -252,6 +252,13 @@ declare const MAIN_WINDOW_VITE_NAME: string;
+ 
+ const execFileAsync = promisify(execFile);
+ 
++// Keep this local fork separate from the upstream desktop install.
++if (app.isPackaged) {
++	process.env.AO_DATA_DIR ||= path.join(os.homedir(), ".ao", "worktogether-local", "data");
++	process.env.AO_RUN_FILE ||= path.join(os.homedir(), ".ao", "worktogether-local", "running.json");
++}
++
++
+ // Windows GUI launches (e.g. from a Start-menu/desktop shortcut) have no attached
+ // console, so process.stdout and process.stderr are dead pipes. The daemon-output
+ // console.log/console.error calls
+@@ -318,7 +325,7 @@ if (disableGpu === "1" || disableGpu === "true" || disableGpu === "yes" || disab
+ app.setPath(
+ 	"userData",
+ 	app.isPackaged
+-		? path.join(os.homedir(), ".ao", "electron")
++		? path.join(os.homedir(), ".ao", "worktogether-local", "electron")
+ 		: (process.env.AO_DEV_ELECTRON_DIR ?? path.join(os.homedir(), ".ao", "dev", "electron")),
+ );
+ 
+diff --git a/frontend/src/main/desktop-version-floor.ts b/frontend/src/main/desktop-version-floor.ts
+index c3339bf..dcc276c 100644
+--- a/frontend/src/main/desktop-version-floor.ts
++++ b/frontend/src/main/desktop-version-floor.ts
+@@ -2,7 +2,7 @@ import { app, dialog, shell } from "electron";
+ import semver from "semver";
+ 
+ const FLOOR_URL =
+-  "https://raw.githubusercontent.com/Untrivial-ai/agent-orchestrator/main/desktop-version-floor.json";
++  "https://raw.githubusercontent.com/limengzhe27-boop/workTogether/main/desktop-version-floor.json";
+ 
+ const FETCH_TIMEOUT_MS = 10_000;
+ 
+@@ -13,7 +13,7 @@ type Floor = {
+ };
+ 
+ const DEFAULT_DOWNLOAD_URL =
+-  "https://github.com/Untrivial-ai/agent-orchestrator/releases/latest";
++  "https://github.com/limengzhe27-boop/workTogether/releases/latest";
+ 
+ function usableVersion(v: string | null | undefined): string | null {
+   const trimmed = v?.trim();
+-- 
+2.54.0 (Apple Git-157)
+

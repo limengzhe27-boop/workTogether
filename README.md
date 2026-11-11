@@ -1,5 +1,7 @@
 # WorkTogether
 
+> **原生客户端新版正在独立验证**：以 Agent Orchestrator 为底座的项目群聊、同伴工具和自主认领实现见 [新版启动与边界](docs/ao-local-app.md)。以下正文仍描述原 Python/Web 应用；两者未合并，旧数据库保持原样。
+
 本地多 Agent 任务对话与协同研发原型，包含调度核心、命令行及 React 网页工作台。
 
 接手开发请先看 [未完成项](docs/next-steps.md)。当前 [HTTP 契约](docs/contracts/v1.md)

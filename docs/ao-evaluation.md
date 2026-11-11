@@ -133,3 +133,26 @@
 本批源码提交 `cc58de9`，补丁 `experiments/0006-feat-persist-room-delivery-history-without-mixing-na.patch`。AO SQLite、会话服务、HTTP 与契约测试通过；持久化并发测试（race）和相关 go vet 通过。前端完整测试（UTC）679 个文件、11,721 项通过、9 项跳过；类型检查和 renderer 构建通过。WorkTogether 后端 388 项、前端 18 项及生产构建通过。未执行完整桌面打包或真实模型验收。
 
 后续回复归属需沿现有原生会话 `ClientMessageID / TurnID` 传递和建立关联；不能按文本相同或时间相邻推断。当前 `Manager.SendWithOptions` 未传调用方消息标识到内部 `send`，这是下一批需要验证的实际连接点。
+
+
+## 第七轮：原生回复、明确授权与自主认领（2026-11-12）
+
+源码提交 `4f282c8`，补丁 `experiments/0007-feat-connect-native-replies-and-explicitly-authorize.patch`。
+
+- 用户广播与同伴消息将稳定投递 ID 传入原生轮次；历史只显示精确匹配的助手回复，排除无关会话、回滚/迁移轮次。每项超过 100 条时提示截断。
+- 新增显式「连接 / 更新同伴工具」。授权持久保存当前成员和房间版本；暂停/变更后失效，恢复后仍须重新连接，不隐式续权。
+- Agent 可查询成员与任务、提出开放任务，再通过既有原子认领、提交和独立验收推进。界面提供任务与证据面板、原生授权处理入口，以及候选集成入口。
+- 真 SQLite + 假原生发送器验证双成员广播、回复关联、去重不重放、暂停撤销和显式重绑；race 通过。无真实模型调用。
+- AO 受影响后台包通过，session_manager 全包首次受本机 tmux 环境影响，修正假运行器测试的依赖注入后全包通过；未调整生产权限。go vet 与前端类型检查通过。
+- 前端全套：680 文件通过，11,724 项通过、9 项跳过。构建后 Electron SQLite 与测试 Node ABI 不同，测试依赖需按宿主 Node 重新编译；这属于测试运行环境，不是放宽断言。
+- 原 WorkTogether：Python 388 项、前端 18 项及生产构建通过，静态文件无变更。
+
+## 第八轮：可运行本地桌面交付（2026-11-12）
+
+源码提交 `34e8be5`、`184e01b`，对应补丁 0008、0009。最终启动隔离改动的类型检查与 92 个桌面测试文件（2,007 项通过、3 项跳过）通过。`WorkTogether Local.app` 已在本机源码打包；Node 26 解压 Electron 时未完成即退出，使用准备好的 Node 22 后 Forge 完整完成，并通过 postPackage 资源检查。
+
+修复 bundled tmux 所依赖 libevent 的 pipe2 SDK 误检测后，终端真实启动/连接检查通过。应用名称、bundle ID、Electron profile、数据库和更新源与官方 AO 分离。另移除首次启动时的上游搬迁/旧副本清理步骤，并给浏览器运行目录独立短路径，保留官方应用。
+
+安装位置：`~/Applications/WorkTogether Local.app`；入口：仓库 `scripts/launch-native-desktop.command`。没有签名发布、公证或替换原 Python 服务；Git 仓库保存可复现源码补丁与说明，不上传本地账号数据或大体积应用包。
+
+桌面冒烟使用全新 `desktop-smoke` 数据目录，没有启动模型。电脑锁屏使实际窗口操作不可验证；不能把进程启动或打包通过说成已完成 UI/真实 Agent 全链路验收。后续需解锁检查项目添加、创建原生会话、群聊实际操作；真实模型执行仍遵守用户额度授权。
