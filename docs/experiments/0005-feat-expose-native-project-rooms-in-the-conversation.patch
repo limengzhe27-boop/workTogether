@@ -1,0 +1,660 @@
+From fbcd55c5ea4989eeabed1e34f4be77df5e377324 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Wed, 11 Nov 2026 22:29:30 +0800
+Subject: [PATCH] feat: expose native project rooms in the conversation
+ workspace
+
+Let users select native session members, broadcast with explicit partial outcomes and inspect original conversation history. Preserve uncertain-send warnings across refresh and reuse native session creation. Verified with mocked interaction tests, desktop/mobile browser checks, typecheck and renderer build; no live agent calls.
+---
+ DESIGN.md                                     |   4 +
+ .../src/renderer/components/PeerRoom.test.tsx | 157 +++++++
+ frontend/src/renderer/components/PeerRoom.tsx | 403 ++++++++++++++++++
+ .../routes/_shell.projects.$projectId.tsx     |  42 +-
+ 4 files changed, 605 insertions(+), 1 deletion(-)
+ create mode 100644 frontend/src/renderer/components/PeerRoom.test.tsx
+ create mode 100644 frontend/src/renderer/components/PeerRoom.tsx
+
+diff --git a/DESIGN.md b/DESIGN.md
+index e9eb319..18c7f88 100644
+--- a/DESIGN.md
++++ b/DESIGN.md
+@@ -438,3 +438,7 @@ Approve only when the answer to every applicable check is yes. Otherwise classif
+ | 2026-11-01 | Add Project: Local/Cloud is a first step of two tiles, and the sources are a 2×2 grid of the same borderless tiles | Cloud sat in the same list as local sources, mixing "where agents run" with "where the code comes from"; tiles in both steps keep the flow consistent with Home. |
+ | 2026-11-04 | One `Button` for every action, `Pressable` for rows/cards/tabs; ghost buttons use the growing hover pill; no press scale anywhere | The person disliked the tap-scale and found ~280 raw buttons and ~200 variant-restyling overrides; the sidebar's hover pill is the ghost interaction they want everywhere. |
+ | 2026-11-05 | Every settled chat turn opens with "Worked for <time>": the fold, with a chevron, when the turn has steps; plain text when it went straight to its answer. The time never repeats on the action row. As a turn settles nothing in view jumps: "Worked for" fades into the row reserved under the prompt, the reply slides up into the room its steps left, and the live row fades where it was | The person wanted the time on every reply, and the time moved between the top of some turns and the action row of others; the settle handover dipped the whole chat and glided it back. |
++
++## WorkTogether project room extension
++
++The project room follows the existing shell, typography, semantic color tokens and shared Button/ChatMarkdown components. Project navigation stays in the shell; a local project exposes Board and Project Room views. The room is a restrained single conversation column (max-width 48rem), flexible scrolling history and fixed-in-layout composer. Members and policy details are disclosed above the history. On narrow screens controls wrap; no fixed-width panels. No new font, palette, dependency or decorative animation is introduced. Native session identity and recipient are visible on each message; delivery acceptance is distinct from completion. Partial failure is explicit, never automatically replayed. Keyboard form controls have labels and visible focus. This implements the user-approved conversation-first layout, with L1 interaction inherited from existing controls.
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+new file mode 100644
+index 0000000..be2beca
+--- /dev/null
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -0,0 +1,157 @@
++import {
++	fireEvent,
++	render,
++	screen,
++	waitFor,
++	cleanup,
++} from "@testing-library/react";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import { PeerRoom } from "./PeerRoom";
++import type { WorkspaceSession } from "../types/workspace";
++const api = vi.hoisted(() => ({ GET: vi.fn(), PUT: vi.fn(), POST: vi.fn() }));
++vi.mock("../lib/api-client", () => ({ apiClient: api }));
++vi.mock("./chat/ChatMarkdown", () => ({
++	ChatMarkdown: ({ text }: { text: string }) => <p>{text}</p>,
++}));
++const sessions = ["a", "b"].map(
++	(id) =>
++		({
++			id,
++			title: id,
++			provider: "codex",
++			mode: "chat",
++			workspaceId: "p",
++		}) as WorkspaceSession,
++);
++let room: any;
++function mount() {
++	return render(
++		<QueryClientProvider
++			client={
++				new QueryClient({ defaultOptions: { queries: { retry: false } } })
++			}
++		>
++			<PeerRoom projectId="p" sessions={sessions} onManageSessions={() => {}} />
++		</QueryClientProvider>,
++	);
++}
++beforeEach(() => {
++	vi.clearAllMocks();
++	sessionStorage.clear();
++	room = {
++		id: "project-p",
++		projectId: "p",
++		epoch: 1,
++		members: ["a", "b"],
++		budget: 24,
++		used: 0,
++		paused: false,
++	};
++	api.GET.mockImplementation(async (path: string) =>
++		path.includes("peer-rooms")
++			? { data: room, response: { status: room ? 200 : 404 } }
++			: {
++					data: {
++						controller: "ready",
++						messages: [
++							{
++								id: "1",
++								role: "assistant",
++								text: "原生回复",
++								createdAt: "2026-11-11T10:00:00Z",
++								sequence: 1,
++							},
++						],
++						hasMoreBefore: false,
++					},
++				},
++	);
++	api.PUT.mockImplementation(async (_path, { body }) => {
++		room = { ...body, epoch: body.epoch + 1 };
++		return { data: room };
++	});
++	api.POST.mockResolvedValue({
++		data: {
++			deliveries: [
++				{ session: "a", state: "accepted" },
++				{ session: "b", state: "uncertain" },
++			],
++		},
++	});
++});
++afterEach(cleanup);
++it("broadcasts once to same-provider sessions and blocks replay of uncertain delivery", async () => {
++	mount();
++	await screen.findAllByText("原生回复");
++	fireEvent.change(screen.getByLabelText("群聊消息"), {
++		target: { value: "请一起分析" },
++	});
++	fireEvent.click(screen.getByRole("button", { name: "发送给全体成员" }));
++	await screen.findByText(/部分结果未确认/);
++	expect(api.POST).toHaveBeenCalledTimes(1);
++	expect(api.POST.mock.calls[0][1].body).toMatchObject({
++		epoch: 1,
++		message: "请一起分析",
++	});
++	expect(screen.getByRole("button", { name: "发送给全体成员" })).toBeDisabled();
++	expect(screen.getByLabelText("群聊消息")).toHaveValue("");
++	fireEvent.click(screen.getByRole("button", { name: "已核查，撰写新消息" }));
++	expect(api.POST).toHaveBeenCalledTimes(1);
++});
++it("creates a room with selected session IDs and restores server history on remount", async () => {
++	room = null;
++	const first = mount();
++	await screen.findByText("创建项目房间");
++	fireEvent.click(screen.getAllByRole("checkbox")[0]);
++	fireEvent.click(screen.getAllByRole("checkbox")[1]);
++	fireEvent.click(screen.getByRole("button", { name: "创建项目房间" }));
++	await waitFor(() => expect(api.PUT).toHaveBeenCalledTimes(1));
++	expect(api.PUT.mock.calls[0][1].body.members).toEqual(["a", "b"]);
++	first.unmount();
++	mount();
++	expect((await screen.findAllByText("原生回复")).length).toBe(2);
++});
++it("pauses without altering members and disables sending", async () => {
++	mount();
++	await screen.findAllByText("原生回复");
++	fireEvent.click(screen.getByRole("button", { name: "暂停房间" }));
++	await screen.findByRole("button", { name: "恢复房间" });
++	expect(api.PUT.mock.calls[0][1].body).toMatchObject({
++		paused: true,
++		members: ["a", "b"],
++		epoch: 1,
++	});
++	fireEvent.change(screen.getByLabelText("群聊消息"), {
++		target: { value: "不应该发送" },
++	});
++	expect(screen.getByRole("button", { name: "发送给全体成员" })).toBeDisabled();
++});
++it("does not turn a failed room lookup into a new room", async () => {
++	api.GET.mockResolvedValue({
++		error: { message: "offline" },
++		response: { status: 503 },
++	});
++	mount();
++	await screen.findByRole("alert");
++	expect(screen.getByRole("button", { name: "创建项目房间" })).toBeDisabled();
++	expect(api.PUT).not.toHaveBeenCalled();
++});
++
++it("retains an interrupted-send warning across remount without replay", async () => {
++	sessionStorage.setItem("peer-room-pending:project-p", "1");
++	mount();
++	await screen.findByText(/部分结果未确认/);
++	expect(screen.getByLabelText("群聊消息")).toBeDisabled();
++	expect(api.POST).not.toHaveBeenCalled();
++});
++it("rejects budget changes above the backend maximum", async () => {
++	mount();
++	await screen.findAllByText("原生回复");
++	fireEvent.click(screen.getByText(/房间成员（/));
++	fireEvent.change(screen.getByRole("spinbutton", { name: "总投递上限" }), {
++		target: { value: "101" },
++	});
++	expect(screen.getByRole("button", { name: "保存成员" })).toBeDisabled();
++	expect(api.PUT).not.toHaveBeenCalled();
++});
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+new file mode 100644
+index 0000000..38e9329
+--- /dev/null
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -0,0 +1,403 @@
++import { useEffect, useRef, useState } from "react";
++import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
++import type { components } from "../../api/schema";
++import { apiClient } from "../lib/api-client";
++import type { WorkspaceSession } from "../types/workspace";
++import { Button } from "./ui/button";
++import { ChatMarkdown } from "./chat/ChatMarkdown";
++
++type Room = components["schemas"]["PeerRoom"];
++type Receipt = components["schemas"]["PeerBroadcastDelivery"];
++const states: Record<string, string> = {
++	accepted: "已接收，等待回复",
++	already_accepted: "之前已接收",
++	blocked: "未发送",
++	uncertain: "结果不确定，请核查",
++};
++const controllerStates: Record<string, string> = {
++	busy: "正在工作",
++	ready: "就绪",
++	connecting: "连接中",
++	recovering: "恢复中",
++	hibernated: "已休眠",
++	stopped: "已停止",
++};
++function failure(value: unknown): Error {
++	return new Error(
++		typeof value === "object" && value !== null && "message" in value
++			? String(value.message)
++			: "操作失败，请刷新状态后检查；不要重复发送未确认的消息。",
++	);
++}
++
++/** One durable project room; native sessions remain the owners of conversation history. */
++export function PeerRoom({
++	projectId,
++	sessions,
++	onManageSessions,
++}: {
++	projectId: string;
++	sessions: WorkspaceSession[];
++	onManageSessions: () => void;
++}) {
++	const roomId = `project-${projectId}`;
++	const cache = useQueryClient();
++	const key = ["peer-room", roomId];
++	const [draftMembers, setDraftMembers] = useState<string[] | null>(null);
++	const [draftBudget, setDraftBudget] = useState<number | null>(null);
++	const [text, setText] = useState("");
++	const [busy, setBusy] = useState(false);
++	const [error, setError] = useState("");
++	const history = useRef<HTMLDivElement>(null);
++	const followLatest = useRef(true);
++	const [receipts, setReceipts] = useState<Receipt[]>([]);
++	const recoveryKey = `peer-room-pending:${roomId}`;
++	const [uncertain, setUncertain] = useState(
++		() => sessionStorage.getItem(recoveryKey) === "1",
++	);
++	function markUncertain(value: boolean) {
++		setUncertain(value);
++		if (value) sessionStorage.setItem(recoveryKey, "1");
++		else sessionStorage.removeItem(recoveryKey);
++	}
++	const room = useQuery({
++		queryKey: key,
++		retry: false,
++		refetchInterval: 3000,
++		queryFn: async () => {
++			const result = await apiClient.GET("/api/v1/peer-rooms/{roomId}", {
++				params: { path: { roomId } },
++			});
++			if (result.response.status === 404) return null;
++			if (result.error || !result.data) throw failure(result.error);
++			if (result.data.projectId !== projectId)
++				throw new Error("房间与当前项目不匹配，已停止加载。");
++			return result.data;
++		},
++	});
++	const members = room.data?.members ?? [];
++	const selected = draftMembers ?? members;
++	const eligible = sessions.filter(
++		(s) => !s.hostId && !s.isTerminated && s.mode === "chat",
++	);
++	const conversations = useQueries({
++		queries: members.map((sessionId) => ({
++			queryKey: ["peer-room-conversation", roomId, sessionId],
++			retry: false,
++			refetchInterval: 2000,
++			queryFn: async () => {
++				const result = await apiClient.GET(
++					"/api/v1/sessions/{sessionId}/conversation",
++					{ params: { path: { sessionId }, query: { limit: 100 } } },
++				);
++				if (result.error || !result.data) throw failure(result.error);
++				return result.data;
++			},
++		})),
++	});
++	const messages = conversations
++		.flatMap((q, i) =>
++			(q.data?.messages ?? []).map((message) => ({
++				...message,
++				session: members[i],
++			})),
++		)
++		.sort(
++			(a, b) =>
++				a.createdAt.localeCompare(b.createdAt) ||
++				a.session.localeCompare(b.session) ||
++				a.sequence - b.sequence,
++		);
++	useEffect(() => {
++		if (followLatest.current && history.current)
++			history.current.scrollTop = history.current.scrollHeight;
++	}, [messages.length, messages.at(-1)?.text]);
++	const label = (id: string) => {
++		const session = sessions.find((s) => s.id === id);
++		return session
++			? `${session.title || session.id} · ${session.provider} (${id})`
++			: id;
++	};
++	async function configure(paused: boolean, nextMembers = selected) {
++		setBusy(true);
++		setError("");
++		try {
++			const body: Room = {
++				id: roomId,
++				projectId,
++				epoch: room.data?.epoch ?? 0,
++				members: nextMembers,
++				paused,
++				budget: draftBudget ?? room.data?.budget ?? 24,
++				used: room.data?.used ?? 0,
++			};
++			const result = await apiClient.PUT("/api/v1/peer-rooms/{roomId}", {
++				params: { path: { roomId } },
++				body,
++			});
++			if (result.error || !result.data) throw failure(result.error);
++			cache.setQueryData(key, result.data);
++			setDraftMembers(null);
++			setDraftBudget(null);
++		} catch (e) {
++			setError(failure(e).message);
++			await cache.invalidateQueries({ queryKey: key });
++		} finally {
++			setBusy(false);
++		}
++	}
++	async function send() {
++		if (!room.data || busy || !text.trim() || uncertain) return;
++		setBusy(true);
++		setError("");
++		setReceipts([]);
++		markUncertain(true);
++		followLatest.current = true;
++		try {
++			const result = await apiClient.POST(
++				"/api/v1/peer-rooms/{roomId}/broadcast",
++				{
++					params: { path: { roomId } },
++					body: {
++						id: crypto.randomUUID(),
++						epoch: room.data.epoch,
++						message: text,
++					},
++				},
++			);
++			if (result.error || !result.data) throw failure(result.error);
++			setReceipts(result.data.deliveries);
++			// Never silently resend a partially delivered broadcast, even after editing the draft.
++			setText("");
++			markUncertain(
++				result.data.deliveries.some((r) => r.state === "uncertain"),
++			);
++		} catch (e) {
++			setError(failure(e).message);
++			markUncertain(true);
++		} finally {
++			setBusy(false);
++			await cache.invalidateQueries({ queryKey: key });
++			await cache.invalidateQueries({
++				queryKey: ["peer-room-conversation", roomId],
++			});
++		}
++	}
++	const canSend =
++		!!room.data &&
++		!room.data.paused &&
++		members.length > 0 &&
++		room.data.used < room.data.budget &&
++		!room.isError &&
++		!busy &&
++		!uncertain &&
++		!!text.trim() &&
++		new TextEncoder().encode(text).length <= 2000;
++	return (
++		<section className="flex min-h-0 flex-1 flex-col" aria-label="项目群聊">
++			<header className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-4">
++				<div>
++					<h1 className="text-base font-medium">项目群聊</h1>
++					<p className="text-sm text-muted-foreground">
++						原生会话共同参与 ·{" "}
++						{room.data
++							? `${room.data.used} / ${room.data.budget} 次投递${room.data.paused ? " · 已暂停" : ""}`
++							: "选择成员后创建房间"}
++					</p>
++				</div>
++				<div className="flex gap-2">
++					<Button variant="secondary" onClick={onManageSessions}>
++						管理 / 新建会话
++					</Button>
++					{room.data && (
++						<Button
++							variant="secondary"
++							disabled={busy}
++							onClick={() => configure(!room.data!.paused, members)}
++						>
++							{room.data.paused ? "恢复房间" : "暂停房间"}
++						</Button>
++					)}
++				</div>
++			</header>
++			<details className="border-b border-border p-4" open={!room.data}>
++				<summary className="cursor-pointer text-sm">
++					房间成员（{members.length}）
++				</summary>
++				<div className="mt-3 flex flex-wrap gap-3">
++					{eligible.map((s) => (
++						<label
++							key={s.id}
++							className="flex min-h-11 items-center gap-2 text-sm"
++						>
++							<input
++								type="checkbox"
++								checked={selected.includes(s.id)}
++								disabled={busy}
++								onChange={(e) =>
++									setDraftMembers(
++										e.target.checked
++											? [...selected, s.id]
++											: selected.filter((id) => id !== s.id),
++									)
++								}
++							/>
++							{label(s.id)}
++						</label>
++					))}
++				</div>
++				{!eligible.length && (
++					<p className="my-2 text-sm">
++						还没有可加入的本机对话会话，请先新建会话。同一种智能体可以创建多个会话。
++					</p>
++				)}
++				<label className="mt-3 flex items-center gap-2 text-sm">
++					总投递上限
++					<input
++						aria-label="总投递上限"
++						type="number"
++						min={Math.max(1, room.data?.used ?? 0)}
++						max={100}
++						value={draftBudget ?? room.data?.budget ?? 24}
++						disabled={busy}
++						onChange={(e) => setDraftBudget(Number(e.target.value))}
++						className="w-20 rounded border border-border bg-secondary p-2 focus-visible:ring-2 focus-visible:ring-ring"
++					/>
++				</label>
++				<p className="my-3 text-sm text-muted-foreground">
++					加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员后，原生同伴工具需重新绑定才能继续互发消息。
++				</p>
++				<Button
++					disabled={
++						busy ||
++						room.isPending ||
++						room.isError ||
++						!selected.length ||
++						selected.length > 16 ||
++						!Number.isInteger(draftBudget ?? 24) ||
++						(draftBudget !== null &&
++							(draftBudget < Math.max(1, room.data?.used ?? 0) ||
++								draftBudget > 100))
++					}
++					onClick={() => configure(room.data?.paused ?? false)}
++				>
++					{room.data ? "保存成员" : "创建项目房间"}
++				</Button>
++			</details>
++			{(error || room.isError) && (
++				<p role="alert" className="p-4 text-destructive">
++					{error || failure(room.error).message}
++				</p>
++			)}
++			<div
++				ref={history}
++				onScroll={(e) => {
++					const el = e.currentTarget;
++					followLatest.current =
++						el.scrollHeight - el.scrollTop - el.clientHeight < 80;
++				}}
++				className="min-h-0 flex-1 overflow-auto p-4"
++				aria-label="成员对话记录"
++			>
++				<div className="mx-auto max-w-3xl space-y-6">
++					{members.length > 0 && (
++						<p className="text-xs text-muted-foreground">
++							以下汇集成员原生会话的近期记录，包含加入房间前的对话。发送给各成员的用户消息分别显示。
++						</p>
++					)}
++					{members.map((id, i) => (
++						<p key={id} className="text-sm text-muted-foreground">
++							{label(id)}：
++							{conversations[i]?.isError
++								? "记录加载失败，不能确认当前状态"
++								: (controllerStates[conversations[i]?.data?.controller ?? ""] ??
++									"加载中")}
++							{conversations[i]?.data?.hasMoreBefore
++								? " · 仅显示最近记录，完整历史请在会话中查看"
++								: ""}
++						</p>
++					))}
++					{!messages.length && (
++						<p className="py-12 text-center text-muted-foreground">
++							在这里说明目标，消息将发给房间中的每个成员。
++						</p>
++					)}
++					{messages.map((m) => (
++						<article
++							key={`${m.session}:${m.id}`}
++							className={
++								m.role === "user"
++									? "ml-auto max-w-[90%] rounded-xl bg-secondary p-4"
++									: "py-2"
++							}
++						>
++							<p className="mb-2 text-xs text-muted-foreground">
++								{m.role === "assistant"
++									? label(m.session)
++									: `${m.senderDisplayName || m.senderSessionId || "你"} → ${label(m.session)}`}{" "}
++								· {new Date(m.createdAt).toLocaleTimeString()}
++								{m.streaming ? " · 正在回复" : ""}
++							</p>
++							<ChatMarkdown text={m.text} streaming={m.streaming} />
++						</article>
++					))}
++				</div>
++			</div>
++			<footer className="border-t border-border p-4">
++				<div className="mx-auto max-w-3xl">
++					<div aria-live="polite">
++						{receipts.map((r) => (
++							<p key={r.session} className="text-sm">
++								{label(r.session)}：{states[r.state] ?? r.state}
++								{r.detail ? ` · ${r.detail}` : ""}
++							</p>
++						))}
++					</div>
++					{uncertain && (
++						<div role="alert" className="my-2 text-sm">
++							部分结果未确认。先检查成员记录，不会自动重发。
++							<Button
++								variant="secondary"
++								onClick={() => {
++									markUncertain(false);
++									setText("");
++								}}
++							>
++								已核查，撰写新消息
++							</Button>
++						</div>
++					)}
++					<form
++						onSubmit={(e) => {
++							e.preventDefault();
++							if (canSend) void send();
++						}}
++					>
++						<label className="sr-only" htmlFor="peer-message">
++							群聊消息
++						</label>
++						<textarea
++							id="peer-message"
++							className="mt-2 min-h-24 w-full resize-y rounded-xl border border-border bg-secondary p-3 text-base outline-none focus-visible:ring-2 focus-visible:ring-ring"
++							value={text}
++							onChange={(e) => setText(e.target.value)}
++							placeholder="说明你希望团队完成什么…"
++							disabled={busy || uncertain}
++						/>
++						<div className="mt-2 flex items-center justify-between gap-3">
++							<p className="text-xs text-muted-foreground">
++								每位成员计一次投递；已接收不代表工作完成。
++								{new TextEncoder().encode(text).length > 2000
++									? "消息超过 2000 字节，请缩短。"
++									: ""}
++							</p>
++							<Button type="submit" disabled={!canSend}>
++								{busy ? "处理中…" : "发送给全体成员"}
++							</Button>
++						</div>
++					</form>
++				</div>
++			</footer>
++		</section>
++	);
++}
+diff --git a/frontend/src/renderer/routes/_shell.projects.$projectId.tsx b/frontend/src/renderer/routes/_shell.projects.$projectId.tsx
+index 3c64124..8beb780 100644
+--- a/frontend/src/renderer/routes/_shell.projects.$projectId.tsx
++++ b/frontend/src/renderer/routes/_shell.projects.$projectId.tsx
+@@ -1,4 +1,8 @@
+ import { createFileRoute } from "@tanstack/react-router";
++import { useState } from "react";
++import { PeerRoom } from "../components/PeerRoom";
++import { useWorkspaceQuery } from "../hooks/useWorkspaceQuery";
++import { Button } from "../components/ui/button";
+ import { SessionsBoard } from "../components/SessionsBoard";
+ 
+ export const Route = createFileRoute("/_shell/projects/$projectId")({
+@@ -7,5 +11,41 @@ export const Route = createFileRoute("/_shell/projects/$projectId")({
+ 
+ function ProjectBoardRoute() {
+ 	const { projectId } = Route.useParams();
+-	return <SessionsBoard projectId={projectId} />;
++	const [room, setRoom] = useState(false);
++	const workspace = useWorkspaceQuery({ includeCloud: false });
++	const project = workspace.data?.find(
++		(p) => p.id === projectId && !p.hostId && p.kind !== "cloud",
++	);
++	return (
++		<div className="flex h-full min-h-0 flex-col">
++			{project && (
++				<div className="flex gap-2 border-b border-border px-4 py-2">
++					<Button
++						variant="quiet"
++						aria-pressed={!room}
++						onClick={() => setRoom(false)}
++					>
++						会话看板
++					</Button>
++					<Button
++						variant="quiet"
++						aria-pressed={room}
++						onClick={() => setRoom(true)}
++					>
++						项目群聊
++					</Button>
++				</div>
++			)}
++			{room && project ? (
++				<PeerRoom
++					key={projectId}
++					projectId={projectId}
++					sessions={project.sessions}
++					onManageSessions={() => setRoom(false)}
++				/>
++			) : (
++				<SessionsBoard projectId={projectId} />
++			)}
++		</div>
++	);
+ }
+-- 
+2.54.0 (Apple Git-157)
+
