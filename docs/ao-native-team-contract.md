@@ -18,6 +18,7 @@ Go 1.27.1，在 backend 目录执行 `go build -o /absolute/evaluation/ao-room .
 | PUT /peer-rooms/{roomId} | 用旧 epoch 做比较更新；首次 epoch=0；每次成功递增 |
 | POST /peer-rooms/{roomId}/broadcast | 用户消息按成员顺序预占预算，再并行投递，逐个返回结果 |
 | POST /peer-rooms/{roomId}/send | 事务性预占预算后投递，失败/不确定不重放 |
+| GET /peer-rooms/{roomId}/history | 读取获准投递的持久记录及最新接收状态 |
 | GET /peer-rooms/{roomId}/tasks | 读取任务清单和 revision |
 | PUT /peer-rooms/{roomId}/tasks | 创建开放任务，需唯一 id 与 goal |
 | POST /peer-rooms/{roomId}/tasks | claim / submit / accept / reject |
@@ -57,3 +58,11 @@ AO 本机管理 API 继承其可信本地进程模型；本实验不把它宣传
 - `uncertain`：发送失败或结果未能落库，禁止自动重放，需人工核查。
 
 收件人快照来自当前房间；每次预占还会重新验证房间状态、代次、成员与项目。并行发送已经获准的成员，暂停不强杀在途调用。重复请求须保持相同 id 与正文；不要为了绕过 uncertain 自动生成新 id。房间更新后旧 epoch 失效。
+
+## 持久投递记录
+
+`history` 返回当前房间的投递数组，字段为 `id / sender / target / message / epoch / state / createdAt`。正文和成员信息与预算预占处于同一事务；接收状态更新复用同一记录，不新增第二份状态。按时间和 ID 稳定排序，房间终身最多准入 100 次，因此读取有界。
+
+状态 `pending` 表示已预占但结果未确认，进程重启后不能假定未发送，更不能自动重放；`accepted` 仅表示原生发送入口接受；`uncertain` 需核查。迁移前的记录保留状态，未知的正文、成员、时间留空，不做推测回填。未获准的请求没有投递记录，当前只能看本次调用的失败结果。
+
+该接口只记录发往成员的消息，不记录或推断模型回复归属。界面默认显示房间投递，其他原生会话历史在明确标注的折叠区域查看。它仍不是完整的房间消息时间线。
