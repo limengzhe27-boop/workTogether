@@ -1,0 +1,187 @@
+From 775460dac2bfe931dc42068d189536bfcc43b00b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Wed, 11 Nov 2026 19:49:51 +0800
+Subject: [PATCH] feat: expose opt-in project-scoped peer messaging over native
+ MCP
+
+---
+ backend/internal/cli/mcp.go                   |  6 ++
+ backend/internal/cli/mcp_peer.go              | 48 ++++++++++++++
+ backend/internal/cli/mcp_peer_test.go         | 63 +++++++++++++++++++
+ .../internal/session_manager/chat_spawn.go    |  3 +
+ 4 files changed, 120 insertions(+)
+ create mode 100644 backend/internal/cli/mcp_peer.go
+ create mode 100644 backend/internal/cli/mcp_peer_test.go
+
+diff --git a/backend/internal/cli/mcp.go b/backend/internal/cli/mcp.go
+index 179336e..077bd92 100644
+--- a/backend/internal/cli/mcp.go
++++ b/backend/internal/cli/mcp.go
+@@ -8,6 +8,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"os"
+ 	"slices"
+ 	"unicode/utf8"
+ 
+@@ -119,6 +120,9 @@ func (c *commandContext) handleMCP(ctx context.Context, state *mcpState, line []
+ 		resp.Result = map[string]any{}
+ 	case "tools/list":
+ 		tools := append(append([]map[string]any{}, mcpTools...), c.cuaTools(ctx, state)...)
++		if os.Getenv("AO_PEER_PROJECT") != "" {
++			tools = append(tools, peerTool)
++		}
+ 		resp.Result = map[string]any{"tools": tools}
+ 	case "tools/call":
+ 		var p struct {
+@@ -127,6 +131,8 @@ func (c *commandContext) handleMCP(ctx context.Context, state *mcpState, line []
+ 		}
+ 		_ = json.Unmarshal(req.Params, &p)
+ 		switch p.Name {
++		case "peer_send":
++			resp.Result = c.callPeerSend(ctx, p.Arguments)
+ 		case "html_preview":
+ 			resp.Result = c.callHTMLPreview(ctx, p.Arguments)
+ 		case "html_render":
+diff --git a/backend/internal/cli/mcp_peer.go b/backend/internal/cli/mcp_peer.go
+new file mode 100644
+index 0000000..bab24c1
+--- /dev/null
++++ b/backend/internal/cli/mcp_peer.go
+@@ -0,0 +1,48 @@
++package cli
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/url"
++	"os"
++	"strings"
++)
++
++var peerTool = map[string]any{
++	"name": "peer_send", "description": "Send a bounded message to another active member of this project's team. This starts a model turn and consumes account usage. Do not create reply loops. A receipt is not task completion. On failure do not automatically retry.",
++	"inputSchema": map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"session": map[string]any{"type": "string"}, "message": map[string]any{"type": "string", "maxLength": 2000}}, "required": []string{"session", "message"}},
++}
++
++func (c *commandContext) callPeerSend(ctx context.Context, raw json.RawMessage) map[string]any {
++	project, sender := os.Getenv("AO_PEER_PROJECT"), os.Getenv("AO_SESSION_ID")
++	if project == "" || sender == "" {
++		return mcpToolError(fmt.Errorf("peer messaging is not enabled for this session"))
++	}
++	var args struct {
++		Session string `json:"session"`
++		Message string `json:"message"`
++	}
++	decoder := json.NewDecoder(strings.NewReader(string(raw)))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&args); err != nil {
++		return mcpToolError(err)
++	}
++	if args.Session == "" || args.Session == sender || len(args.Message) > 2000 || strings.TrimSpace(args.Message) == "" {
++		return mcpToolError(fmt.Errorf("invalid peer or message (maximum 2000 bytes; no self-send)"))
++	}
++	for _, id := range []string{sender, args.Session} {
++		var result sessionResponse
++		if err := c.getJSON(ctx, "sessions/"+url.PathEscape(id), &result); err != nil {
++			return mcpToolError(err)
++		}
++		if result.Session.ID != id || result.Session.ProjectID != project || result.Session.IsTerminated {
++			return mcpToolError(fmt.Errorf("peer messaging requires active members of the enabled project"))
++		}
++	}
++	// Reuse the daemon delivery path; never invoke a shell or change permissions.
++	if err := c.sendMessage(ctx, sendOptions{session: args.Session, message: args.Message}); err != nil {
++		return mcpToolError(fmt.Errorf("delivery failed or uncertain; do not automatically retry: %w", err))
++	}
++	return map[string]any{"content": []any{mcpText("Message accepted. Recipient completion is not confirmed.")}}
++}
+diff --git a/backend/internal/cli/mcp_peer_test.go b/backend/internal/cli/mcp_peer_test.go
+new file mode 100644
+index 0000000..e08dfbd
+--- /dev/null
++++ b/backend/internal/cli/mcp_peer_test.go
+@@ -0,0 +1,63 @@
++package cli
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestPeerSendScope(t *testing.T) {
++	for _, tc := range []struct {
++		name, project, targetProject string
++		terminated, allowed          bool
++	}{
++		{"same project", "p", "p", false, true}, {"disabled", "", "p", false, false}, {"other project", "p", "q", false, false}, {"terminated", "p", "p", true, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv("AO_SESSION_ID", "sender")
++			t.Setenv("AO_PEER_PROJECT", tc.project)
++			cfg := setConfigEnv(t)
++			posts := 0
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				w.Header().Set("Content-Type", "application/json")
++				if r.Method == "GET" {
++					id := strings.TrimPrefix(r.URL.Path, "/api/v1/sessions/")
++					project := "p"
++					if id == "receiver" {
++						project = tc.targetProject
++					}
++					json.NewEncoder(w).Encode(map[string]any{"session": map[string]any{"id": id, "projectId": project, "isTerminated": tc.terminated}})
++					return
++				}
++				posts++
++				var body sendAPIRequest
++				json.NewDecoder(r.Body).Decode(&body)
++				if body.SenderSessionID != "sender" || body.UserAuthored {
++					t.Error("sender provenance lost")
++				}
++				w.Write([]byte(`{}`))
++			}))
++			defer srv.Close()
++			writeRunFileFor(t, cfg, srv)
++			result := runMCP(t, mcpCall("peer_send", map[string]any{"session": "receiver", "message": "hello"}))[0]
++			if tc.allowed {
++				if result.Result.IsError || posts != 1 {
++					t.Fatalf("expected one delivery: %+v posts=%d", result, posts)
++				}
++			} else if !result.Result.IsError || posts != 0 {
++				t.Fatalf("expected rejection: %+v posts=%d", result, posts)
++			}
++		})
++	}
++}
++func TestPeerSendRejectsInvalidArguments(t *testing.T) {
++	t.Setenv("AO_SESSION_ID", "sender")
++	t.Setenv("AO_PEER_PROJECT", "p")
++	for _, args := range []map[string]any{{"session": "sender", "message": "x"}, {"session": "receiver", "message": ""}, {"session": "receiver", "message": strings.Repeat("x", 2001)}, {"session": "receiver", "message": "x", "sender": "spoof"}} {
++		if !runMCP(t, mcpCall("peer_send", args))[0].Result.IsError {
++			t.Fatal("invalid arguments accepted")
++		}
++	}
++}
+diff --git a/backend/internal/session_manager/chat_spawn.go b/backend/internal/session_manager/chat_spawn.go
+index 0fcadc9..81646b0 100644
+--- a/backend/internal/session_manager/chat_spawn.go
++++ b/backend/internal/session_manager/chat_spawn.go
+@@ -368,6 +368,9 @@ func (m *Manager) aoMCPServers(ctx context.Context, harness domain.AgentHarness,
+ 			serverEnv[key] = value
+ 		}
+ 	}
++	if project := os.Getenv("AO_PEER_PROJECT"); project != "" {
++		serverEnv["AO_PEER_PROJECT"] = project
++	}
+ 	if m.computerUseEnabled(ctx) {
+ 		serverEnv[envComputerUse] = "1"
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+
