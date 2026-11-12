@@ -1,0 +1,247 @@
+{
+  "verifiedAt": "2026-11-12",
+  "sourceCommit": "57e2edb",
+  "scope": "Native Codex + DeepSeek read-only room collaboration; not arbitrary autonomous project delivery",
+  "room": {
+    "id": "project-worktogether",
+    "projectId": "worktogether",
+    "members": [
+      "worktogether-2",
+      "worktogether-3",
+      "worktogether-1"
+    ],
+    "epoch": 2,
+    "budget": 24,
+    "used": 9,
+    "paused": false
+  },
+  "existingDeliveriesUnchanged": [
+    {
+      "id": "user-c063439b2259fa440ceb7840fe7bd9335139a36501a21f21fd110fe860d53cc2",
+      "target": "worktogether-2",
+      "state": "accepted",
+      "turnState": "completed"
+    },
+    {
+      "id": "user-e85fd72a1c6eb7dae858284a5f2a03e4f5cc436b9dc48c76f7034a85a72dbe1c",
+      "target": "worktogether-3",
+      "state": "accepted",
+      "turnState": "completed"
+    },
+    {
+      "id": "user-97621dcf3f2fffbee91ed3f840130aac010ce3e085036679e460a2fa9b566173",
+      "target": "worktogether-1",
+      "state": "uncertain",
+      "turnState": null
+    }
+  ],
+  "newDeliveries": [
+    {
+      "id": "user-7420bb7b29042ccb40ba69bda01a69e2bf1669e2a867b78931562326dda8687f",
+      "sender": "",
+      "target": "worktogether-2",
+      "state": "accepted",
+      "turnState": "completed",
+      "message": "【新验收任务 WT-FLOW-1112】验证本房间真实协作，不修改业务文件、不重发旧消息、不访问外部网站。请每位成员：用 peer_tasks 确认自己和同伴编号；自主提出“只读核对本房间协作身份”的任务，ID 为 flow1112-加自己的编号，propose 后 claim；只读运行 git rev-parse HEAD，以现有 HEAD 为 commit，以自己及另一位接收人的编号和真实工具结果为 evidence 提交 submit，说明无文件改动；用 peer_send 向另一位本次接收人发送一次独立核验请求，包含任务 ID。收到同伴请求后读取任务与证据，符合则 accept，否则 reject 并说明原因。每人最多发一次同伴消息，不回复确认或致谢，完成后简短汇报。工具不存在或失败就报告，不绕过权限、不自动重试。",
+      "replies": [
+        {
+          "id": "a669839f-5a17-44ac-8d7d-eba1bf3cfec0",
+          "text": "我会按指定流程核对身份、提交只读证据，并向本次同伴发送一次独立核验请求。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "733bf085-f149-42cb-9ef8-cf7ad9f701fb",
+          "text": "房间工具确认本次两位接收人为 `worktogether-2` 和 `worktogether-3`；同伴已提交任务 `flow1112-3`。我将创建自己的 `flow1112-2` 并记录当前 HEAD。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "eac15773-03cb-456e-a363-86c20d2b49d8",
+          "text": "`flow1112-2` 已提交，HEAD 为 `98f7d1a…`，没有修改文件。现在向 `worktogether-3` 发送唯一一次独立核验请求。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "0dc2ee64-b0f3-430e-8e41-ee2a85113f82",
+          "text": "我是 `worktogether-2`，本次同伴是 `worktogether-3`。\n\n- `flow1112-2` 已完成 propose → claim → submit。\n- HEAD：`98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8`。\n- 无文件改动；已发送一次独立核验请求。\n- 尚待同伴验收；当前未收到同伴核验请求。",
+          "streaming": false,
+          "turnState": "completed"
+        }
+      ]
+    },
+    {
+      "id": "user-8760ab8e465feb750e1900b04596faf562f1312af3a715245776a3b56054bb61",
+      "sender": "",
+      "target": "worktogether-3",
+      "state": "accepted",
+      "turnState": "completed",
+      "message": "【新验收任务 WT-FLOW-1112】验证本房间真实协作，不修改业务文件、不重发旧消息、不访问外部网站。请每位成员：用 peer_tasks 确认自己和同伴编号；自主提出“只读核对本房间协作身份”的任务，ID 为 flow1112-加自己的编号，propose 后 claim；只读运行 git rev-parse HEAD，以现有 HEAD 为 commit，以自己及另一位接收人的编号和真实工具结果为 evidence 提交 submit，说明无文件改动；用 peer_send 向另一位本次接收人发送一次独立核验请求，包含任务 ID。收到同伴请求后读取任务与证据，符合则 accept，否则 reject 并说明原因。每人最多发一次同伴消息，不回复确认或致谢，完成后简短汇报。工具不存在或失败就报告，不绕过权限、不自动重试。",
+      "replies": [
+        {
+          "id": "38bfe49f-854c-4d8c-8795-e736b70de22b",
+          "text": "收到验收任务。我先查看本房间任务与成员，同时以只读方式取当前 HEAD。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "7fb3bb38-8910-4c67-8e1f-7b79563cea0f",
+          "text": "任务列表为空，房间成员为 worktogether-2 / worktogether-3 / worktogether-1，但本次接收人只有我和 worktogether-2。HEAD 是 `98f7d1a`。现在提议并认领我的只读核对任务 `flow1112-3`。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "0821d986-f464-45ef-9679-1ddd23a99bf9",
+          "text": "任务已认领。接下来把真实只读结果作为证据提交，commit 用当前 HEAD。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "46c95a6e-7ef0-46ab-9bf9-a35ed82cf050",
+          "text": "我的任务已提交。现在按“每人最多一次”的要求，向 worktogether-2 发出唯一一条独立核验请求。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "dfcf99de-9d9a-4f28-94af-ceef81023338",
+          "text": "核验请求已投递。我检查一下同伴任务是否已提交，若已提交就立即核验。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "24980817-d5e6-4ec5-a633-768ceb5f9f13",
+          "text": "同伴任务 `flow1112-2` 尚未提交。我等一小段时间再读一次共享任务状态，避免空转。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "080f9af4-60b5-4207-bf25-b469607d872c",
+          "text": "`flow1112-2` 已提交：owner=worktogether-2，commit `98f7d1a`，证据声明 self=-2、同伴=-3、无文件改动，与我独立读到的 HEAD 和成员列表一致。我据此核验通过并 accept。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "c2d044fd-c8be-4d92-82a5-914b383810a5",
+          "text": "我核验并通过了同伴任务。最后确认一下我自己的 `flow1112-3` 是否已被同伴验收。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "002b885e-1ca0-4022-b032-ade408157823",
+          "text": "我这边已验收同伴任务；我自己的任务仍是 submitted，等待 worktogether-2 交叉验收。再做一次短暂的定点确认。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "f7ff5547-bc7f-495b-8ff7-6bec023b9b03",
+          "text": "双向验收均已完成（`flow1112-3` 已被 worktogether-2 验收，`flow1112-2` 已由我验收）。我把这次验收结果登记到 AO。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "051ad84c-5bba-41d4-b14f-c18edfcbd3a7",
+          "text": "WT-FLOW-1112 完成，简要汇报：\n\n| 项 | 结果 |\n|---|---|\n| 身份确认 | self = `worktogether-3`，同伴 = `worktogether-2`（房间另有 `worktogether-1`，本次未选中、未联系） |\n| 我的任务 | `flow1112-3`：propose → claim → submit，commit `98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8` |\n| 证据来源 | 只读 `git rev-parse HEAD` + `git status --porcelain`（空）+ `peer_tasks` 成员/任务输出 |\n| 同伴消息 | 仅向 `worktogether-2` 发送一次独立核验请求（含任务 ID），无重复、无致谢回复 |\n| 我验收同伴 | `flow1112-2` 的 commit 与我独立读到的 HEAD 一致、成员与 self/同伴编号相符、声明无文件改动 → **accept** |\n| 我的任务被验收 | `flow1112-3` 已被 `worktogether-2` 验收，reviewer 记录在案 |\n\n未修改任何业务文件，未访问外部网站，未重发旧消息，无失败重试。",
+          "streaming": false,
+          "turnState": "completed"
+        }
+      ]
+    },
+    {
+      "id": "flow1112-3-verify-req",
+      "sender": "worktogether-3",
+      "target": "worktogether-2",
+      "state": "accepted",
+      "turnState": "completed",
+      "message": "独立核验请求：请只读查看任务 flow1112-3（owner=worktogether-3，状态 submitted，commit=98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8），核对 evidence 中的自身/同伴编号与 git HEAD 结果是否与真实工具输出一致。符合则 accept，不符合则 reject 并说明具体原因。无需回复确认或致谢。",
+      "replies": [
+        {
+          "id": "7b6c5735-8cc0-4c75-aae5-56e02de2153b",
+          "text": "我会读取 `flow1112-3` 的最新证据，与已取得的房间成员和 Git HEAD 结果核对后提交验收。",
+          "streaming": false,
+          "turnState": "completed"
+        },
+        {
+          "id": "ff18cf0d-bbab-4829-9124-6cf33e16b449",
+          "text": "`flow1112-3` 身份与 HEAD 核对一致，已独立验收为 `accepted`。`flow1112-2` 也已由同伴验收通过，本次双方交叉验收完成。无业务文件修改，未追加同伴消息。",
+          "streaming": false,
+          "turnState": "completed"
+        }
+      ]
+    },
+    {
+      "id": "flow1112-2-review-request",
+      "sender": "worktogether-2",
+      "target": "worktogether-3",
+      "state": "accepted",
+      "turnState": "completed",
+      "message": "WT-FLOW-1112 独立核验请求：请读取任务 flow1112-2 的提交证据并独立 accept 或 reject。本人 worktogether-2，任务已 submitted revision=2，commit=98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8；证据包含 peer_tasks、claim 身份与只读 git rev-parse HEAD 真实结果，无文件改动。这是我本次唯一同伴消息，无需确认或致谢。",
+      "replies": [
+        {
+          "id": "db07e19c-e5bd-45f1-8e22-7ab41a6e0a30",
+          "text": "`flow1112-2` 已核验通过，无需重复处理：我上一轮已读取其提交证据并完成独立 accept，当前状态为 `state=accepted`、`reviewer=worktogether-3`、`revision=3`，commit `98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8` 与我本地只读 `git rev-parse HEAD` 结果一致，证据声明无文件改动。\n\n按任务要求，我不再发送第二条同伴消息，也不回复确认/致谢。",
+          "streaming": false,
+          "turnState": "completed"
+        }
+      ]
+    },
+    {
+      "id": "user-dca650b7e1e3a47817a9e4afc0ac90644fcb2ab81b6b7b8e87b8c2897a0d3566",
+      "sender": "",
+      "target": "worktogether-2",
+      "state": "accepted",
+      "turnState": "completed",
+      "message": "【新的界面发送验收 WT-UI-1112】只简短回复：你的会话编号，以及本次另一位接收人的编号。不要调用工具、不要互发、不要改文件。",
+      "replies": [
+        {
+          "id": "35ac9f94-5cc1-47df-ba56-3a8da9f6cc01",
+          "text": "我的会话编号：worktogether-2；本次另一位接收人：worktogether-3。",
+          "streaming": false,
+          "turnState": "completed"
+        }
+      ]
+    },
+    {
+      "id": "user-2146800f91c790d0f330e5a9621c9119a86023cd2f3cbc72ea73a293e8242ac9",
+      "sender": "",
+      "target": "worktogether-3",
+      "state": "accepted",
+      "turnState": "completed",
+      "message": "【新的界面发送验收 WT-UI-1112】只简短回复：你的会话编号，以及本次另一位接收人的编号。不要调用工具、不要互发、不要改文件。",
+      "replies": [
+        {
+          "id": "f1a87551-2932-4e03-8b6e-4be2ae78d04f",
+          "text": "我是 `worktogether-3`，本次另一位接收人是 `worktogether-2`。",
+          "streaming": false,
+          "turnState": "completed"
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "flow1112-2",
+      "goal": "只读核对本房间协作身份：核对 worktogether-2 与本次同伴 worktogether-3，记录现有 HEAD 与真实工具结果，无文件改动。",
+      "state": "accepted",
+      "owner": "worktogether-2",
+      "revision": 3,
+      "evidence": "本次 self=worktogether-2，另一位接收人=worktogether-3。真实 peer_tasks 返回 room.id=project-worktogether，members=[worktogether-2,worktogether-3,worktogether-1]，epoch=2，paused=false；claim 返回 owner=worktogether-2,state=claimed,revision=1，确认自身身份。只读 git rev-parse HEAD 成功退出 0，输出 98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8。本任务仅读取 Git HEAD 并操作协作任务元数据，无文件改动，未访问外部网站、未重发旧消息。\nReview: 独立核验通过：flow1112-2 的 commit=98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8，与我在本会话只读执行 git rev-parse HEAD 的输出一致；evidence 声明的 room=project-worktogether、members=[worktogether-2,worktogether-3,worktogether-1]、self=worktogether-2、同伴=worktogether-3 与 peer_tasks 返回一致；声明无文件改动，任务目标仅为只读核对，无业务文件变更。",
+      "commit": "98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8",
+      "reviewer": "worktogether-3"
+    },
+    {
+      "id": "flow1112-3",
+      "goal": "只读核对本房间协作身份：确认自身与同伴编号，以现有 HEAD 为 commit，提交真实只读工具结果作为 evidence，不修改业务文件、不重发旧消息、不访问外部网站。",
+      "state": "accepted",
+      "owner": "worktogether-3",
+      "revision": 3,
+      "evidence": "只读核对，无文件改动（git status --porcelain 输出为空）。真实工具结果：peer_tasks 返回 room=project-worktogether，members=[\"worktogether-2\",\"worktogether-3\",\"worktogether-1\"]，tasks=[]；本次接收人 self=worktogether-3、recipients=[\"worktogether-2\",\"worktogether-3\"]；git rev-parse HEAD = 98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8；当前分支 ao/worktogether-3/root。据此确认自身编号 worktogether-3，同伴接收编号 worktogether-2。\nReview: 独立核验通过：本次 peer_tasks 实际返回 flow1112-3 owner=worktogether-3,state=submitted,revision=2；room=project-worktogether，成员包含 worktogether-2 与 worktogether-3，与本次接收人及提交证据身份相符。commit=98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8，与我此前只读执行 git rev-parse HEAD 的成功输出完全一致。提交明确声明无文件改动。验收范围为本次要求的身份和 HEAD 一致性；未独立重现同伴历史 tasks=[] 或其 git status 输出，未修改业务文件。",
+      "commit": "98f7d1a6961fc8a1c52f304ec59adad6ba4bbec8",
+      "reviewer": "worktogether-2"
+    }
+  ],
+  "worktreeStatus": {
+    "worktogether-2": "",
+    "worktogether-3": ""
+  },
+  "desktopEvidence": "Enter submitted a distinct WT-UI-1112 message to both ready members; UI displayed both completed replies. Stopped member stayed skipped."
+}

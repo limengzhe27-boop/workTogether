@@ -1,0 +1,424 @@
+From 57e2edb425fb9af420298dc9e978644f8eff94af Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 16:56:55 +0800
+Subject: [PATCH] fix: connect available room peers with explicit recipients
+ and shared context
+
+A stopped member no longer blocks new messages to ready peers. Explicit sends bind current room tools and carry self/recipient identities without replaying old deliveries. Cover subset validation and durable peer reply correlation; verified native Codex and DeepSeek exchange and cross-review, plus Enter submission in the desktop app.
+---
+ backend/internal/httpd/apispec/openapi.yaml   |  6 ++
+ .../service/session/peer_broadcast.go         | 56 +++++++++++++++++--
+ .../service/session/peer_broadcast_test.go    | 27 +++++++++
+ .../service/session/peer_workflow_test.go     | 51 ++++++++++++++---
+ frontend/src/api/schema.ts                    |  2 +
+ .../src/renderer/components/PeerRoom.test.tsx | 16 +++---
+ frontend/src/renderer/components/PeerRoom.tsx | 20 +++++--
+ 7 files changed, 150 insertions(+), 28 deletions(-)
+
+diff --git a/backend/internal/httpd/apispec/openapi.yaml b/backend/internal/httpd/apispec/openapi.yaml
+index c635ebb..a17f1e1 100644
+--- a/backend/internal/httpd/apispec/openapi.yaml
++++ b/backend/internal/httpd/apispec/openapi.yaml
+@@ -19426,6 +19426,8 @@ components:
+       type: object
+     PeerBroadcastRequest:
+       properties:
++        connectPeers:
++          type: boolean
+         epoch:
+           format: int64
+           type: integer
+@@ -19433,6 +19435,10 @@ components:
+           type: string
+         message:
+           type: string
++        targets:
++          items:
++            type: string
++          type: array
+       required:
+       - id
+       - epoch
+diff --git a/backend/internal/service/session/peer_broadcast.go b/backend/internal/service/session/peer_broadcast.go
+index 9b67723..326d2d3 100644
+--- a/backend/internal/service/session/peer_broadcast.go
++++ b/backend/internal/service/session/peer_broadcast.go
+@@ -3,6 +3,7 @@ package session
+ import (
+ 	"context"
+ 	"crypto/sha256"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"strings"
+@@ -15,9 +16,11 @@ import (
+ )
+ 
+ type PeerBroadcastRequest struct {
+-	ID      string `json:"id"`
+-	Epoch   int64  `json:"epoch"`
+-	Message string `json:"message"`
++	ID           string   `json:"id"`
++	Epoch        int64    `json:"epoch"`
++	Message      string   `json:"message"`
++	Targets      []string `json:"targets,omitempty"`
++	ConnectPeers bool     `json:"connectPeers,omitempty"`
+ }
+ type PeerBroadcastDelivery struct {
+ 	ID      string `json:"id"`
+@@ -51,10 +54,37 @@ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroad
+ 	if !ok {
+ 		return out, fmt.Errorf("broadcast unavailable")
+ 	}
+-	out.Deliveries = make([]PeerBroadcastDelivery, len(room.Members))
++	targets := in.Targets
++	if targets == nil {
++		targets = room.Members
++	}
++	if len(targets) == 0 {
++		return out, fmt.Errorf("no recipients selected")
++	}
++	seen := map[string]bool{}
++	for _, target := range targets {
++		member := false
++		for _, id := range room.Members {
++			if id == target {
++				member = true
++				break
++			}
++		}
++		if !member || seen[target] {
++			return out, fmt.Errorf("invalid or duplicate room recipient")
++		}
++		seen[target] = true
++	}
++	// Only this explicit user action grants room-scoped peer tools. Reads never grant access.
++	if in.ConnectPeers {
++		if _, err := s.BindPeerTools(ctx, id, in.Epoch); err != nil {
++			return out, err
++		}
++	}
++	out.Deliveries = make([]PeerBroadcastDelivery, len(targets))
+ 	var wg sync.WaitGroup
+ 	// Reservation order follows the visible member order. Budget exhaustion is deterministic.
+-	for i, target := range room.Members {
++	for i, target := range targets {
+ 		receipt := fmt.Sprintf("user-%x", sha256.Sum256([]byte(in.ID+"\x00"+target)))
+ 		out.Deliveries[i] = PeerBroadcastDelivery{Session: target, ID: receipt}
+ 		rec, exists, checkErr := s.store.GetSession(ctx, domain.SessionID(target))
+@@ -88,7 +118,7 @@ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroad
+ 		wg.Add(1)
+ 		go func(i int, target, receipt string) {
+ 			defer wg.Done()
+-			err := s.manager.SendWithOptions(peerpolicy.Admitted(ctx, "", target), domain.SessionID(target), in.Message, nil, ports.MessageDeliveryOptions{AuthoredByUser: true, ClientMessageID: domain.PeerDeliveryKey(id, receipt)})
++			err := s.manager.SendWithOptions(peerpolicy.Admitted(ctx, "", target), domain.SessionID(target), peerBroadcastPrompt(id, target, targets, in), nil, ports.MessageDeliveryOptions{AuthoredByUser: true, ClientMessageID: domain.PeerDeliveryKey(id, receipt)})
+ 			detail := ""
+ 			if err != nil {
+ 				detail = peerDeliveryFailure(err)
+@@ -150,3 +180,17 @@ func peerDeliveryFailure(err error) string {
+ 	}
+ 	return "客户端投递失败（未分类错误）；请按投递编号检查原生会话与本地日志。结果未确认，不会自动重发。"
+ }
++
++// Preserve the original user message in delivery history; add routing context only at execution.
++func peerBroadcastPrompt(room, self string, targets []string, in PeerBroadcastRequest) string {
++	context, _ := json.Marshal(struct {
++		Room       string   `json:"room"`
++		Self       string   `json:"self"`
++		Recipients []string `json:"recipients"`
++	}{room, self, targets})
++	tools := "同伴工具未在此次发送中授权；不要声称已经联系同伴。若已有授权，可通过 peer_tasks 查询。"
++	if in.ConnectPeers {
++		tools = "本房间同伴工具已获用户授权。用 peer_tasks 查看任务和成员；peer_send 向 recipients 中其他会话发送必要的问题、交接或结论；peer_task 提议、认领、提交与交叉验收任务。"
++	}
++	return fmt.Sprintf("[项目群聊上下文]\n%s\n你是 self 指定的独立原生会话，其他 recipients 同时收到本次用户消息。%s\n先按任务需要简短讨论并自主分工，再工作。不要互相重复确认，不要循环致谢，不要自动重发失败消息。没有实质问题时直接汇报。尊重项目写入权限和任务认领边界；工具返回成功只代表投递，不代表同伴完成。不要联系本次未选中的成员。\n[用户消息]\n%s", context, tools, in.Message)
++}
+diff --git a/backend/internal/service/session/peer_broadcast_test.go b/backend/internal/service/session/peer_broadcast_test.go
+index 3cd053e..f973670 100644
+--- a/backend/internal/service/session/peer_broadcast_test.go
++++ b/backend/internal/service/session/peer_broadcast_test.go
+@@ -126,3 +126,30 @@ func TestPeerDeliveryFailureExplainsKnownCauseWithoutLeakingProviderText(t *test
+ 		t.Fatal(got)
+ 	}
+ }
++
++func TestPeerBroadcastExplicitRecipientsAndContext(t *testing.T) {
++	p := &broadcastStore{room: domain.PeerRoom{Epoch: 1, Budget: 4, Members: []string{"a", "b", "stopped"}}, states: map[string]string{}}
++	var mu sync.Mutex
++	prompts := map[string]string{}
++	svc := NewWithDeps(Deps{Store: p, Manager: &fakeCommander{sendFunc: func(id domain.SessionID, text string) error {
++		mu.Lock()
++		defer mu.Unlock()
++		prompts[string(id)] = text
++		return nil
++	}}})
++	for _, targets := range [][]string{{"outsider"}, {"a", "a"}, {}} {
++		_, err := svc.BroadcastPeerRoom(context.Background(), "r", PeerBroadcastRequest{ID: "bad", Epoch: 1, Message: "hi", Targets: targets, ConnectPeers: true})
++		if err == nil || p.used != 0 {
++			t.Fatal("invalid target caused side effects", err, p.used)
++		}
++	}
++	out, err := svc.BroadcastPeerRoom(context.Background(), "r", PeerBroadcastRequest{ID: "new", Epoch: 1, Message: "hello team", Targets: []string{"a", "b"}})
++	if err != nil || len(out.Deliveries) != 2 || len(prompts) != 2 {
++		t.Fatal(out, err, prompts)
++	}
++	for id, prompt := range prompts {
++		if !strings.Contains(prompt, `"self":"`+id+`"`) || !strings.Contains(prompt, `"recipients":["a","b"]`) || !strings.Contains(prompt, "hello team") || strings.Contains(prompt, "stopped") {
++			t.Fatal(prompt)
++		}
++	}
++}
+diff --git a/backend/internal/service/session/peer_workflow_test.go b/backend/internal/service/session/peer_workflow_test.go
+index 70f0566..d30b62c 100644
+--- a/backend/internal/service/session/peer_workflow_test.go
++++ b/backend/internal/service/session/peer_workflow_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"path/filepath"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 
+@@ -41,10 +42,10 @@ func (n *nativeFixture) reply(ctx context.Context, id domain.SessionID, text str
+ 		sql  string
+ 		args []any
+ 	}{
+-		{"INSERT INTO conversations(id,scope,project_id,session_id,current_session_id,created_at,updated_at) VALUES(?,'session','p',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{string(id), string(id), string(id)}},
++		{"INSERT OR IGNORE INTO conversations(id,scope,project_id,session_id,current_session_id,created_at,updated_at) VALUES(?,'session','p',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{string(id), string(id), string(id)}},
+ 		{"INSERT INTO conversation_turns(id,conversation_id,handled_by_session_id,state,requested_at) VALUES(?,?,?,'completed',CURRENT_TIMESTAMP)", []any{key, string(id), string(id)}},
+-		{"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,client_message_id,created_at,updated_at) VALUES(?,?,?,1,'user','human',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{key + ":input", string(id), key, text, key}},
+-		{"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,created_at,updated_at) VALUES(?,?,?,2,'assistant','provider',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{key + ":reply", string(id), key, "answer from " + string(id)}},
++		{"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,client_message_id,created_at,updated_at) VALUES(?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_messages WHERE conversation_id=?),'user','human',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{key + ":input", string(id), key, string(id), text, key}},
++		{"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,created_at,updated_at) VALUES(?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_messages WHERE conversation_id=?),'assistant','provider',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", []any{key + ":reply", string(id), key, string(id), "answer from " + string(id)}},
+ 	} {
+ 		if _, err = tx.ExecContext(ctx, q.sql, q.args...); err != nil {
+ 			return err
+@@ -68,21 +69,21 @@ func TestPeerWorkflowBroadcastRepliesAndRevocation(t *testing.T) {
+ 	if _, err = db.Exec("INSERT INTO projects(id,path,display_name,registered_at) VALUES('p','/tmp/p','p',CURRENT_TIMESTAMP)"); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	for i, id := range []string{"a", "b"} {
++	for i, id := range []string{"a", "b", "stopped"} {
+ 		if _, err = db.Exec("INSERT INTO sessions(id,project_id,num,kind,session_mode,activity_state,activity_last_at,created_at,updated_at) VALUES(?,'p',?,'worker','chat','idle',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", id, i+1); err != nil {
+ 			t.Fatal(err)
+ 		}
+ 	}
++	if _, err = db.Exec("UPDATE sessions SET activity_state='exited' WHERE id='stopped'"); err != nil {
++		t.Fatal(err)
++	}
+ 	fixture := &nativeFixture{fakeCommander: &fakeCommander{}, db: db, store: store}
+ 	svc := NewWithDeps(Deps{Store: store, Manager: fixture})
+-	room, err := svc.ConfigurePeerRoom(ctx, domain.PeerRoom{ID: "r", ProjectID: "p", Members: []string{"a", "b"}, Budget: 4})
++	room, err := svc.ConfigurePeerRoom(ctx, domain.PeerRoom{ID: "r", ProjectID: "p", Members: []string{"a", "b", "stopped"}, Budget: 4})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if _, err = svc.BindPeerTools(ctx, "r", room.Epoch); err != nil {
+-		t.Fatal(err)
+-	}
+-	input := PeerBroadcastRequest{ID: "broadcast", Epoch: room.Epoch, Message: "discuss and propose tasks"}
++	input := PeerBroadcastRequest{ID: "broadcast", Epoch: room.Epoch, Message: "discuss and propose tasks", Targets: []string{"a", "b"}, ConnectPeers: true}
+ 	result, err := svc.BroadcastPeerRoom(ctx, "r", input)
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -115,6 +116,38 @@ func TestPeerWorkflowBroadcastRepliesAndRevocation(t *testing.T) {
+ 			t.Fatal(duplicate)
+ 		}
+ 	}
++
++	for _, member := range []string{"a", "b"} {
++		if _, err := svc.GetPeerToolBinding(ctx, member); err != nil {
++			t.Fatal(err)
++		}
++	}
++	var sent string
++	if err := db.QueryRow("SELECT text FROM conversation_messages WHERE role='user' LIMIT 1").Scan(&sent); err != nil || !strings.Contains(sent, `"recipients":["a","b"]`) {
++		t.Fatal(sent, err)
++	}
++	before := len(fixture.pending)
++	if err := svc.SendPeerMessage(ctx, "r", domain.PeerMessage{ID: "peer-new", Epoch: room.Epoch, Sender: "a", Target: "b", Message: "Please independently verify my proposal"}); err != nil {
++		t.Fatal(err)
++	}
++	for _, reply := range fixture.pending[before:] {
++		if err := reply(); err != nil {
++			t.Fatal(err)
++		}
++	}
++	history, err = svc.ListPeerDeliveries(ctx, "r")
++	if err != nil || len(history) != 3 {
++		t.Fatal(history, err)
++	}
++	found := false
++	for _, d := range history {
++		if d.ID == "peer-new" {
++			found = d.Sender == "a" && d.Target == "b" && len(d.Replies) == 1 && d.TurnState == "completed"
++		}
++	}
++	if !found {
++		t.Fatal("peer reply was not correlated", history)
++	}
+ 	room.Paused = true
+ 	room, err = svc.ConfigurePeerRoom(ctx, room)
+ 	if err != nil {
+diff --git a/frontend/src/api/schema.ts b/frontend/src/api/schema.ts
+index 7119591..961cb76 100644
+--- a/frontend/src/api/schema.ts
++++ b/frontend/src/api/schema.ts
+@@ -6779,10 +6779,12 @@ export interface components {
+             state: string;
+         };
+         PeerBroadcastRequest: {
++            connectPeers?: boolean;
+             /** Format: int64 */
+             epoch: number;
+             id: string;
+             message: string;
++            targets?: string[];
+         };
+         PeerBroadcastResult: {
+             deliveries: components["schemas"]["PeerBroadcastDelivery"][];
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index 5a48ca3..2c83316 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -121,14 +121,14 @@ it("broadcasts once to same-provider sessions and blocks replay of uncertain del
+ 	fireEvent.change(screen.getByLabelText("群聊消息"), {
+ 		target: { value: "请一起分析" },
+ 	});
+-	fireEvent.click(screen.getByRole("button", { name: "发送给全体成员" }));
++	fireEvent.click(screen.getByRole("button", { name: /连接同伴并发送/ }));
+ 	await screen.findByText(/部分结果未确认/);
+ 	expect(api.POST).toHaveBeenCalledTimes(1);
+ 	expect(api.POST.mock.calls[0][1].body).toMatchObject({
+ 		epoch: 1,
+ 		message: "请一起分析",
+ 	});
+-	expect(screen.getByRole("button", { name: "发送给全体成员" })).toBeDisabled();
++	expect(screen.getByRole("button", { name: /连接同伴并发送/ })).toBeDisabled();
+ 	expect(screen.getByLabelText("群聊消息")).toHaveValue("");
+ 	fireEvent.click(screen.getByRole("button", { name: "已核查，撰写新消息" }));
+ 	expect(api.POST).toHaveBeenCalledTimes(1);
+@@ -159,7 +159,7 @@ it("pauses without altering members and disables sending", async () => {
+ 	fireEvent.change(screen.getByLabelText("群聊消息"), {
+ 		target: { value: "不应该发送" },
+ 	});
+-	expect(screen.getByRole("button", { name: "发送给全体成员" })).toBeDisabled();
++	expect(screen.getByRole("button", { name: /连接同伴并发送/ })).toBeDisabled();
+ });
+ it("does not turn a failed room lookup into a new room", async () => {
+ 	api.GET.mockResolvedValue({
+@@ -299,15 +299,17 @@ it("keeps failed-save selections and detects a changed room before overwriting i
+ 	expect(api.PUT).toHaveBeenCalledTimes(1);
+ });
+ 
+-it("blocks a stopped member without sending or automatically restarting it", async () => {
++it("sends only to visible available recipients without restarting stopped members", async () => {
+  const original = api.GET.getMockImplementation()!;
+  api.GET.mockImplementation(async (path, options) => path.endsWith("/conversation") && options.params.path.sessionId === "b"
+     ? {data:{controller:"stopped",messages:[]}} : original(path, options));
+  mount();
+  await screen.findByText(/b · codex.*会话已停止/);
+  fireEvent.change(screen.getByLabelText("群聊消息"), {target:{value:"do not send"}});
+- expect(screen.getByRole("button",{name:"发送给全体成员"})).toBeDisabled();
+- expect(api.POST).not.toHaveBeenCalled();
++ expect(screen.getByText(/跳过 1 位不可用成员/)).toBeInTheDocument();
++ fireEvent.click(screen.getByRole("button",{name:/连接同伴并发送/}));
++ await waitFor(() => expect(api.POST).toHaveBeenCalledTimes(1));
++ expect(api.POST.mock.calls[0][1].body).toMatchObject({targets:["a"],connectPeers:true});
+ });
+ it("updates receipts using the exact delivery id rather than another turn from the same member", async () => {
+  let state = "running";
+@@ -320,7 +322,7 @@ it("updates receipts using the exact delivery id rather than another turn from t
+  const {client}=mount();
+  await screen.findAllByText("原生回复");
+  fireEvent.change(screen.getByLabelText("群聊消息"),{target:{value:"new message"}});
+- fireEvent.click(screen.getByRole("button",{name:"发送给全体成员"}));
++ fireEvent.click(screen.getByRole("button",{name:/连接同伴并发送/}));
+  await screen.findByText("a · codex (a)：正在工作");
+  state="failed";
+  await act(async()=>{await client.invalidateQueries({queryKey:["peer-room-history","project-p"]});});
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index 558ad4c..0c5a226 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -241,7 +241,7 @@ export function PeerRoom({
+ 			setDraftBudget(null);
+ 			draftEpoch.current = null;
+ 			setSaveNotice(
+-				`已保存 ${result.data.members.length} 位成员。成员变更后请重新连接同伴工具。`,
++				`已保存 ${result.data.members.length} 位成员。下一次发送将连接当前房间同伴工具。`,
+ 			);
+ 			return true;
+ 		} catch (e) {
+@@ -271,6 +271,8 @@ export function PeerRoom({
+ 						id: crypto.randomUUID(),
+ 						epoch: room.data.epoch,
+ 						message: text,
++                        targets: availableMembers,
++                        connectPeers: true,
+ 					},
+ 				},
+ 			);
+@@ -324,6 +326,7 @@ export function PeerRoom({
+ 	const unavailableMembers = members
+ 		.map((id, i) => ({ id, issue: memberIssue(i) }))
+ 		.filter((m) => m.issue);
++	const availableMembers = members.filter((_, i) => !memberIssue(i));
+ 	const canSend =
+ 		!!room.data &&
+ 		!room.data.paused &&
+@@ -332,7 +335,7 @@ export function PeerRoom({
+ 		!room.isError &&
+ 		!busy &&
+ 		!pendingChanges &&
+-		unavailableMembers.length === 0 &&
++		availableMembers.length > 0 &&
+ 		!uncertain &&
+ 		!!text.trim() &&
+ 		new TextEncoder().encode(text).length <= 2000;
+@@ -406,7 +409,7 @@ export function PeerRoom({
+ 							if (!(await configure(room.data?.paused ?? false, next)))
+ 								throw new Error("房间保存未确认");
+ 							setAddingMembers(false);
+-							return "成员已加入房间。点击「连接 / 更新同伴工具」后，即可向全体发送任务。";
++							return "成员已加入房间。在下方查看接收人并发送新任务。";
+ 						}}
+ 					/>
+ 				)}
+@@ -539,7 +542,7 @@ export function PeerRoom({
+ 				)}
+ 				{unavailableMembers.length > 0 && (
+ 					<div role="status" className="border-b border-border p-4 text-sm">
+-						<p>成员尚不可用，发送已暂停。不会自动恢复或重发消息。</p>
++						<p>以下成员暂不可用，本次跳过。可用成员仍可接收新消息，不会自动恢复或补发。</p>
+ 						{unavailableMembers.map(({ id, issue }) => (
+ 							<div key={id} className="my-2">
+ 								{label(id)}：{issue}
+@@ -705,7 +708,12 @@ export function PeerRoom({
+ 							</Button>
+ 						</div>
+ 					)}
+-					<form
++					<p className="text-sm" aria-live="polite">
++                        本次接收：{availableMembers.length ? availableMembers.map(label).join("、") : "暂无可用成员，请打开原生会话恢复连接"}。
++                        {unavailableMembers.length > 0 ? `跳过 ${unavailableMembers.length} 位不可用成员，不会补发。` : ""}
++                    </p>
++                    <p className="text-xs text-muted-foreground">发送时连接当前房间同伴工具，允许成员互相沟通与认领任务；沿用现有权限及投递上限。</p>
++                    <form
+ 						onSubmit={(e) => {
+ 							e.preventDefault();
+ 							if (canSend) void send();
+@@ -745,7 +753,7 @@ export function PeerRoom({
+ 									: ""}
+ 							</p>
+ 							<Button type="submit" disabled={!canSend}>
+-								{busy ? "处理中…" : "发送给全体成员"}
++								{busy ? "处理中…" : `连接同伴并发送（${availableMembers.length} 位）`}
+ 							</Button>
+ 						</div>
+ 					</form>
+-- 
+2.54.0 (Apple Git-157)
+

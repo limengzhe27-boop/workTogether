@@ -1,6 +1,6 @@
 # WorkTogether
 
-> **原生客户端新版正在独立验证**：以 Agent Orchestrator 为底座的项目群聊、同伴工具和自主认领实现见 [新版启动与边界](docs/ao-local-app.md)。以下正文仍描述原 Python/Web 应用；两者未合并，旧数据库保持原样。
+> **原生客户端新版正在独立验证**：以 Agent Orchestrator 为底座的项目群聊、同伴工具和自主认领实现见 [新版启动与边界](docs/ao-local-app.md)。原生版已验证 Codex + DeepSeek 收发、双向同伴消息和只读任务交叉验收（[证据](docs/experiments/native-room-flow-verification.json)），不代表任意编码任务无人值守交付。以下正文仍描述原 Python/Web 应用；两者未合并，旧数据库保持原样。
 
 本地多 Agent 任务对话与协同研发原型，包含调度核心、命令行及 React 网页工作台。
 
