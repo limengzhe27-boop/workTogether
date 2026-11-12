@@ -1,0 +1,610 @@
+From f1e3a63fb6f6c1ceb20dd49663b4b85e0253f1da Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 15:32:30 +0800
+Subject: [PATCH] fix: explain unavailable peers and correlate live delivery
+ outcomes
+
+Reject unavailable members before admission, retain safe failure diagnostics, and read exact native turn state even without reply text. Preserve uncertain receipts and never replay messages. Verified 11733 frontend tests, typecheck, session/storage/HTTP suites and legacy checks.
+---
+ backend/internal/domain/peer_room.go          |  2 +
+ backend/internal/httpd/apispec/openapi.yaml   |  7 ++
+ .../service/session/peer_broadcast.go         | 75 ++++++++++++++++-
+ .../service/session/peer_broadcast_test.go    | 36 +++++++-
+ .../service/session/peer_workflow_test.go     |  2 +-
+ .../sqlite/migrate_burned_versions_test.go    |  1 +
+ ...112072517589_peer_delivery_diagnostics.sql |  4 +
+ .../storage/sqlite/peer_rooms_test.go         | 16 +++-
+ .../storage/sqlite/store/peer_rooms.go        | 18 +++-
+ frontend/src/api/schema.ts                    |  3 +
+ .../src/renderer/components/PeerRoom.test.tsx | 31 ++++++-
+ frontend/src/renderer/components/PeerRoom.tsx | 82 +++++++++++++++++--
+ 12 files changed, 256 insertions(+), 21 deletions(-)
+ create mode 100644 backend/internal/storage/sqlite/migrations/20261112072517589_peer_delivery_diagnostics.sql
+
+diff --git a/backend/internal/domain/peer_room.go b/backend/internal/domain/peer_room.go
+index 888a2f9..89a3d2e 100644
+--- a/backend/internal/domain/peer_room.go
++++ b/backend/internal/domain/peer_room.go
+@@ -46,6 +46,8 @@ type PeerTaskAction struct {
+ // PeerDelivery describes durable admission, not a completed agent turn.
+ // Empty metadata belongs to a delivery recorded before history support.
+ type PeerDelivery struct {
++	Detail           string      `json:"detail,omitempty"`
++	TurnState        string      `json:"turnState,omitempty"`
+ 	Replies          []PeerReply `json:"replies"`
+ 	RepliesTruncated bool        `json:"repliesTruncated"`
+ 	ID               string      `json:"id"`
+diff --git a/backend/internal/httpd/apispec/openapi.yaml b/backend/internal/httpd/apispec/openapi.yaml
+index ed72414..c635ebb 100644
+--- a/backend/internal/httpd/apispec/openapi.yaml
++++ b/backend/internal/httpd/apispec/openapi.yaml
+@@ -19413,11 +19413,14 @@ components:
+       properties:
+         detail:
+           type: string
++        id:
++          type: string
+         session:
+           type: string
+         state:
+           type: string
+       required:
++      - id
+       - session
+       - state
+       type: object
+@@ -19448,6 +19451,8 @@ components:
+       properties:
+         createdAt:
+           type: string
++        detail:
++          type: string
+         epoch:
+           format: int64
+           type: integer
+@@ -19467,6 +19472,8 @@ components:
+           type: string
+         target:
+           type: string
++        turnState:
++          type: string
+       required:
+       - replies
+       - repliesTruncated
+diff --git a/backend/internal/service/session/peer_broadcast.go b/backend/internal/service/session/peer_broadcast.go
+index a46258e..9b67723 100644
+--- a/backend/internal/service/session/peer_broadcast.go
++++ b/backend/internal/service/session/peer_broadcast.go
+@@ -3,6 +3,7 @@ package session
+ import (
+ 	"context"
+ 	"crypto/sha256"
++	"errors"
+ 	"fmt"
+ 	"strings"
+ 	"sync"
+@@ -10,6 +11,7 @@ import (
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/peerpolicy"
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++	"github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+ )
+ 
+ type PeerBroadcastRequest struct {
+@@ -18,6 +20,7 @@ type PeerBroadcastRequest struct {
+ 	Message string `json:"message"`
+ }
+ type PeerBroadcastDelivery struct {
++	ID      string `json:"id"`
+ 	Session string `json:"session"`
+ 	State   string `json:"state"`
+ 	Detail  string `json:"detail,omitempty"`
+@@ -53,9 +56,26 @@ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroad
+ 	// Reservation order follows the visible member order. Budget exhaustion is deterministic.
+ 	for i, target := range room.Members {
+ 		receipt := fmt.Sprintf("user-%x", sha256.Sum256([]byte(in.ID+"\x00"+target)))
++		out.Deliveries[i] = PeerBroadcastDelivery{Session: target, ID: receipt}
++		rec, exists, checkErr := s.store.GetSession(ctx, domain.SessionID(target))
++		if checkErr != nil || !exists || rec.IsTerminated || string(rec.ProjectID) != room.ProjectID || rec.Mode != domain.SessionModeChat || string(rec.Activity.State) == "exited" {
++			out.Deliveries[i].State = "blocked"
++			switch {
++			case checkErr != nil:
++				out.Deliveries[i].Detail = "无法读取成员状态，未发送；请检查原生会话。"
++			case !exists:
++				out.Deliveries[i].Detail = "成员会话不存在，未发送；请移出房间。"
++			case rec.IsTerminated:
++				out.Deliveries[i].Detail = "成员已终止，未发送；请移出房间或创建新成员。"
++			case string(rec.Activity.State) == "exited":
++				out.Deliveries[i].Detail = "成员进程已退出，未发送；请打开原生会话并手动恢复。"
++			default:
++				out.Deliveries[i].Detail = "成员不属于当前项目或不是 Chat 会话，未发送。"
++			}
++			continue
++		}
+ 		m := domain.PeerMessage{ID: receipt, Target: target, Epoch: in.Epoch, Message: in.Message}
+ 		admitted, err := store.ReserveUserRoomMessage(ctx, id, m)
+-		out.Deliveries[i] = PeerBroadcastDelivery{Session: target}
+ 		if err != nil {
+ 			out.Deliveries[i].State = "blocked"
+ 			out.Deliveries[i].Detail = err.Error()
+@@ -69,10 +89,27 @@ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroad
+ 		go func(i int, target, receipt string) {
+ 			defer wg.Done()
+ 			err := s.manager.SendWithOptions(peerpolicy.Admitted(ctx, "", target), domain.SessionID(target), in.Message, nil, ports.MessageDeliveryOptions{AuthoredByUser: true, ClientMessageID: domain.PeerDeliveryKey(id, receipt)})
+-			finishErr := store.FinishPeerMessage(context.WithoutCancel(ctx), id, receipt, err == nil)
++			detail := ""
++			if err != nil {
++				detail = peerDeliveryFailure(err)
++				if s.logger != nil {
++					s.logger.Warn("peer delivery failed", "deliveryID", receipt, "sessionID", target, "reason", detail, "errorType", fmt.Sprintf("%T", err))
++				}
++			}
++			var finishErr error
++			if diagnostic, ok := s.store.(interface {
++				FinishPeerMessageDetail(context.Context, string, string, bool, string) error
++			}); ok {
++				finishErr = diagnostic.FinishPeerMessageDetail(context.WithoutCancel(ctx), id, receipt, err == nil, detail)
++			} else {
++				finishErr = store.FinishPeerMessage(context.WithoutCancel(ctx), id, receipt, err == nil)
++			}
+ 			if err != nil || finishErr != nil {
+ 				out.Deliveries[i].State = "uncertain"
+-				out.Deliveries[i].Detail = "Delivery failed or could not be recorded; do not automatically replay"
++				out.Deliveries[i].Detail = detail
++				if finishErr != nil {
++					out.Deliveries[i].Detail += " 回执保存失败，结果未确认；请按投递编号核查，不要重复发送。"
++				}
+ 				return
+ 			}
+ 			out.Deliveries[i].State = "accepted"
+@@ -81,3 +118,35 @@ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroad
+ 	wg.Wait()
+ 	return out, nil
+ }
++
++// Do not expose arbitrary provider output: it may contain credentials or prompt text.
++func peerDeliveryFailure(err error) string {
++	for _, item := range []struct {
++		err     error
++		message string
++	}{
++		{ports.ErrChatAuthRequired, "客户端尚未登录或登录已失效，请打开原生会话完成登录。"},
++		{ports.ErrChatHostNotRunning, "原生会话进程未运行，请打开原生会话并手动恢复。"},
++		{ports.ErrChatResumeFailed, "原生会话恢复失败，请检查原生会话；不会替换为新会话。"},
++		{ports.ErrChatRecoveryInconclusive, "原生进程恢复状态无法确认，请核查原生会话。"},
++		{ports.ErrChatDriverUnavailable, "客户端程序不可用，请检查客户端安装。"},
++		{ports.ErrChatDriverIncompatible, "客户端协议不兼容，请检查客户端版本。"},
++		{ports.ErrChatUnsupported, "客户端不支持当前 Chat 接入方式。"},
++		{sessionmanager.ErrTerminated, "成员会话已终止。"},
++		{sessionmanager.ErrAgentExited, "成员进程已退出。"},
++		{sessionmanager.ErrNativeConversationMissing, "缺少原生会话编号，无法恢复，请检查原生会话。"},
++		{sessionmanager.ErrNativeConversationUnverified, "原生会话身份尚未确认，无法安全恢复。"},
++		{sessionmanager.ErrTargetAgentUnauthorized, "当前客户端账号未认证，请打开原生会话完成登录。"},
++		{ports.ErrChatHistoryUnsettled, "原生会话历史尚未核对完成，无法安全继续。"},
++		{ports.ErrChatHistoryLoadFailed, "原生会话历史加载失败。"},
++		{ports.ErrChatPermissionModeUnsupported, "客户端不支持当前权限模式，请检查会话设置。"},
++		{sessionmanager.ErrNotResumable, "没有可恢复的原生会话，请检查会话记录。"},
++		{context.DeadlineExceeded, "等待客户端响应超时。"},
++		{context.Canceled, "投递请求已取消。"},
++	} {
++		if errors.Is(err, item.err) {
++			return item.message + " 本次结果未确认，不会自动重发。"
++		}
++	}
++	return "客户端投递失败（未分类错误）；请按投递编号检查原生会话与本地日志。结果未确认，不会自动重发。"
++}
+diff --git a/backend/internal/service/session/peer_broadcast_test.go b/backend/internal/service/session/peer_broadcast_test.go
+index 106d43e..3cd053e 100644
+--- a/backend/internal/service/session/peer_broadcast_test.go
++++ b/backend/internal/service/session/peer_broadcast_test.go
+@@ -3,6 +3,9 @@ package session
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
++	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -13,12 +16,16 @@ import (
+ 
+ type broadcastStore struct {
+ 	peerStoreFake
+-	mu     sync.Mutex
+-	room   domain.PeerRoom
+-	states map[string]string
+-	used   int
++	mu          sync.Mutex
++	room        domain.PeerRoom
++	states      map[string]string
++	used        int
++	unavailable bool
+ }
+ 
++func (p *broadcastStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
++	return domain.SessionRecord{ID: id, ProjectID: domain.ProjectID(p.room.ProjectID), Mode: domain.SessionModeChat, IsTerminated: p.unavailable}, true, nil
++}
+ func (p *broadcastStore) GetPeerRoom(context.Context, string) (domain.PeerRoom, error) {
+ 	return p.room, nil
+ }
+@@ -98,3 +105,24 @@ func TestPeerBroadcastReportsPartialBudget(t *testing.T) {
+ 		t.Fatal(out, err)
+ 	}
+ }
++
++func TestPeerBroadcastUnavailableDoesNotReserveOrSend(t *testing.T) {
++	p := &broadcastStore{room: domain.PeerRoom{Epoch: 1, Budget: 2, Members: []string{"a"}}, states: map[string]string{}, unavailable: true}
++	var calls int
++	s := NewWithDeps(Deps{Store: p, Manager: &fakeCommander{sendFunc: func(domain.SessionID, string) error { calls++; return nil }}})
++	out, err := s.BroadcastPeerRoom(context.Background(), "r", PeerBroadcastRequest{ID: "x", Epoch: 1, Message: "hello"})
++	if err != nil || calls != 0 || p.used != 0 || out.Deliveries[0].State != "blocked" || out.Deliveries[0].Detail == "" {
++		t.Fatal(out, err, calls, p.used)
++	}
++}
++
++func TestPeerDeliveryFailureExplainsKnownCauseWithoutLeakingProviderText(t *testing.T) {
++	got := peerDeliveryFailure(fmt.Errorf("secret-token: %w", ports.ErrChatAuthRequired))
++	if !strings.Contains(got, "登录") || strings.Contains(got, "secret-token") {
++		t.Fatal(got)
++	}
++	got = peerDeliveryFailure(errors.New("secret-token"))
++	if !strings.Contains(got, "未分类") || strings.Contains(got, "secret-token") {
++		t.Fatal(got)
++	}
++}
+diff --git a/backend/internal/service/session/peer_workflow_test.go b/backend/internal/service/session/peer_workflow_test.go
+index 22ea2b2..70f0566 100644
+--- a/backend/internal/service/session/peer_workflow_test.go
++++ b/backend/internal/service/session/peer_workflow_test.go
+@@ -69,7 +69,7 @@ func TestPeerWorkflowBroadcastRepliesAndRevocation(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	for i, id := range []string{"a", "b"} {
+-		if _, err = db.Exec("INSERT INTO sessions(id,project_id,num,kind,activity_state,activity_last_at,created_at,updated_at) VALUES(?,'p',?,'worker','idle',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", id, i+1); err != nil {
++		if _, err = db.Exec("INSERT INTO sessions(id,project_id,num,kind,session_mode,activity_state,activity_last_at,created_at,updated_at) VALUES(?,'p',?,'worker','chat','idle',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", id, i+1); err != nil {
+ 			t.Fatal(err)
+ 		}
+ 	}
+diff --git a/backend/internal/storage/sqlite/migrate_burned_versions_test.go b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+index 5992937..fbcc522 100644
+--- a/backend/internal/storage/sqlite/migrate_burned_versions_test.go
++++ b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+@@ -20,6 +20,7 @@ import (
+ // session list). Renaming, renumbering, or deleting a shipped migration
+ // produces exactly that class of failure, so this list is append-only.
+ var shippedMigrations = map[int64]string{
++	20261112072517589: "20261112072517589_peer_delivery_diagnostics.sql",
+ 	20261111201016434: "20261111201016434_peer_tool_grants.sql",
+ 	20261111182908940: "20261111182908940_peer_delivery_history.sql",
+ 	20261111122043927: "20261111122043927_peer_session_bindings.sql",
+diff --git a/backend/internal/storage/sqlite/migrations/20261112072517589_peer_delivery_diagnostics.sql b/backend/internal/storage/sqlite/migrations/20261112072517589_peer_delivery_diagnostics.sql
+new file mode 100644
+index 0000000..02fe7e8
+--- /dev/null
++++ b/backend/internal/storage/sqlite/migrations/20261112072517589_peer_delivery_diagnostics.sql
+@@ -0,0 +1,4 @@
++-- +goose Up
++ALTER TABLE peer_deliveries ADD COLUMN detail TEXT NOT NULL DEFAULT '';
++-- +goose Down
++ALTER TABLE peer_deliveries DROP COLUMN detail;
+diff --git a/backend/internal/storage/sqlite/peer_rooms_test.go b/backend/internal/storage/sqlite/peer_rooms_test.go
+index b7bb8a3..8e993d6 100644
+--- a/backend/internal/storage/sqlite/peer_rooms_test.go
++++ b/backend/internal/storage/sqlite/peer_rooms_test.go
+@@ -113,7 +113,17 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	joined, err := s.ListPeerDeliveries(ctx, "r")
+-	if err != nil || len(joined[0].Replies) != 1 || joined[0].Replies[0].Text != "room answer" {
++	if err != nil || len(joined[0].Replies) != 1 || joined[0].TurnState != "completed" || joined[0].Replies[0].Text != "room answer" {
++		t.Fatal(joined, err)
++	}
++	if _, err = db.Exec("DELETE FROM conversation_messages WHERE id='reply'"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = db.Exec("UPDATE conversation_turns SET state='failed' WHERE id='turn'"); err != nil {
++		t.Fatal(err)
++	}
++	joined, err = s.ListPeerDeliveries(ctx, "r")
++	if err != nil || joined[0].TurnState != "failed" || len(joined[0].Replies) != 0 {
+ 		t.Fatal(joined, err)
+ 	}
+ 	if _, err = db.Exec("UPDATE conversation_turns SET rolled_back_at=CURRENT_TIMESTAMP WHERE id='turn'"); err != nil {
+@@ -145,11 +155,11 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 	if _, err = s.ReservePeerMessage(ctx, "r", msg); err == nil {
+ 		t.Fatal("pending delivery replayed after restart")
+ 	}
+-	if err = s.FinishPeerMessage(ctx, "r", "one", true); err != nil {
++	if err = s.FinishPeerMessageDetail(ctx, "r", "one", true, "persisted diagnostic"); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	history, err = s.ListPeerDeliveries(ctx, "r")
+-	if err != nil || len(history) != 1 || history[0].State != "accepted" {
++	if err != nil || len(history) != 1 || history[0].State != "accepted" || history[0].Detail != "persisted diagnostic" {
+ 		t.Fatalf("receipt state not updated: %+v %v", history, err)
+ 	}
+ 	if ok, err := s.ReservePeerMessage(ctx, "r", msg); ok || err != nil {
+diff --git a/backend/internal/storage/sqlite/store/peer_rooms.go b/backend/internal/storage/sqlite/store/peer_rooms.go
+index cb4d537..f6aa16d 100644
+--- a/backend/internal/storage/sqlite/store/peer_rooms.go
++++ b/backend/internal/storage/sqlite/store/peer_rooms.go
+@@ -160,11 +160,14 @@ func (s *Store) reservePeerMessage(ctx context.Context, room string, m domain.Pe
+ 	return true, tx.Commit()
+ }
+ func (s *Store) FinishPeerMessage(ctx context.Context, room, id string, accepted bool) error {
++	return s.FinishPeerMessageDetail(ctx, room, id, accepted, "")
++}
++func (s *Store) FinishPeerMessageDetail(ctx context.Context, room, id string, accepted bool, detail string) error {
+ 	state := "uncertain"
+ 	if accepted {
+ 		state = "accepted"
+ 	}
+-	_, err := s.writeDB.ExecContext(ctx, "UPDATE peer_deliveries SET state=? WHERE room_id=? AND id=? AND state='pending'", state, room, id)
++	_, err := s.writeDB.ExecContext(ctx, "UPDATE peer_deliveries SET state=?,detail=? WHERE room_id=? AND id=? AND state='pending'", state, detail, room, id)
+ 	return err
+ }
+ 
+@@ -180,7 +183,7 @@ func (s *Store) ListPeerDeliveries(ctx context.Context, room string) ([]domain.P
+ 	if _, err := s.GetPeerRoom(ctx, room); err != nil {
+ 		return nil, err
+ 	}
+-	rows, err := s.readDB.QueryContext(ctx, "SELECT id,sender,target,message,epoch,state,created_at FROM peer_deliveries WHERE room_id=? ORDER BY created_at,id", room)
++	rows, err := s.readDB.QueryContext(ctx, "SELECT id,sender,target,message,epoch,state,created_at,detail FROM peer_deliveries WHERE room_id=? ORDER BY created_at,id", room)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -188,7 +191,7 @@ func (s *Store) ListPeerDeliveries(ctx context.Context, room string) ([]domain.P
+ 	out := []domain.PeerDelivery{}
+ 	for rows.Next() {
+ 		var d domain.PeerDelivery
+-		if err := rows.Scan(&d.ID, &d.Sender, &d.Target, &d.Message, &d.Epoch, &d.State, &d.CreatedAt); err != nil {
++		if err := rows.Scan(&d.ID, &d.Sender, &d.Target, &d.Message, &d.Epoch, &d.State, &d.CreatedAt, &d.Detail); err != nil {
+ 			return nil, err
+ 		}
+ 		out = append(out, d)
+@@ -199,6 +202,15 @@ func (s *Store) ListPeerDeliveries(ctx context.Context, room string) ([]domain.P
+ 	rows.Close()
+ 	for i := range out {
+ 		out[i].Replies = []domain.PeerReply{}
++		// Read turn state even when a failed/cancelled turn emitted no assistant message.
++		turnErr := s.readDB.QueryRowContext(ctx, `SELECT t.state FROM conversation_messages u
++          JOIN conversation_turns t ON t.id=u.turn_id AND t.conversation_id=u.conversation_id
++          WHERE u.client_message_id=? AND u.role='user' AND t.handled_by_session_id=?
++          AND t.rolled_back_at IS NULL AND t.promoted_to_turn_id IS NULL
++          ORDER BY u.sequence DESC LIMIT 1`, domain.PeerDeliveryKey(room, out[i].ID), out[i].Target).Scan(&out[i].TurnState)
++		if turnErr != nil && turnErr != sql.ErrNoRows {
++			return nil, turnErr
++		}
+ 		// Match a persisted input key and native turn, never text similarity or a time window.
+ 		replies, err := s.readDB.QueryContext(ctx, `SELECT DISTINCT a.id,a.text,a.streaming,t.state,a.sequence
+    FROM conversation_messages u JOIN conversations c ON c.id=u.conversation_id
+diff --git a/frontend/src/api/schema.ts b/frontend/src/api/schema.ts
+index 201d556..7119591 100644
+--- a/frontend/src/api/schema.ts
++++ b/frontend/src/api/schema.ts
+@@ -6774,6 +6774,7 @@ export interface components {
+         };
+         PeerBroadcastDelivery: {
+             detail?: string;
++            id: string;
+             session: string;
+             state: string;
+         };
+@@ -6788,6 +6789,7 @@ export interface components {
+         };
+         PeerDelivery: {
+             createdAt: string;
++            detail?: string;
+             /** Format: int64 */
+             epoch: number;
+             id: string;
+@@ -6797,6 +6799,7 @@ export interface components {
+             sender: string;
+             state: string;
+             target: string;
++            turnState?: string;
+         };
+         PeerIntegrationRequest: {
+             base: string;
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index cd63631..b7e489d 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -199,7 +199,7 @@ it("keeps durable receipts after remount and labels native history separately",
+ 	first.unmount();
+ 	mount();
+ 	await screen.findByText("本房间的消息");
+-	expect(screen.getByText(/结果不确定，请核查/)).toBeInTheDocument();
++	expect(screen.getByText(/本轮已回复（投递回执仍待核查）/)).toBeInTheDocument();
+ 	expect(api.POST).not.toHaveBeenCalled();
+ });
+ 
+@@ -298,3 +298,32 @@ it("keeps failed-save selections and detects a changed room before overwriting i
+ 	expect(screen.getAllByRole("checkbox")[2]).not.toBeChecked();
+ 	expect(api.PUT).toHaveBeenCalledTimes(1);
+ });
++
++it("blocks a stopped member without sending or automatically restarting it", async () => {
++ const original = api.GET.getMockImplementation()!;
++ api.GET.mockImplementation(async (path, options) => path.endsWith("/conversation") && options.params.path.sessionId === "b"
++    ? {data:{controller:"stopped",messages:[]}} : original(path, options));
++ mount();
++ await screen.findByText(/b · codex.*会话已停止/);
++ fireEvent.change(screen.getByLabelText("群聊消息"), {target:{value:"do not send"}});
++ expect(screen.getByRole("button",{name:"发送给全体成员"})).toBeDisabled();
++ expect(api.POST).not.toHaveBeenCalled();
++});
++it("updates receipts using the exact delivery id rather than another turn from the same member", async () => {
++ let state = "running";
++ const original = api.GET.getMockImplementation()!;
++ api.GET.mockImplementation(async (path, options) => path.endsWith("/history") ? {data:[
++  {id:"current",target:"a",state:"accepted",turnState:state,replies:[],message:"current"},
++  {id:"other",target:"a",state:"accepted",turnState:"completed",replies:[],message:"other"}
++ ]} : original(path,options));
++ api.POST.mockResolvedValue({data:{deliveries:[{id:"current",session:"a",state:"accepted"}]}});
++ const {client}=mount();
++ await screen.findAllByText("原生回复");
++ fireEvent.change(screen.getByLabelText("群聊消息"),{target:{value:"new message"}});
++ fireEvent.click(screen.getByRole("button",{name:"发送给全体成员"}));
++ await screen.findByText("a · codex (a)：正在工作");
++ state="failed";
++ await act(async()=>{await client.invalidateQueries({queryKey:["peer-room-history","project-p"]});});
++ await screen.findByText("a · codex (a)：本轮失败");
++ expect(api.POST).toHaveBeenCalledTimes(1);
++});
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index b936f23..f95a924 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -256,7 +256,7 @@ export function PeerRoom({
+ 		}
+ 	}
+ 	async function send() {
+-		if (!room.data || busy || !text.trim() || uncertain) return;
++		if (!room.data || !canSend) return;
+ 		setBusy(true);
+ 		setError("");
+ 		setReceipts([]);
+@@ -295,6 +295,35 @@ export function PeerRoom({
+ 			});
+ 		}
+ 	}
++	function memberIssue(index: number): string {
++		const session = sessions.find((s) => s.id === members[index]);
++		const query = conversations[index];
++		if (!session || session.isTerminated)
++			return "会话不存在或已终止，请移出房间或创建新成员";
++		if (query?.isError) return "会话状态读取失败，请打开原生会话检查";
++		if (!query?.data) return "正在检查会话状态";
++		const state = query.data.controller;
++		if (state === "stopped") return "会话已停止，请打开原生会话并手动恢复";
++		if (state === "connecting" || state === "recovering")
++			return "会话连接或恢复中，请等待状态更新";
++		if (!["ready", "busy", "hibernated"].includes(state ?? ""))
++			return "会话状态未知，请检查原生会话";
++		return "";
++	}
++	function deliveryStatus(d: {
++		state: string;
++		turnState?: string;
++		replies?: { turnState: string; streaming: boolean }[];
++	}) {
++		const turn = d.turnState || d.replies?.at(-1)?.turnState;
++		if (turn)
++			return `${replyStates[turn] ?? turn}${d.state === "uncertain" ? "（投递回执仍待核查）" : ""}`;
++		if (d.replies?.some((r) => r.streaming)) return "正在回复";
++		return states[d.state] ?? d.state;
++	}
++	const unavailableMembers = members
++		.map((id, i) => ({ id, issue: memberIssue(i) }))
++		.filter((m) => m.issue);
+ 	const canSend =
+ 		!!room.data &&
+ 		!room.data.paused &&
+@@ -303,11 +332,15 @@ export function PeerRoom({
+ 		!room.isError &&
+ 		!busy &&
+ 		!pendingChanges &&
++		unavailableMembers.length === 0 &&
+ 		!uncertain &&
+ 		!!text.trim() &&
+ 		new TextEncoder().encode(text).length <= 2000;
+ 	return (
+-		<section className="flex min-h-0 flex-1 flex-col overflow-hidden" aria-label="项目群聊">
++		<section
++			className="flex min-h-0 flex-1 flex-col overflow-hidden"
++			aria-label="项目群聊"
++		>
+ 			<header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border p-4">
+ 				<div>
+ 					<h1 className="text-base font-medium">项目群聊</h1>
+@@ -504,6 +537,21 @@ export function PeerRoom({
+ 						</p>
+ 					</div>
+ 				)}
++				{unavailableMembers.length > 0 && (
++					<div role="status" className="border-b border-border p-4 text-sm">
++						<p>成员尚不可用，发送已暂停。不会自动恢复或重发消息。</p>
++						{unavailableMembers.map(({ id, issue }) => (
++							<div key={id} className="my-2">
++								{label(id)}：{issue}
++								{onOpenSession && (
++									<Button variant="quiet" onClick={() => onOpenSession(id)}>
++										打开原生会话检查
++									</Button>
++								)}
++							</div>
++						))}
++					</div>
++				)}
+ 				{room.data && (
+ 					<PeerTasks
+ 						key={roomId}
+@@ -525,7 +573,9 @@ export function PeerRoom({
+ 							记录获准发送的消息和接收状态。未获准的请求不在历史中；已接收不等于已完成回复。
+ 						</p>
+ 						{deliveries.isError && (
+-							<p role="alert">房间记录加载失败，请稍后刷新；不要据此重复发送。</p>
++							<p role="alert">
++								房间记录加载失败，请稍后刷新；不要据此重复发送。
++							</p>
+ 						)}
+ 						{(deliveries.data ?? []).map((d) => (
+ 							<article key={d.id} className="rounded-xl bg-secondary p-4">
+@@ -533,11 +583,24 @@ export function PeerRoom({
+ 									{d.target
+ 										? `${d.sender ? label(d.sender) : "你"} → ${label(d.target)}`
+ 										: "旧版投递（未保存正文和成员信息）"}{" "}
+-									· {states[d.state] ?? d.state}
++									· {deliveryStatus(d)}
+ 									{d.createdAt
+ 										? ` · ${new Date(d.createdAt).toLocaleString()}`
+ 										: ""}
+ 								</p>
++								{d.detail && (
++									<p className="mb-2 text-sm text-destructive">{d.detail}</p>
++								)}
++								{d.state === "uncertain" && !d.detail && (
++									<p className="mb-2 text-sm">
++										旧记录未保存失败原因；请核查原生会话，不会自动重发。
++									</p>
++								)}
++								{d.state === "uncertain" && (
++									<p className="text-xs text-muted-foreground">
++										投递编号：{d.id}
++									</p>
++								)}
+ 								{d.message && <ChatMarkdown text={d.message} />}
+ 								{(d.replies ?? []).map((reply) => (
+ 									<section
+@@ -550,7 +613,10 @@ export function PeerRoom({
+ 												? "正在回复"
+ 												: (replyStates[reply.turnState] ?? "状态待确认")}
+ 										</p>
+-										<ChatMarkdown text={reply.text} streaming={reply.streaming} />
++										<ChatMarkdown
++											text={reply.text}
++											streaming={reply.streaming}
++										/>
+ 									</section>
+ 								))}
+ 								{d.repliesTruncated && (
+@@ -616,8 +682,12 @@ export function PeerRoom({
+ 					<div aria-live="polite">
+ 						{receipts.map((r) => (
+ 							<p key={r.session} className="text-sm">
+-								{label(r.session)}：{states[r.state] ?? r.state}
++								{label(r.session)}：
++								{deliveryStatus(
++									deliveries.data?.find((d) => d.id === r.id) ?? r,
++								)}
+ 								{r.detail ? ` · ${r.detail}` : ""}
++								{r.state === "uncertain" && r.id ? ` · 投递编号：${r.id}` : ""}
+ 							</p>
+ 						))}
+ 					</div>
+-- 
+2.54.0 (Apple Git-157)
+
