@@ -1,0 +1,552 @@
+From 673c4ca43e28c686ca899382405a7c24d3c3b1e1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 14:11:31 +0800
+Subject: [PATCH] fix: disable unavailable local updates and distinguish
+ unsaved room members
+
+Keep local builds off the release updater and retain membership drafts on failed or conflicting saves. Verify explicit saves, stale epochs and local update controls with regression tests; all 11731 frontend tests and type checks pass.
+---
+ frontend/src/main.ts                          |  81 ++---------
+ frontend/src/main/update-settings.ts          |   2 +
+ .../src/renderer/components/PeerRoom.test.tsx |  80 +++++++++--
+ frontend/src/renderer/components/PeerRoom.tsx | 131 ++++++++++++++----
+ .../settings/UpdatesSection.test.tsx          |   9 ++
+ .../components/settings/UpdatesSection.tsx    |   4 +
+ 6 files changed, 203 insertions(+), 104 deletions(-)
+
+diff --git a/frontend/src/main.ts b/frontend/src/main.ts
+index 67040e5..74f14ff 100644
+--- a/frontend/src/main.ts
++++ b/frontend/src/main.ts
+@@ -28,28 +28,16 @@ import {
+ 	type OpenDialogOptions,
+ } from "electron";
+ import {
+-	setRendererSink,
+-	startAutoUpdates,
+-	ensureUpdatePrefs,
+-	checkForUpdatesNow,
+-	downloadUpdateNow,
+-	quitAndInstallUpdate,
+ 	isUpdateRestartRequested,
+ 	clearUpdateRestartRequest,
+ 	setUpdateRestartFailureHandler,
+-	getUpdateStatus,
+ 	recordUpdateDiagnostic,
+-	setUpdateSettings,
+-	setMacDifferentialUpdates,
+-	returnToHome,
+-	type UpdateCheckOptions,
+ } from "./main/auto-updater";
+-import { listFeatureBuilds, getActiveFeatureBuild } from "./main/feature-builds";
+ import { clearMainSentryCache, initMainSentry, sanitizeRendererCapture } from "./main/sentry-main";
+ import { TelemetryPolicyAuthority, resolveDesktopDataDir } from "./main/telemetry-policy-file";
+ import { DesktopTelemetryController } from "./main/desktop-telemetry-controller";
+ import { TelemetryIdentityController } from "./main/telemetry-identity";
+-import { readUpdateSettings, type UpdateSettings, type UpdateStatus } from "./main/update-settings";
++import { type UpdateSettings, type UpdateStatus } from "./main/update-settings";
+ import { readKeybindingOverrides, writeKeybindingOverrides } from "./main/keybinding-settings";
+ import { readEditorSettings, writeEditorPreference } from "./main/editor-settings";
+ import { createEditorHandoff } from "./main/editor-handoff";
+@@ -3404,22 +3392,10 @@ ipcMain.handle("appState:markFirstRunProjectPromptSeen", async () => {
+ 	await markFirstRunProjectPromptSeen(path.dirname(runFile));
+ });
+ 
+-ipcMain.handle("updateSettings:get", async (): Promise<UpdateSettings> => {
+-	const runFile = runFilePath();
+-	if (!runFile) return { enabled: false, channel: "latest", nightlyAck: false, feature: null, macDifferentialUpdates: false };
+-	return readUpdateSettings(path.dirname(runFile));
+-});
+-ipcMain.handle("updateSettings:set", async (_event, settings: UpdateSettings) => {
+-	const runFile = runFilePath();
+-	if (!runFile) return;
+-	await setUpdateSettings(path.dirname(runFile), settings);
+-});
+-ipcMain.handle("updateSettings:setMacDifferentialUpdates", async (_event, enabled: unknown) => {
+-	if (typeof enabled !== "boolean") return;
+-	const runFile = runFilePath();
+-	if (!runFile) return;
+-	await setMacDifferentialUpdates(path.dirname(runFile), enabled);
+-});
++// Local builds have no published update feed. Ignore legacy update preferences.
++ipcMain.handle("updateSettings:get", async (): Promise<UpdateSettings> => ({ enabled: false, channel: "latest", nightlyAck: false, feature: null }));
++ipcMain.handle("updateSettings:set", async () => {});
++ipcMain.handle("updateSettings:setMacDifferentialUpdates", async () => {});
+ 
+ ipcMain.handle("uiSettings:get", async (): Promise<UiSettings> => {
+ 	const runFile = runFilePath();
+@@ -3449,24 +3425,14 @@ ipcMain.handle("keybindings:setRecording", (event, active: unknown): void => {
+ 	keybindingRecordingActive = active;
+ });
+ 
+-ipcMain.handle("featureBuilds:list", () => listFeatureBuilds());
+-ipcMain.handle("featureBuilds:getActive", () => getActiveFeatureBuild());
+-
+-ipcMain.handle("updates:getStatus", (): UpdateStatus => getUpdateStatus());
+-ipcMain.handle("updates:check", async (_event, options?: UpdateCheckOptions) => {
+-	const runFile = runFilePath();
+-	if (!runFile) return;
+-	await checkForUpdatesNow(path.dirname(runFile), options);
+-});
+-ipcMain.handle("updates:returnHome", async (_event, requestId?: string) => {
+-	const runFile = runFilePath();
+-	if (!runFile) return;
+-	await returnToHome(path.dirname(runFile), requestId);
+-});
+-ipcMain.handle("updates:download", async (_event, requestId?: string) => {
+-	await downloadUpdateNow(requestId);
+-});
+-ipcMain.handle("updates:install", (_event, confirmedVersion?: string) => quitAndInstallUpdate(confirmedVersion));
++ipcMain.handle("featureBuilds:list", async () => []);
++ipcMain.handle("featureBuilds:getActive", async () => null);
++ipcMain.handle("updates:getStatus", (): UpdateStatus => ({ state: "idle", localBuild: true }));
++// Guard manual IPC paths too: hiding the automatic timer alone is insufficient.
++ipcMain.handle("updates:check", async () => {});
++ipcMain.handle("updates:returnHome", async () => {});
++ipcMain.handle("updates:download", async () => {});
++ipcMain.handle("updates:install", async () => {});
+ // Retry after a failed macOS preparation: Squirrel can't reset a stalled staging
+ // in-process, so restart AO like a manual quit-and-reopen. install-on-quit is
+ // already off on the failed path, so quitting can't apply a half-prepared build.
+@@ -3824,19 +3790,6 @@ app.on("second-instance", (_event, argv) => {
+ // (see forge.config.ts publishers). In dev there is no feed, so it is skipped.
+ // A live updater additionally requires a signed + notarized build — see
+ // frontend/docs/desktop-release.md.
+-function initAutoUpdates(): void {
+-	if (!app.isPackaged) return;
+-	const runFile = runFilePath();
+-	if (!runFile) return;
+-	const stateDir = path.dirname(runFile);
+-	// Route update pushes at the shell WebContents, the same target daemon status
+-	// uses. The shell is a BaseWindow + WebContentsView (#3750), which
+-	// BrowserWindow.getAllWindows() does not return, so the updater cannot find
+-	// the renderer on its own. Resolved lazily so a recreated window still gets
+-	// pushes.
+-	setRendererSink(() => getShellWebContents());
+-	void ensureUpdatePrefs(stateDir).then(() => startAutoUpdates(stateDir));
+-}
+ 
+ // Resolve the bundle path `ao start` will later `open` and stat as a usable app.
+ // On macOS process.execPath is .../Agent Orchestrator.app/Contents/MacOS/<exe>;
+@@ -3895,12 +3848,7 @@ app.whenReady().then(async () => {
+ 	applyUserAgentFallback(app);
+ 	powerMonitor.on("suspend", () => recordUpdateDiagnostic("power-suspend"));
+ 	powerMonitor.on("resume", () => recordUpdateDiagnostic("power-resume"));
+-	if (app.isPackaged) {
+-		const { checkDesktopVersionFloor } = await import("./main/desktop-version-floor");
+-		await checkDesktopVersionFloor().catch((err) =>
+-			console.warn("desktop version floor check failed:", err),
+-		);
+-	}
++
+ 	void refreshGitHubOwners();
+ 	const authority = new TelemetryPolicyAuthority({ dataDir: desktopDataDir, packagedDefault: app.isPackaged, platform: process.platform });
+ 	const policyController = new DesktopTelemetryController({
+@@ -3988,7 +3936,6 @@ app.whenReady().then(async () => {
+ 	await createWindow();
+ 	if (browserQuitRequested) return;
+ 	if (!daemonStartsWithWindow) void startDaemon();
+-	initAutoUpdates();
+ 
+ 	// Windows/Linux: on first launch, the deep-link URL may arrive as a
+ 	// process.argv entry (e.g. ao-app://callback?token=...).
+diff --git a/frontend/src/main/update-settings.ts b/frontend/src/main/update-settings.ts
+index d45ccfb..acead01 100644
+--- a/frontend/src/main/update-settings.ts
++++ b/frontend/src/main/update-settings.ts
+@@ -33,6 +33,8 @@ export type UpdateState =
+ 	"idle" | "checking" | "available" | "not-available" | "downloading" | "preparing" | "downloaded" | "error" | "unsupported";
+ 
+ export interface UpdateStatus {
++	/** This locally built fork has no published update service. */
++	localBuild?: boolean;
+ 	state: UpdateState;
+ 	version?: string;
+ 	/** Absent while a requested download is waiting for its first progress event. */
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index 175ef5d..cd63631 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -1,4 +1,5 @@
+ import {
++	act,
+ 	fireEvent,
+ 	render,
+ 	screen,
+@@ -14,7 +15,7 @@ vi.mock("../lib/api-client", () => ({ apiClient: api }));
+ vi.mock("./chat/ChatMarkdown", () => ({
+ 	ChatMarkdown: ({ text }: { text: string }) => <p>{text}</p>,
+ }));
+-const sessions = ["a", "b"].map(
++const sessions = ["a", "b", "c"].map(
+ 	(id) =>
+ 		({
+ 			id,
+@@ -26,16 +27,23 @@ const sessions = ["a", "b"].map(
+ );
+ let room: any;
+ function mount() {
+-	return render(
+-		<QueryClientProvider
+-			client={
+-				new QueryClient({ defaultOptions: { queries: { retry: false } } })
+-			}
+-		>
+-			<PeerRoom projectId="p" sessions={sessions} onManageSessions={() => {}} />
+-		</QueryClientProvider>,
+-	);
++	const client = new QueryClient({
++		defaultOptions: { queries: { retry: false } },
++	});
++	return {
++		...render(
++			<QueryClientProvider client={client}>
++				<PeerRoom
++					projectId="p"
++					sessions={sessions}
++					onManageSessions={() => {}}
++				/>
++			</QueryClientProvider>,
++		),
++		client,
++	};
+ }
++
+ beforeEach(() => {
+ 	vi.clearAllMocks();
+ 	sessionStorage.clear();
+@@ -174,11 +182,11 @@ it("retains an interrupted-send warning across remount without replay", async ()
+ it("rejects budget changes above the backend maximum", async () => {
+ 	mount();
+ 	await screen.findAllByText("原生回复");
+-	fireEvent.click(screen.getByText(/房间成员（/));
++	fireEvent.click(screen.getByText(/已加入房间：/));
+ 	fireEvent.change(screen.getByRole("spinbutton", { name: "总投递上限" }), {
+ 		target: { value: "101" },
+ 	});
+-	expect(screen.getByRole("button", { name: "保存成员" })).toBeDisabled();
++	expect(screen.getByRole("button", { name: /保存选择/ })).toBeDisabled();
+ 	expect(api.PUT).not.toHaveBeenCalled();
+ });
+ 
+@@ -242,5 +250,51 @@ it("adds multiple native members directly to the room without a message or impli
+ 		true,
+ 	);
+ 	expect(api.POST).toHaveBeenCalledTimes(2);
+-	await screen.findByText(/成员已加入房间/);
++	await screen.findByText(/已保存 4 位成员/);
++});
++
++it("distinguishes saved members from draft selections and saves explicitly", async () => {
++	mount();
++	await screen.findByText("本房间的消息");
++	fireEvent.click(screen.getAllByRole("checkbox")[2]);
++	expect(
++		screen.getByText(/有未保存修改：已加入 2 位，当前选择 3 位/),
++	).toBeInTheDocument();
++	expect(screen.getByText("待加入 · 未保存")).toBeInTheDocument();
++	expect(api.PUT).not.toHaveBeenCalled();
++	const reload = new Event("beforeunload", { cancelable: true });
++	window.dispatchEvent(reload);
++	expect(reload.defaultPrevented).toBe(true);
++	expect(
++		screen.getByRole("button", { name: "连接 / 更新同伴工具" }),
++	).toBeDisabled();
++	fireEvent.click(screen.getByRole("button", { name: "保存选择（3 位）" }));
++	await screen.findByText(/已保存 3 位成员/);
++	expect(room.members).toEqual(["a", "b", "c"]);
++	expect(screen.queryByText("待加入 · 未保存")).not.toBeInTheDocument();
++	expect(screen.getByRole("button", { name: "成员已保存" })).toBeDisabled();
++});
++it("keeps failed-save selections and detects a changed room before overwriting it", async () => {
++	const view = mount();
++	await screen.findByText("本房间的消息");
++	fireEvent.click(screen.getAllByRole("checkbox")[2]);
++	api.PUT.mockResolvedValueOnce({ error: { message: "保存失败" } });
++	fireEvent.click(screen.getByRole("button", { name: "保存选择（3 位）" }));
++	await screen.findByRole("alert");
++	expect(screen.getAllByRole("checkbox")[2]).toBeChecked();
++	room = { ...room, epoch: 2 };
++	await act(async () => {
++		await view.client.invalidateQueries({
++			queryKey: ["peer-room", "project-p"],
++		});
++	});
++	await screen.findByText(/房间已被其他操作更新/);
++	expect(
++		screen.getByRole("button", { name: "保存选择（3 位）" }),
++	).toBeDisabled();
++	fireEvent.click(
++		screen.getByRole("button", { name: "取消修改，载入已保存成员" }),
++	);
++	expect(screen.getAllByRole("checkbox")[2]).not.toBeChecked();
++	expect(api.PUT).toHaveBeenCalledTimes(1);
+ });
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index 4db8f37..551a94f 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -58,6 +58,8 @@ export function PeerRoom({
+ 	const cache = useQueryClient();
+ 	const key = ["peer-room", roomId];
+ 	const [draftMembers, setDraftMembers] = useState<string[] | null>(null);
++	const draftEpoch = useRef<number | null>(null);
++	const [saveNotice, setSaveNotice] = useState("");
+ 	const [draftBudget, setDraftBudget] = useState<number | null>(null);
+ 	const [text, setText] = useState("");
+ 	const [busy, setBusy] = useState(false);
+@@ -92,6 +94,41 @@ export function PeerRoom({
+ 	});
+ 	const members = room.data?.members ?? [];
+ 	const selected = draftMembers ?? members;
++	const membersDirty =
++		selected.length !== members.length ||
++		selected.some((id) => !members.includes(id));
++	const pendingChanges =
++		membersDirty ||
++		(draftBudget !== null && draftBudget !== (room.data?.budget ?? 24));
++	useEffect(() => {
++		if (!pendingChanges) return;
++		const warn = (event: BeforeUnloadEvent) => {
++			event.preventDefault();
++			event.returnValue = "";
++		};
++		window.addEventListener("beforeunload", warn);
++		return () => window.removeEventListener("beforeunload", warn);
++	}, [pendingChanges]);
++	useEffect(() => {
++		if (!pendingChanges) draftEpoch.current = null;
++	}, [pendingChanges, room.data?.epoch]);
++	const draftConflict =
++		pendingChanges &&
++		draftEpoch.current !== null &&
++		draftEpoch.current !== (room.data?.epoch ?? 0);
++	function editMembers(next: string[]) {
++		if (draftEpoch.current === null) draftEpoch.current = room.data?.epoch ?? 0;
++		setDraftMembers(next);
++		setSaveNotice("");
++	}
++	function discardDraft() {
++		setDraftMembers(null);
++		setDraftBudget(null);
++		draftEpoch.current = null;
++		setSaveNotice("");
++		setError("");
++	}
++
+ 	const eligible = sessions.filter(
+ 		(s) => !s.hostId && !s.isTerminated && s.mode === "chat",
+ 	);
+@@ -184,10 +221,11 @@ export function PeerRoom({
+ 		setBusy(true);
+ 		setError("");
+ 		try {
++			await cache.cancelQueries({ queryKey: key });
+ 			const body: Room = {
+ 				id: roomId,
+ 				projectId,
+-				epoch: room.data?.epoch ?? 0,
++				epoch: draftEpoch.current ?? room.data?.epoch ?? 0,
+ 				members: nextMembers,
+ 				paused,
+ 				budget: draftBudget ?? room.data?.budget ?? 24,
+@@ -201,6 +239,10 @@ export function PeerRoom({
+ 			cache.setQueryData(key, result.data);
+ 			setDraftMembers(null);
+ 			setDraftBudget(null);
++			draftEpoch.current = null;
++			setSaveNotice(
++				`已保存 ${result.data.members.length} 位成员。成员变更后请重新连接同伴工具。`,
++			);
+ 			return true;
+ 		} catch (e) {
+ 			setError(failure(e).message);
+@@ -260,6 +302,7 @@ export function PeerRoom({
+ 		room.data.used < room.data.budget &&
+ 		!room.isError &&
+ 		!busy &&
++		!pendingChanges &&
+ 		!uncertain &&
+ 		!!text.trim() &&
+ 		new TextEncoder().encode(text).length <= 2000;
+@@ -298,7 +341,7 @@ export function PeerRoom({
+ 					{room.data && (
+ 						<Button
+ 							variant="secondary"
+-							disabled={busy}
++							disabled={busy || pendingChanges}
+ 							onClick={() => configure(!room.data!.paused, members)}
+ 						>
+ 							{room.data.paused ? "恢复房间" : "暂停房间"}
+@@ -314,22 +357,64 @@ export function PeerRoom({
+ 					onClose={() => setAddingMembers(false)}
+ 					onAdded={async (ids) => {
+ 						const next = [...new Set([...selected, ...ids])];
+-						setDraftMembers(next);
++						editMembers(next);
+ 						if (next.length < 2)
+ 							return "已准备成员；请再添加一位或勾选已有会话，房间至少需要两位成员。";
+ 						if (!(await configure(room.data?.paused ?? false, next)))
+ 							throw new Error("房间保存未确认");
++						setAddingMembers(false);
+ 						return "成员已加入房间。点击「连接 / 更新同伴工具」后，即可向全体发送任务。";
+ 					}}
+ 				/>
+ 			)}
+ 			<details
+ 				className="border-b border-border p-4"
+-				open={!room.data || addingMembers}
++				open={!room.data || addingMembers || pendingChanges || !!saveNotice}
+ 			>
+ 				<summary className="cursor-pointer text-sm">
+-					房间成员（{members.length}）
++					已加入房间：{members.length} 位
++					{pendingChanges ? ` · 未保存选择：${selected.length} 位` : ""}
+ 				</summary>
++				<Button
++					disabled={
++						busy ||
++						draftConflict ||
++						(!!room.data && !pendingChanges) ||
++						room.isPending ||
++						room.isError ||
++						selected.length < 2 ||
++						selected.length > 16 ||
++						!Number.isInteger(draftBudget ?? 24) ||
++						(draftBudget !== null &&
++							(draftBudget < Math.max(1, room.data?.used ?? 0) ||
++								draftBudget > 100))
++					}
++					onClick={() => configure(room.data?.paused ?? false)}
++				>
++					{room.data
++						? pendingChanges
++							? `保存选择（${selected.length} 位）`
++							: "成员已保存"
++						: "创建项目房间"}
++				</Button>
++				{pendingChanges && (
++					<div
++						role="status"
++						className="my-3 rounded border border-border bg-secondary p-3 text-sm"
++					>
++						{draftConflict
++							? "房间已被其他操作更新。你的选择仍保留，请重新载入已保存成员后再修改。"
++							: `有未保存修改：已加入 ${members.length} 位，当前选择 ${selected.length} 位。请点击「保存选择」。保存前不会更改接收消息的成员。`}
++						<Button variant="quiet" disabled={busy} onClick={discardDraft}>
++							取消修改，载入已保存成员
++						</Button>
++					</div>
++				)}
++				{!pendingChanges && saveNotice && (
++					<p role="status" className="my-3 text-sm">
++						{saveNotice}
++					</p>
++				)}
+ 				<div className="mt-3 flex flex-wrap gap-3">
+ 					{eligible.map((s) => (
+ 						<label
+@@ -341,7 +426,7 @@ export function PeerRoom({
+ 								checked={selected.includes(s.id)}
+ 								disabled={busy}
+ 								onChange={(e) =>
+-									setDraftMembers(
++									editMembers(
+ 										e.target.checked
+ 											? [...selected, s.id]
+ 											: selected.filter((id) => id !== s.id),
+@@ -349,6 +434,15 @@ export function PeerRoom({
+ 								}
+ 							/>
+ 							{label(s.id)}
++							<span className="text-xs text-muted-foreground">
++								{members.includes(s.id)
++									? selected.includes(s.id)
++										? "已加入"
++										: "待移出 · 未保存"
++									: selected.includes(s.id)
++										? "待加入 · 未保存"
++										: "未加入"}
++							</span>
+ 						</label>
+ 					))}
+ 				</div>
+@@ -366,35 +460,24 @@ export function PeerRoom({
+ 						max={100}
+ 						value={draftBudget ?? room.data?.budget ?? 24}
+ 						disabled={busy}
+-						onChange={(e) => setDraftBudget(Number(e.target.value))}
++						onChange={(e) => {
++							if (draftEpoch.current === null)
++								draftEpoch.current = room.data?.epoch ?? 0;
++							setDraftBudget(Number(e.target.value));
++							setSaveNotice("");
++						}}
+ 						className="w-20 rounded border border-border bg-secondary p-2 focus-visible:ring-2 focus-visible:ring-ring"
+ 					/>
+ 				</label>
+ 				<p className="my-3 text-sm text-muted-foreground">
+ 					至少选择两位成员。加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员或恢复房间后，请点击连接按钮明确更新同伴工具授权。
+ 				</p>
+-				<Button
+-					disabled={
+-						busy ||
+-						room.isPending ||
+-						room.isError ||
+-						selected.length < 2 ||
+-						selected.length > 16 ||
+-						!Number.isInteger(draftBudget ?? 24) ||
+-						(draftBudget !== null &&
+-							(draftBudget < Math.max(1, room.data?.used ?? 0) ||
+-								draftBudget > 100))
+-					}
+-					onClick={() => configure(room.data?.paused ?? false)}
+-				>
+-					{room.data ? "保存成员" : "创建项目房间"}
+-				</Button>
+ 			</details>
+ 			{room.data && (
+ 				<div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
+ 					<Button
+ 						variant="secondary"
+-						disabled={busy || room.data.paused}
++						disabled={busy || room.data.paused || pendingChanges}
+ 						onClick={bindTools}
+ 					>
+ 						连接 / 更新同伴工具
+diff --git a/frontend/src/renderer/components/settings/UpdatesSection.test.tsx b/frontend/src/renderer/components/settings/UpdatesSection.test.tsx
+index 8f0bb8f..2ed24c8 100644
+--- a/frontend/src/renderer/components/settings/UpdatesSection.test.tsx
++++ b/frontend/src/renderer/components/settings/UpdatesSection.test.tsx
+@@ -287,3 +287,12 @@ it("focuses the status after a fast failure while the manual check action is sti
+ 	expect(screen.getByRole("button", { name: "Checking for updates…" })).toBeDisabled();
+ 	expect(screen.getByTestId("update-status-line")).toHaveFocus();
+ });
++
++it("shows local-build information without update or channel controls", async () => {
++ updGetStatus.mockResolvedValue({state:'idle',localBuild:true} satisfies UpdateStatus);
++ renderUpdates();
++ await screen.findByText('此版本通过本地构建安装，暂无在线更新服务。不会自动检查或下载更新。');
++ expect(screen.queryByRole('button',{name:/Check for updates/i})).not.toBeInTheDocument();
++ expect(settingsSet).not.toHaveBeenCalled();
++ expect(updDownload).not.toHaveBeenCalled();
++});
+diff --git a/frontend/src/renderer/components/settings/UpdatesSection.tsx b/frontend/src/renderer/components/settings/UpdatesSection.tsx
+index c4fcb86..b457105 100644
+--- a/frontend/src/renderer/components/settings/UpdatesSection.tsx
++++ b/frontend/src/renderer/components/settings/UpdatesSection.tsx
+@@ -252,6 +252,10 @@ export function UpdatesSection({ titleHidden }: { titleHidden?: boolean } = {})
+ 	// Show the escape hatch whenever a feature build is running or pinned.
+ 	const featurePr = activeBuild?.pr ?? (developerMode ? null : (form.feature?.pr ?? null));
+ 
++	if (status.localBuild) return <SettingsSection title="本地构建" sectionId="updates" titleHidden={titleHidden} grouped>
++        <p className="p-4 text-sm text-muted-foreground">此版本通过本地构建安装，暂无在线更新服务。不会自动检查或下载更新。</p>
++    </SettingsSection>;
++
+ 	return (
+ 		<>
+ 			<SettingsSection title={t("settings.updates.versionSection")} sectionId="updates" titleHidden={titleHidden} grouped>
+-- 
+2.54.0 (Apple Git-157)
+
