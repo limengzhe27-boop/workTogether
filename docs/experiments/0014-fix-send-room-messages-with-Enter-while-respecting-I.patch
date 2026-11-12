@@ -1,0 +1,87 @@
+From 152e4262e4193c33bd850ec992eeefb0d11eabd8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 15:44:10 +0800
+Subject: [PATCH] fix: send room messages with Enter while respecting IME
+ composition
+
+Keep Shift+Enter for newlines and preserve all send guards. Cover composition, repeated keys, whitespace and no automatic replay.
+---
+ .../src/renderer/components/PeerRoom.test.tsx | 30 +++++++++++++++++++
+ frontend/src/renderer/components/PeerRoom.tsx | 17 ++++++++++-
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index b7e489d..5a48ca3 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -327,3 +327,33 @@ it("updates receipts using the exact delivery id rather than another turn from t
+  await screen.findByText("a · codex (a)：本轮失败");
+  expect(api.POST).toHaveBeenCalledTimes(1);
+ });
++
++it("sends on Enter but preserves Shift+Enter and IME composition", async () => {
++	mount();
++	await screen.findAllByText("原生回复");
++	const input = screen.getByLabelText("群聊消息");
++	fireEvent.change(input, { target: { value: "键盘发送" } });
++	for (const options of [
++		{ shiftKey: true },
++		{ isComposing: true },
++		{ keyCode: 229 },
++		{ repeat: true },
++	]) {
++		fireEvent.keyDown(input, { key: "Enter", ...options });
++	}
++	expect(api.POST).not.toHaveBeenCalled();
++	fireEvent.keyDown(input, { key: "Enter" });
++	await waitFor(() => expect(api.POST).toHaveBeenCalledTimes(1));
++	expect(api.POST.mock.calls[0][1].body.message).toBe("键盘发送");
++	fireEvent.keyDown(input, { key: "Enter" });
++	expect(api.POST).toHaveBeenCalledTimes(1);
++});
++it("does not bypass send guards with Enter", async () => {
++	mount();
++	await screen.findAllByText("原生回复");
++	const input = screen.getByLabelText("群聊消息");
++	fireEvent.keyDown(input, { key: "Enter" });
++	fireEvent.change(input, { target: { value: "   " } });
++	fireEvent.keyDown(input, { key: "Enter" });
++	expect(api.POST).not.toHaveBeenCalled();
++});
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index f95a924..558ad4c 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -719,12 +719,27 @@ export function PeerRoom({
+ 							className="mt-2 min-h-24 w-full resize-y rounded-xl border border-border bg-secondary p-3 text-base outline-none focus-visible:ring-2 focus-visible:ring-ring"
+ 							value={text}
+ 							onChange={(e) => setText(e.target.value)}
++							onKeyDown={(e) => {
++								if (
++									e.key !== "Enter" ||
++									e.shiftKey ||
++									e.ctrlKey ||
++									e.altKey ||
++									e.metaKey ||
++									e.nativeEvent.isComposing ||
++									e.keyCode === 229 ||
++									e.repeat
++								)
++									return;
++								e.preventDefault();
++								if (canSend) void send();
++							}}
+ 							placeholder="说明你希望团队完成什么…"
+ 							disabled={busy || uncertain}
+ 						/>
+ 						<div className="mt-2 flex items-center justify-between gap-3">
+ 							<p className="text-xs text-muted-foreground">
+-								每位成员计一次投递；已接收不代表工作完成。
++								回车发送 · ⇧＋回车换行。每位成员计一次投递。
+ 								{new TextEncoder().encode(text).length > 2000
+ 									? "消息超过 2000 字节，请缩短。"
+ 									: ""}
+-- 
+2.54.0 (Apple Git-157)
+
