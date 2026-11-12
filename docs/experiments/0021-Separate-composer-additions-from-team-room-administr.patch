@@ -1,0 +1,808 @@
+From 7524261a22479653d88ca3c61c2a30a6c4cd4b7f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 20:34:29 +0800
+Subject: [PATCH] Separate composer additions from team room administration
+
+Use the native add menu pattern and compact member dialog; move room settings and tasks out of the transcript into explicit header actions. Disclose unsupported group attachments rather than imply delivery. Preserve membership saves and no-replay behavior, verified by 28 tests and typecheck.
+---
+ .../renderer/components/PeerMemberPicker.tsx  |  18 +-
+ .../src/renderer/components/PeerRoom.test.tsx |  65 ++-
+ frontend/src/renderer/components/PeerRoom.tsx | 529 ++++++++++--------
+ 3 files changed, 367 insertions(+), 245 deletions(-)
+
+diff --git a/frontend/src/renderer/components/PeerMemberPicker.tsx b/frontend/src/renderer/components/PeerMemberPicker.tsx
+index 85e3aac..c7a8a52 100644
+--- a/frontend/src/renderer/components/PeerMemberPicker.tsx
++++ b/frontend/src/renderer/components/PeerMemberPicker.tsx
+@@ -1,6 +1,7 @@
+ import { useState } from "react";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+ import { apiClient } from "../lib/api-client";
++import { AgentAvatar } from "./AgentAvatar";
+ import { Button } from "./ui/button";
+ 
+ const choices = [
+@@ -89,28 +90,29 @@ export function PeerMemberPicker({
+ 			className="border-b border-border bg-secondary/30 p-4"
+ 		>
+ 			<div className="flex items-center justify-between gap-3">
+-				<h2 className="font-medium">添加成员</h2>
++				<h2 className="text-sm font-medium">添加成员</h2>
+ 				<Button variant="quiet" disabled={busy} onClick={onClose}>
+ 					关闭
+ 				</Button>
+ 			</div>
+-			<p className="my-2 text-sm text-muted-foreground">
+-				选择每种智能体的人数，同一种也可以添加多位。只建立独立会话，不发送任务；客户端会启动并检查登录，权限沿用项目设置。
++			<p className="my-2 text-[12px] text-muted-foreground">
++				选择 Agent 和人数。创建独立会话，不发送任务；权限沿用项目设置。
+ 			</p>
+ 			{readiness.isError && (
+ 				<p role="alert">无法读取客户端状态，请关闭后重试。</p>
+ 			)}
+-			<div className="grid gap-3 sm:grid-cols-3">
++			<div className="grid gap-1">
+ 				{choices.map((choice) => {
+ 					const state = readiness.data?.find((a) => a.id === choice.id);
+ 					const missing = state?.installation.state === "not_installed";
+ 					return (
+ 						<label
+ 							key={choice.id}
+-							className="flex flex-col gap-2 rounded border border-border p-3"
++							className="grid grid-cols-[20px_1fr_64px] items-center gap-x-3 gap-y-1 rounded-lg px-2 py-2"
+ 						>
+-							<span>{choice.label}</span>
+-							<span className="text-xs text-muted-foreground">
++							<AgentAvatar provider={choice.id} className="size-5" decorative />
++							<span className="text-[12px]">{choice.label}</span>
++							<span className="col-start-2 row-start-2 text-[11px] text-muted-foreground">
+ 								{missing
+ 									? "未找到本机命令，暂不可添加"
+ 									: state?.effectiveReadiness === "ready"
+@@ -130,7 +132,7 @@ export function PeerMemberPicker({
+ 									readiness.isPending ||
+ 									readiness.isError
+ 								}
+-								className="w-20 rounded border border-border bg-background p-2"
++								className="col-start-3 row-start-1 row-span-2 h-7 w-16 rounded-md border border-border bg-background px-2 text-[12px]"
+ 								onChange={(e) =>
+ 									setCounts((old) => ({
+ 										...old,
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index e499e19..d081b62 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -8,6 +8,7 @@ import {
+ } from "@testing-library/react";
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import userEvent from "@testing-library/user-event";
+ import { PeerRoom } from "./PeerRoom";
+ import type { WorkspaceSession } from "../types/workspace";
+ const api = vi.hoisted(() => ({ GET: vi.fn(), PUT: vi.fn(), POST: vi.fn() }));
+@@ -136,6 +137,10 @@ it("broadcasts once to same-provider sessions and blocks replay of uncertain del
+ it("creates a room with selected session IDs and restores server history on remount", async () => {
+ 	room = null;
+ 	const first = mount();
++	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
++	await userEvent.click(
++		await screen.findByRole("menuitem", { name: "房间设置" }),
++	);
+ 	await screen.findByText("创建项目房间");
+ 	fireEvent.click(screen.getAllByRole("checkbox")[0]);
+ 	fireEvent.click(screen.getAllByRole("checkbox")[1]);
+@@ -149,8 +154,11 @@ it("creates a room with selected session IDs and restores server history on remo
+ it("pauses without altering members and disables sending", async () => {
+ 	mount();
+ 	await screen.findAllByText("原生回复");
+-	fireEvent.click(screen.getByRole("button", { name: "暂停房间" }));
+-	await screen.findByRole("button", { name: "恢复房间" });
++	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
++	await userEvent.click(
++		await screen.findByRole("menuitem", { name: "暂停房间" }),
++	);
++	await waitFor(() => expect(api.PUT).toHaveBeenCalledTimes(1));
+ 	expect(api.PUT.mock.calls[0][1].body).toMatchObject({
+ 		paused: true,
+ 		members: ["a", "b"],
+@@ -168,6 +176,10 @@ it("does not turn a failed room lookup into a new room", async () => {
+ 	});
+ 	mount();
+ 	await screen.findByRole("alert");
++	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
++	await userEvent.click(
++		await screen.findByRole("menuitem", { name: "房间设置" }),
++	);
+ 	expect(screen.getByRole("button", { name: "创建项目房间" })).toBeDisabled();
+ 	expect(api.PUT).not.toHaveBeenCalled();
+ });
+@@ -182,7 +194,10 @@ it("retains an interrupted-send warning across remount without replay", async ()
+ it("rejects budget changes above the backend maximum", async () => {
+ 	mount();
+ 	await screen.findAllByText("原生回复");
+-	fireEvent.click(screen.getByRole("button", { name: "房间设置" }));
++	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
++	await userEvent.click(
++		await screen.findByRole("menuitem", { name: "房间设置" }),
++	);
+ 	fireEvent.click(screen.getByText(/已加入房间：/));
+ 	fireEvent.change(screen.getByRole("spinbutton", { name: "总投递上限" }), {
+ 		target: { value: "101" },
+@@ -210,7 +225,10 @@ it("renders exact correlated replies in the room and grants tools only on explic
+ 	mount();
+ 	await screen.findByText("准确关联的回复");
+ 	expect(api.POST).not.toHaveBeenCalled();
+-	fireEvent.click(screen.getByRole("button", { name: "房间设置" }));
++	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
++	await userEvent.click(
++		await screen.findByRole("menuitem", { name: "房间设置" }),
++	);
+ 	fireEvent.click(screen.getByRole("button", { name: "连接 / 更新同伴工具" }));
+ 	await waitFor(() => expect(api.POST).toHaveBeenCalledTimes(1));
+ 	expect(api.POST.mock.calls[0][0]).toContain("/bind");
+@@ -240,7 +258,10 @@ it("adds multiple native members directly to the room without a message or impli
+ 	}));
+ 	mount();
+ 	await screen.findByText("本房间的消息");
+-	fireEvent.click(screen.getByRole("button", { name: "添加成员" }));
++	await userEvent.click(screen.getByRole("button", { name: "添加" }));
++	await userEvent.click(
++		await screen.findByRole("menuitem", { name: /添加 Agent/ }),
++	);
+ 	await waitFor(() =>
+ 		expect(screen.getByLabelText("Codex 人数")).toBeEnabled(),
+ 	);
+@@ -254,13 +275,20 @@ it("adds multiple native members directly to the room without a message or impli
+ 		true,
+ 	);
+ 	expect(api.POST).toHaveBeenCalledTimes(2);
+-	await screen.findByText(/已保存 4 位成员/);
++	await waitFor(() =>
++		expect(
++			screen.queryByRole("dialog", { name: "添加 Agent" }),
++		).not.toBeInTheDocument(),
++	);
+ });
+ 
+ it("distinguishes saved members from draft selections and saves explicitly", async () => {
+ 	mount();
+ 	await screen.findByText("本房间的消息");
+-	fireEvent.click(screen.getByRole("button", { name: "房间设置" }));
++	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
++	await userEvent.click(
++		await screen.findByRole("menuitem", { name: "房间设置" }),
++	);
+ 	fireEvent.click(screen.getByText(/已加入房间：/));
+ 	fireEvent.click(screen.getAllByRole("checkbox")[2]);
+ 	expect(
+@@ -283,7 +311,10 @@ it("distinguishes saved members from draft selections and saves explicitly", asy
+ it("keeps failed-save selections and detects a changed room before overwriting it", async () => {
+ 	const view = mount();
+ 	await screen.findByText("本房间的消息");
+-	fireEvent.click(screen.getByRole("button", { name: "房间设置" }));
++	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
++	await userEvent.click(
++		await screen.findByRole("menuitem", { name: "房间设置" }),
++	);
+ 	fireEvent.click(screen.getByText(/已加入房间：/));
+ 	fireEvent.click(screen.getAllByRole("checkbox")[2]);
+ 	api.PUT.mockResolvedValueOnce({ error: { message: "保存失败" } });
+@@ -406,3 +437,21 @@ it("does not bypass send guards with Enter", async () => {
+ 	fireEvent.keyDown(input, { key: "Enter" });
+ 	expect(api.POST).not.toHaveBeenCalled();
+ });
++
++it("keeps room administration out of the composer and discloses unavailable attachments", async () => {
++	mount();
++	await screen.findByText("本房间的消息");
++	expect(
++		screen.queryByRole("button", { name: "房间设置" }),
++	).not.toBeInTheDocument();
++	expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++	await userEvent.click(screen.getByRole("button", { name: "添加" }));
++	expect(await screen.findByRole("menuitem", { name: /文件/ })).toHaveAttribute(
++		"aria-disabled",
++		"true",
++	);
++	expect(
++		screen.getByRole("menuitem", { name: /添加 Agent/ }),
++	).toBeInTheDocument();
++	expect(api.POST).not.toHaveBeenCalled();
++});
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index f932193..2777861 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -1,5 +1,16 @@
+ import { PeerAccessControl } from "./PeerAccessControl";
+-import { Plus, SlidersHorizontal, ArrowUp } from "lucide-react";
++import {
++	Plus,
++	MoreHorizontal,
++	ArrowUp,
++	Paperclip,
++	UserPlus,
++	Settings2,
++	ListTodo,
++	PanelsTopLeft,
++	Pause,
++	Play,
++} from "lucide-react";
+ import { PeerAgentSettings } from "./PeerAgentSettings";
+ import { PeerTimeline } from "./PeerTimeline";
+ import { PeerMemberPicker } from "./PeerMemberPicker";
+@@ -9,6 +20,14 @@ import type { components } from "../../api/schema";
+ import { apiClient } from "../lib/api-client";
+ import type { WorkspaceSession } from "../types/workspace";
+ import { Button } from "./ui/button";
++import {
++	OptionMenu,
++	OptionMenuTrigger,
++	OptionMenuContent,
++	OptionMenuItem,
++} from "./ui/option-menu";
++import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
++import { ComposerMenuRow } from "./chat/TurnSettingsBar";
+ import { PeerTasks } from "./PeerTasks";
+ import { ChatMarkdown } from "./chat/ChatMarkdown";
+ 
+@@ -71,6 +90,7 @@ export function PeerRoom({
+ 	const [settingsOpen, setSettingsOpen] = useState(false);
+ 	const [names, setNames] = useState<Record<string, string>>({});
+ 	const [addingMembers, setAddingMembers] = useState(false);
++	const [tasksOpen, setTasksOpen] = useState(false);
+ 	const [error, setError] = useState("");
+ 	const history = useRef<HTMLDivElement>(null);
+ 	const followLatest = useRef(true);
+@@ -356,44 +376,49 @@ export function PeerRoom({
+ 						项目群聊
+ 					</h1>
+ 				</div>
+-				<div className="flex gap-2">
+-					<Button
+-						size="sm"
+-						variant="quiet"
+-						disabled={
+-							busy ||
+-							addingMembers ||
+-							room.isPending ||
+-							room.isError ||
+-							selected.length >= 16
+-						}
+-						onClick={() => {
+-							setSettingsOpen(true);
+-							setAddingMembers(true);
+-							if (history.current) history.current.scrollTop = 0;
+-						}}
++				<OptionMenu>
++					<OptionMenuTrigger
++						showCaret={false}
++						aria-label="群聊菜单"
++						title="群聊菜单"
++						className="size-7 justify-center rounded-full p-0 text-muted-foreground"
+ 					>
+-						添加成员
+-					</Button>
+-					<Button
+-						variant="quiet"
+-						size="sm"
+-						disabled={busy}
+-						onClick={onManageSessions}
++						<MoreHorizontal className="size-3.5" />
++					</OptionMenuTrigger>
++					<OptionMenuContent
++						align="end"
++						className="chat-settings-menu w-56 text-[12px]!"
+ 					>
+-						会话看板
+-					</Button>
+-					{room.data && (
+-						<Button
+-							variant="quiet"
+-							size="sm"
+-							disabled={busy || pendingChanges}
+-							onClick={() => configure(!room.data!.paused, members)}
++						<OptionMenuItem onSelect={() => setSettingsOpen(true)}>
++							<Settings2 className="mr-2 size-3.5" />
++							房间设置
++						</OptionMenuItem>
++						<OptionMenuItem
++							disabled={!room.data}
++							onSelect={() => setTasksOpen(true)}
+ 						>
+-							{room.data.paused ? "恢复房间" : "暂停房间"}
+-						</Button>
+-					)}
+-				</div>
++							<ListTodo className="mr-2 size-3.5" />
++							团队任务
++						</OptionMenuItem>
++						<OptionMenuItem disabled={busy} onSelect={onManageSessions}>
++							<PanelsTopLeft className="mr-2 size-3.5" />
++							会话看板
++						</OptionMenuItem>
++						{room.data && (
++							<OptionMenuItem
++								disabled={busy || pendingChanges}
++								onSelect={() => void configure(!room.data!.paused, members)}
++							>
++								{room.data.paused ? (
++									<Play className="mr-2 size-3.5" />
++								) : (
++									<Pause className="mr-2 size-3.5" />
++								)}
++								{room.data.paused ? "恢复房间" : "暂停房间"}
++							</OptionMenuItem>
++						)}
++					</OptionMenuContent>
++				</OptionMenu>
+ 			</header>
+ 			<div
+ 				ref={history}
+@@ -405,182 +430,219 @@ export function PeerRoom({
+ 				className="min-h-0 flex-1 overflow-y-auto"
+ 				aria-label="群聊内容"
+ 			>
+-				<div
+-					hidden={
+-						!settingsOpen && !addingMembers && !pendingChanges && !!room.data
+-					}
++				<Dialog
++					open={addingMembers}
++					onOpenChange={(value) => {
++						if (!busy) setAddingMembers(value);
++					}}
+ 				>
+-					{addingMembers && (
+-						<PeerMemberPicker
+-							onBusyChange={setBusy}
+-							projectId={projectId}
+-							selectedCount={selected.length}
+-							onClose={() => setAddingMembers(false)}
+-							onAdded={async (ids) => {
+-								const next = [...new Set([...selected, ...ids])];
+-								editMembers(next);
+-								if (next.length < 2)
+-									return "已准备成员；请再添加一位或勾选已有会话，房间至少需要两位成员。";
+-								if (!(await configure(room.data?.paused ?? false, next)))
+-									throw new Error("房间保存未确认");
+-								setAddingMembers(false);
+-								return "成员已加入房间。在下方查看接收人并发送新任务。";
+-							}}
+-						/>
+-					)}
+-					<details
+-						className="border-b border-border p-4"
+-						open={!room.data || addingMembers || pendingChanges || !!saveNotice}
++					<DialogContent
++						showCloseButton={false}
++						className="max-w-md max-h-[80dvh] overflow-y-auto p-0"
++						aria-describedby={undefined}
+ 					>
+-						<summary className="cursor-pointer text-sm">
+-							已加入房间：{members.length} 位
+-							{pendingChanges ? ` · 未保存选择：${selected.length} 位` : ""}
+-						</summary>
+-						<Button
+-							disabled={
+-								busy ||
+-								draftConflict ||
+-								(!!room.data && !pendingChanges) ||
+-								room.isPending ||
+-								room.isError ||
+-								selected.length < 2 ||
+-								selected.length > 16 ||
+-								!Number.isInteger(draftBudget ?? 24) ||
+-								(draftBudget !== null &&
+-									(draftBudget < Math.max(1, room.data?.used ?? 0) ||
+-										draftBudget > 100))
+-							}
+-							onClick={() => configure(room.data?.paused ?? false)}
+-						>
+-							{room.data
+-								? pendingChanges
+-									? `保存选择（${selected.length} 位）`
+-									: "成员已保存"
+-								: "创建项目房间"}
+-						</Button>
+-						{pendingChanges && (
+-							<div
+-								role="status"
+-								className="my-3 rounded border border-border bg-secondary p-3 text-sm"
+-							>
+-								{draftConflict
+-									? "房间已被其他操作更新。你的选择仍保留，请重新载入已保存成员后再修改。"
+-									: `有未保存修改：已加入 ${members.length} 位，当前选择 ${selected.length} 位。请点击「保存选择」。保存前不会更改接收消息的成员。`}
+-								<Button variant="quiet" disabled={busy} onClick={discardDraft}>
+-									取消修改，载入已保存成员
+-								</Button>
+-							</div>
++						<DialogTitle className="sr-only">添加 Agent</DialogTitle>
++						{addingMembers && (
++							<PeerMemberPicker
++								onBusyChange={setBusy}
++								projectId={projectId}
++								selectedCount={selected.length}
++								onClose={() => setAddingMembers(false)}
++								onAdded={async (ids) => {
++									const next = [...new Set([...selected, ...ids])];
++									editMembers(next);
++									if (next.length < 2)
++										return "已准备成员；请再添加一位或勾选已有会话，房间至少需要两位成员。";
++									if (!(await configure(room.data?.paused ?? false, next)))
++										throw new Error("房间保存未确认");
++									setAddingMembers(false);
++									return "成员已加入房间。在下方查看接收人并发送新任务。";
++								}}
++							/>
+ 						)}
+-						{!pendingChanges && saveNotice && (
+-							<p role="status" className="my-3 text-sm">
+-								{saveNotice}
++					</DialogContent>
++				</Dialog>
++				<Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
++					<DialogContent
++						className="max-w-xl max-h-[80dvh] overflow-y-auto p-0"
++						aria-describedby={undefined}
++					>
++						<DialogTitle className="px-4 pt-4 text-sm">群聊设置</DialogTitle>
++						{error && (
++							<p role="alert" className="px-4 text-sm text-destructive">
++								{error}
+ 							</p>
+ 						)}
+-						<div className="mt-3 flex flex-wrap gap-3">
+-							{eligible.map((s) => (
+-								<label
+-									key={s.id}
+-									className="flex min-h-11 items-center gap-2 text-sm"
++
++						<details
++							className="border-b border-border p-4"
++							open={
++								!room.data || addingMembers || pendingChanges || !!saveNotice
++							}
++						>
++							<summary className="cursor-pointer text-sm">
++								已加入房间：{members.length} 位
++								{pendingChanges ? ` · 未保存选择：${selected.length} 位` : ""}
++							</summary>
++							<Button
++								disabled={
++									busy ||
++									draftConflict ||
++									(!!room.data && !pendingChanges) ||
++									room.isPending ||
++									room.isError ||
++									selected.length < 2 ||
++									selected.length > 16 ||
++									!Number.isInteger(draftBudget ?? 24) ||
++									(draftBudget !== null &&
++										(draftBudget < Math.max(1, room.data?.used ?? 0) ||
++											draftBudget > 100))
++								}
++								onClick={() => configure(room.data?.paused ?? false)}
++							>
++								{room.data
++									? pendingChanges
++										? `保存选择（${selected.length} 位）`
++										: "成员已保存"
++									: "创建项目房间"}
++							</Button>
++							{pendingChanges && (
++								<div
++									role="status"
++									className="my-3 rounded border border-border bg-secondary p-3 text-sm"
+ 								>
+-									<input
+-										type="checkbox"
+-										checked={selected.includes(s.id)}
++									{draftConflict
++										? "房间已被其他操作更新。你的选择仍保留，请重新载入已保存成员后再修改。"
++										: `有未保存修改：已加入 ${members.length} 位，当前选择 ${selected.length} 位。请点击「保存选择」。保存前不会更改接收消息的成员。`}
++									<Button
++										variant="quiet"
+ 										disabled={busy}
+-										onChange={(e) =>
+-											editMembers(
+-												e.target.checked
+-													? [...selected, s.id]
+-													: selected.filter((id) => id !== s.id),
+-											)
+-										}
+-									/>
+-									{label(s.id)}
+-									<span className="text-xs text-muted-foreground">
+-										{members.includes(s.id)
+-											? selected.includes(s.id)
+-												? "已加入"
+-												: "待移出 · 未保存"
+-											: selected.includes(s.id)
+-												? "待加入 · 未保存"
+-												: "未加入"}
+-									</span>
+-								</label>
+-							))}
+-						</div>
+-						{!eligible.length && (
+-							<p className="my-2 text-sm">
+-								点击上方「添加成员」，选择客户端及人数，无需先发一条任务。
++										onClick={discardDraft}
++									>
++										取消修改，载入已保存成员
++									</Button>
++								</div>
++							)}
++							{!pendingChanges && saveNotice && (
++								<p role="status" className="my-3 text-sm">
++									{saveNotice}
++								</p>
++							)}
++							<div className="mt-3 flex flex-wrap gap-3">
++								{eligible.map((s) => (
++									<label
++										key={s.id}
++										className="flex min-h-11 items-center gap-2 text-sm"
++									>
++										<input
++											type="checkbox"
++											checked={selected.includes(s.id)}
++											disabled={busy}
++											onChange={(e) =>
++												editMembers(
++													e.target.checked
++														? [...selected, s.id]
++														: selected.filter((id) => id !== s.id),
++												)
++											}
++										/>
++										{label(s.id)}
++										<span className="text-xs text-muted-foreground">
++											{members.includes(s.id)
++												? selected.includes(s.id)
++													? "已加入"
++													: "待移出 · 未保存"
++												: selected.includes(s.id)
++													? "待加入 · 未保存"
++													: "未加入"}
++										</span>
++									</label>
++								))}
++							</div>
++							{!eligible.length && (
++								<p className="my-2 text-sm">
++									点击上方「添加成员」，选择客户端及人数，无需先发一条任务。
++								</p>
++							)}
++							<label className="mt-3 flex items-center gap-2 text-sm">
++								总投递上限
++								<input
++									aria-label="总投递上限"
++									type="number"
++									min={Math.max(1, room.data?.used ?? 0)}
++									max={100}
++									value={draftBudget ?? room.data?.budget ?? 24}
++									disabled={busy}
++									onChange={(e) => {
++										if (draftEpoch.current === null)
++											draftEpoch.current = room.data?.epoch ?? 0;
++										setDraftBudget(Number(e.target.value));
++										setSaveNotice("");
++									}}
++									className="w-20 rounded border border-border bg-secondary p-2 focus-visible:ring-2 focus-visible:ring-ring"
++								/>
++							</label>
++							<p className="my-3 text-sm text-muted-foreground">
++								至少选择两位成员。加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员或恢复房间后，请点击连接按钮明确更新同伴工具授权。
+ 							</p>
++						</details>
++						{room.data && (
++							<div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
++								<Button
++									variant="secondary"
++									disabled={busy || room.data.paused || pendingChanges}
++									onClick={bindTools}
++								>
++									连接 / 更新同伴工具
++								</Button>
++								<p className="text-xs text-muted-foreground">
++									{
++										members.filter(
++											(_, i) =>
++												bindings[i]?.data?.roomId === roomId &&
++												bindings[i]?.data?.epoch === room.data?.epoch,
++										).length
++									}{" "}
++									/ {members.length} 位成员已授权当前房间。此操作不会启动模型。
++								</p>
++							</div>
+ 						)}
+-						<label className="mt-3 flex items-center gap-2 text-sm">
+-							总投递上限
+-							<input
+-								aria-label="总投递上限"
+-								type="number"
+-								min={Math.max(1, room.data?.used ?? 0)}
+-								max={100}
+-								value={draftBudget ?? room.data?.budget ?? 24}
+-								disabled={busy}
+-								onChange={(e) => {
+-									if (draftEpoch.current === null)
+-										draftEpoch.current = room.data?.epoch ?? 0;
+-									setDraftBudget(Number(e.target.value));
+-									setSaveNotice("");
+-								}}
+-								className="w-20 rounded border border-border bg-secondary p-2 focus-visible:ring-2 focus-visible:ring-ring"
++						{unavailableMembers.length > 0 && (
++							<div role="status" className="border-b border-border p-4 text-sm">
++								<p>
++									以下成员暂不可用，本次跳过。可用成员仍可接收新消息，不会自动恢复或补发。
++								</p>
++								{unavailableMembers.map(({ id, issue }) => (
++									<div key={id} className="my-2">
++										{label(id)}：{issue}
++										{onOpenSession && (
++											<Button variant="quiet" onClick={() => onOpenSession(id)}>
++												打开原生会话检查
++											</Button>
++										)}
++									</div>
++								))}
++							</div>
++						)}
++					</DialogContent>
++				</Dialog>
++				<Dialog open={tasksOpen} onOpenChange={setTasksOpen}>
++					<DialogContent
++						className="max-w-xl max-h-[80dvh] overflow-y-auto p-0"
++						aria-describedby={undefined}
++					>
++						<DialogTitle className="px-4 pt-4 text-sm">团队任务</DialogTitle>
++
++						{room.data && (
++							<PeerTasks
++								key={roomId}
++								roomId={roomId}
++								epoch={room.data.epoch}
++								paused={room.data.paused}
+ 							/>
+-						</label>
+-						<p className="my-3 text-sm text-muted-foreground">
+-							至少选择两位成员。加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员或恢复房间后，请点击连接按钮明确更新同伴工具授权。
+-						</p>
+-					</details>
+-					{room.data && (
+-						<div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
+-							<Button
+-								variant="secondary"
+-								disabled={busy || room.data.paused || pendingChanges}
+-								onClick={bindTools}
+-							>
+-								连接 / 更新同伴工具
+-							</Button>
+-							<p className="text-xs text-muted-foreground">
+-								{
+-									members.filter(
+-										(_, i) =>
+-											bindings[i]?.data?.roomId === roomId &&
+-											bindings[i]?.data?.epoch === room.data?.epoch,
+-									).length
+-								}{" "}
+-								/ {members.length} 位成员已授权当前房间。此操作不会启动模型。
+-							</p>
+-						</div>
+-					)}
+-					{unavailableMembers.length > 0 && (
+-						<div role="status" className="border-b border-border p-4 text-sm">
+-							<p>
+-								以下成员暂不可用，本次跳过。可用成员仍可接收新消息，不会自动恢复或补发。
+-							</p>
+-							{unavailableMembers.map(({ id, issue }) => (
+-								<div key={id} className="my-2">
+-									{label(id)}：{issue}
+-									{onOpenSession && (
+-										<Button variant="quiet" onClick={() => onOpenSession(id)}>
+-											打开原生会话检查
+-										</Button>
+-									)}
+-								</div>
+-							))}
+-						</div>
+-					)}
+-					{room.data && (
+-						<PeerTasks
+-							key={roomId}
+-							roomId={roomId}
+-							epoch={room.data.epoch}
+-							paused={room.data.paused}
+-						/>
+-					)}
+-				</div>
++						)}
++					</DialogContent>
++				</Dialog>
+ 				{(error || room.isError) && (
+ 					<p role="alert" className="p-4 text-destructive">
+ 						{error || failure(room.error).message}
+@@ -726,20 +788,42 @@ export function PeerRoom({
+ 							disabled={busy || uncertain || settingsBusy}
+ 						/>
+ 						<div className="flex items-center gap-1 pt-1">
+-							<button
+-								type="button"
+-								aria-label="添加新成员"
+-								title="添加成员"
+-								className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg hover:bg-background focus-visible:ring-2 focus-visible:ring-ring"
+-								disabled={busy || settingsBusy}
+-								onClick={() => {
+-									setAddingMembers(true);
+-									setSettingsOpen(true);
+-									if (history.current) history.current.scrollTop = 0;
+-								}}
+-							>
+-								<Plus className="size-4" />
+-							</button>
++							<OptionMenu>
++								<OptionMenuTrigger
++									showCaret={false}
++									disabled={busy || settingsBusy}
++									aria-label="添加"
++									title="添加内容或 Agent"
++									className="size-7 shrink-0 justify-center rounded-full bg-transparent p-0 text-muted-foreground hover:text-foreground"
++								>
++									<Plus className="size-3.5" />
++								</OptionMenuTrigger>
++								<OptionMenuContent
++									side="top"
++									align="start"
++									className="chat-settings-menu w-64 text-[12px]!"
++								>
++									<ComposerMenuRow
++										icon={Paperclip}
++										title="文件"
++										description="群聊附件尚未接通，请在原生会话添加"
++										disabled
++										onSelect={() => {}}
++									/>
++									<ComposerMenuRow
++										icon={UserPlus}
++										title="添加 Agent"
++										description="加入独立会话，同一种 Agent 可添加多位"
++										disabled={
++											busy ||
++											room.isPending ||
++											room.isError ||
++											selected.length >= 16
++										}
++										onSelect={() => setAddingMembers(true)}
++									/>
++								</OptionMenuContent>
++							</OptionMenu>
+ 							<PeerAccessControl
+ 								sessions={members.flatMap((id) => {
+ 									const session = sessions.find((s) => s.id === id);
+@@ -748,19 +832,6 @@ export function PeerRoom({
+ 								disabled={busy || settingsBusy}
+ 								onBusyChange={setSettingsBusy}
+ 							/>
+-							<button
+-								type="button"
+-								aria-label="房间设置"
+-								title="房间设置"
+-								aria-expanded={settingsOpen}
+-								className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg hover:bg-background focus-visible:ring-2 focus-visible:ring-ring"
+-								onClick={() => {
+-									setSettingsOpen(!settingsOpen);
+-									if (history.current) history.current.scrollTop = 0;
+-								}}
+-							>
+-								<SlidersHorizontal className="size-3.5" />
+-							</button>
+ 							<div
+ 								className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto"
+ 								aria-label="项目成员"
+-- 
+2.54.0 (Apple Git-157)
+
