@@ -1,0 +1,65 @@
+{
+  "date": "2026-11-13",
+  "sourceCommit": "166c6dbe4425",
+  "test": "WT-ATTACH-1113",
+  "entry": "Installed desktop app: plus → files → select TXT and PNG → Enter",
+  "tests": {
+    "renderer": 41,
+    "typecheck": "passed",
+    "backend": [
+      "session service",
+      "SQLite",
+      "HTTP including spec drift",
+      "session manager attachment tests"
+    ],
+    "package": "passed"
+  },
+  "members": [
+    {
+      "id": "worktogether-2",
+      "promptCount": 1,
+      "controller": "ready",
+      "filesOnDisk": [
+        {
+          "path": ".ao/attachments/attachment-a344a5a55691b2d9ef1789bce3ba8360.txt",
+          "bytes": 70,
+          "sha256": "a5ab5b5f8a18c95dc387d92bf4baf02fa9604fdca52217a6c9de9d0e10e3dfa9"
+        },
+        {
+          "path": ".ao/attachments/attachment-6031221bd9598e182665fefadfe24498.png",
+          "bytes": 854,
+          "sha256": "b61ea84350403b7287923dfa14d8560b5b71d266069e2ecc33d75ace07fb7192"
+        }
+      ],
+      "finalReply": "会话：`worktogether-2`。已实际读取文本，并用原生图像工具查看 PNG。\n\n- 文本：token `WT-FILE-7391`；item `apricot`；quantity `7`。\n- 图片：左侧红色矩形，右侧蓝色圆形，浅色背景。\n- 实算 SHA256 均与提供值一致：\n  - TXT：`a5ab5b5f8a18c95dc387d92bf4baf02fa9604fdca52217a6c9de9d0e10e3dfa9`\n  - PNG：`b61ea84350403b7287923dfa14d8560b5b71d266069e2ecc33d75ace07fb7192`\n\n全程只读，未修改文件、访问网站或联系同伴。",
+      "imageResult": "correct red rectangle / blue circle"
+    },
+    {
+      "id": "worktogether-3",
+      "promptCount": 1,
+      "controller": "ready",
+      "filesOnDisk": [
+        {
+          "path": ".ao/attachments/attachment-808a37310ade2b5e559acf48d7b94f9c.txt",
+          "bytes": 70,
+          "sha256": "a5ab5b5f8a18c95dc387d92bf4baf02fa9604fdca52217a6c9de9d0e10e3dfa9"
+        },
+        {
+          "path": ".ao/attachments/attachment-b878b0c0e321ea608c376cd69e6a620a.png",
+          "bytes": 854,
+          "sha256": "b61ea84350403b7287923dfa14d8560b5b71d266069e2ecc33d75ace07fb7192"
+        }
+      ],
+      "finalReply": "会话编号 `worktogether-3`。只读结果：\n\n**文本文件**（SHA256 实测 `a5ab5b5f…e10e3dfa9`，与给定值一致）\n- Token: `WT-FILE-7391`\n- Item: `apricot`\n- Quantity: `7`\n\n**PNG 文件**（SHA256 实测 `b61ea843…5ace07fb7192`，与给定值一致）\n- **无法查看图片**：当前模型 `deepseek-v4-flash` 未声明图像输入能力，`read_image` 明确返回“cannot read … as an image”，因此我不能描述左右形状与颜色，也不做猜测。\n\n我未修改任何文件、未访问外部网站、未向同伴发消息。",
+      "imageResult": "native read_image rejected deepseek-v4-flash image capability"
+    }
+  ],
+  "limitations": [
+    "DeepSeek deepseek-v4-flash receives image bytes but cannot interpret images; native read_image returned an explicit unsupported-model error.",
+    "Antigravity image reading not verified in this test.",
+    "No automatic replay; stopped member excluded; no permissions expanded.",
+    "History lists attachment names, sizes and hashes; no inline history image viewer or download button in this batch."
+  ],
+  "budgetBefore": 13,
+  "budgetAfter": 15
+}

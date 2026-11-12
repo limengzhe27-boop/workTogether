@@ -1,0 +1,982 @@
+From 166c6dbe442560a8cbaad28731984a2358b40926 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 01:20:19 +0800
+Subject: [PATCH] feat: deliver group attachments into each native session
+ without replay
+
+Reuse native attachment validation and staging, persist content hashes in delivery receipts, and keep rejected drafts editable. Cover per-recipient failures, idempotency, decoding, history persistence, and composer uploads with service, storage, HTTP and renderer tests.
+---
+ backend/internal/domain/peer_room.go          |  44 ++++---
+ backend/internal/httpd/apispec/openapi.yaml   |  41 ++++++
+ .../controllers/peer_attachments_test.go      |  40 ++++++
+ .../internal/httpd/controllers/peer_rooms.go  |  12 +-
+ .../service/session/peer_broadcast.go         |  58 +++++++--
+ .../service/session/peer_broadcast_test.go    |  65 ++++++++++
+ .../sqlite/migrate_burned_versions_test.go    |   1 +
+ .../20261112171600257_peer_attachments.sql    |   5 +
+ .../storage/sqlite/peer_rooms_test.go         |  12 +-
+ .../storage/sqlite/store/peer_rooms.go        |  16 ++-
+ frontend/src/api/schema.ts                    |  14 +++
+ .../src/renderer/components/PeerRoom.test.tsx |  71 ++++++++++-
+ frontend/src/renderer/components/PeerRoom.tsx | 118 +++++++++++++++++-
+ .../renderer/components/PeerTimeline.test.tsx |  37 +++++-
+ .../src/renderer/components/PeerTimeline.tsx  |  35 +++++-
+ 15 files changed, 522 insertions(+), 47 deletions(-)
+ create mode 100644 backend/internal/httpd/controllers/peer_attachments_test.go
+ create mode 100644 backend/internal/storage/sqlite/migrations/20261112171600257_peer_attachments.sql
+
+diff --git a/backend/internal/domain/peer_room.go b/backend/internal/domain/peer_room.go
+index 7212999..89bb6d0 100644
+--- a/backend/internal/domain/peer_room.go
++++ b/backend/internal/domain/peer_room.go
+@@ -14,13 +14,20 @@ type PeerRoom struct {
+ 	Used      int      `json:"used"`
+ 	Paused    bool     `json:"paused"`
+ }
++type PeerAttachment struct {
++	Name     string `json:"name"`
++	MimeType string `json:"mimeType"`
++	Size     int    `json:"size"`
++	SHA256   string `json:"sha256"`
++}
+ type PeerMessage struct {
+-	BroadcastID string `json:"broadcastId,omitempty"`
+-	Sender      string `json:"sender"`
+-	Target      string `json:"target"`
+-	ID          string `json:"id"`
+-	Epoch       int64  `json:"epoch"`
+-	Message     string `json:"message"`
++	Attachments []PeerAttachment `json:"attachments,omitempty"`
++	BroadcastID string           `json:"broadcastId,omitempty"`
++	Sender      string           `json:"sender"`
++	Target      string           `json:"target"`
++	ID          string           `json:"id"`
++	Epoch       int64            `json:"epoch"`
++	Message     string           `json:"message"`
+ }
+ 
+ type PeerTask struct {
+@@ -47,18 +54,19 @@ type PeerTaskAction struct {
+ // PeerDelivery describes durable admission, not a completed agent turn.
+ // Empty metadata belongs to a delivery recorded before history support.
+ type PeerDelivery struct {
+-	BroadcastID      string      `json:"broadcastId,omitempty"`
+-	Detail           string      `json:"detail,omitempty"`
+-	TurnState        string      `json:"turnState,omitempty"`
+-	Replies          []PeerReply `json:"replies"`
+-	RepliesTruncated bool        `json:"repliesTruncated"`
+-	ID               string      `json:"id"`
+-	Sender           string      `json:"sender"`
+-	Target           string      `json:"target"`
+-	Message          string      `json:"message"`
+-	Epoch            int64       `json:"epoch"`
+-	State            string      `json:"state"`
+-	CreatedAt        string      `json:"createdAt"`
++	Attachments      []PeerAttachment `json:"attachments,omitempty"`
++	BroadcastID      string           `json:"broadcastId,omitempty"`
++	Detail           string           `json:"detail,omitempty"`
++	TurnState        string           `json:"turnState,omitempty"`
++	Replies          []PeerReply      `json:"replies"`
++	RepliesTruncated bool             `json:"repliesTruncated"`
++	ID               string           `json:"id"`
++	Sender           string           `json:"sender"`
++	Target           string           `json:"target"`
++	Message          string           `json:"message"`
++	Epoch            int64            `json:"epoch"`
++	State            string           `json:"state"`
++	CreatedAt        string           `json:"createdAt"`
+ }
+ 
+ func PeerDeliveryKey(room, id string) string {
+diff --git a/backend/internal/httpd/apispec/openapi.yaml b/backend/internal/httpd/apispec/openapi.yaml
+index b35a661..8fea536 100644
+--- a/backend/internal/httpd/apispec/openapi.yaml
++++ b/backend/internal/httpd/apispec/openapi.yaml
+@@ -18001,6 +18001,22 @@ components:
+       - state
+       - lastActivityAt
+       type: object
++    DomainPeerAttachment:
++      properties:
++        mimeType:
++          type: string
++        name:
++          type: string
++        sha256:
++          type: string
++        size:
++          type: integer
++      required:
++      - name
++      - mimeType
++      - size
++      - sha256
++      type: object
+     DomainReviewerConfig:
+       properties:
+         agentConfig:
+@@ -19426,6 +19442,10 @@ components:
+       type: object
+     PeerBroadcastRequest:
+       properties:
++        attachments:
++          items:
++            $ref: '#/components/schemas/SessionPeerBroadcastAttachment'
++          type: array
+         connectPeers:
+           type: boolean
+         epoch:
+@@ -19455,6 +19475,10 @@ components:
+       type: object
+     PeerDelivery:
+       properties:
++        attachments:
++          items:
++            $ref: '#/components/schemas/DomainPeerAttachment'
++          type: array
+         broadcastId:
+           type: string
+         createdAt:
+@@ -19524,6 +19548,10 @@ components:
+       type: object
+     PeerMessage:
+       properties:
++        attachments:
++          items:
++            $ref: '#/components/schemas/DomainPeerAttachment'
++          type: array
+         broadcastId:
+           type: string
+         epoch:
+@@ -21214,6 +21242,19 @@ components:
+       - count
+       - links
+       type: object
++    SessionPeerBroadcastAttachment:
++      properties:
++        data:
++          type: string
++        mimeType:
++          type: string
++        name:
++          type: string
++      required:
++      - name
++      - mimeType
++      - data
++      type: object
+     SessionPreviewResponse:
+       properties:
+         entry:
+diff --git a/backend/internal/httpd/controllers/peer_attachments_test.go b/backend/internal/httpd/controllers/peer_attachments_test.go
+new file mode 100644
+index 0000000..538c433
+--- /dev/null
++++ b/backend/internal/httpd/controllers/peer_attachments_test.go
+@@ -0,0 +1,40 @@
++package controllers_test
++
++import (
++	"context"
++	"github.com/aoagents/agent-orchestrator/backend/internal/config"
++	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
++	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
++	"io"
++	"log/slog"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++type broadcastAttachmentService struct {
++	*fakeSessionService
++	calls int
++	input sessionsvc.PeerBroadcastRequest
++}
++
++func (s *broadcastAttachmentService) BroadcastPeerRoom(_ context.Context, _ string, in sessionsvc.PeerBroadcastRequest) (sessionsvc.PeerBroadcastResult, error) {
++	s.calls++
++	s.input = in
++	return sessionsvc.PeerBroadcastResult{}, nil
++}
++func TestPeerAttachmentsDecodeBeforeAdmission(t *testing.T) {
++	svc := &broadcastAttachmentService{fakeSessionService: newFakeSessionService()}
++	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, httpd.APIDeps{Sessions: svc}, httpd.ControlDeps{}))
++	defer srv.Close()
++	for _, body := range []string{`{"attachments":[{"mimeType":"image/svg+xml","data":"PHN2Zy8+"}]}`, `{"attachments":[{"mimeType":"image/png","data":"!!!"}]}`, pngBody(9)} {
++		_, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/peer-rooms/r/broadcast", body)
++		if status != 400 || svc.calls != 0 {
++			t.Fatal(status, svc.calls)
++		}
++	}
++	_, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/peer-rooms/r/broadcast", `{"id":"new","epoch":1,"attachments":[{"name":"图.png","mimeType":"image/png","data":"cG5n"}]}`)
++	if status != 200 || svc.calls != 1 || len(svc.input.DecodedAttachments) != 1 || string(svc.input.DecodedAttachments[0].Data) != "png" || svc.input.Attachments[0].Name != "图.png" {
++		t.Fatal(status, svc.input)
++	}
++}
+diff --git a/backend/internal/httpd/controllers/peer_rooms.go b/backend/internal/httpd/controllers/peer_rooms.go
+index 30d11ec..63481cc 100644
+--- a/backend/internal/httpd/controllers/peer_rooms.go
++++ b/backend/internal/httpd/controllers/peer_rooms.go
+@@ -140,12 +140,22 @@ func (c *SessionsController) peerBroadcast(w http.ResponseWriter, r *http.Reques
+ 		http.Error(w, "unavailable", 503)
+ 		return
+ 	}
+-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
++	r.Body = http.MaxBytesReader(w, r.Body, maxSpawnBodyBytes)
+ 	var in sessionsvc.PeerBroadcastRequest
+ 	if err := decodeJSON(r, &in); err != nil {
+ 		envelope.WriteAPIError(w, r, 400, "bad_request", "INVALID_JSON", "invalid broadcast", nil)
+ 		return
+ 	}
++	raw := make([]AttachmentInput, len(in.Attachments))
++	for i, a := range in.Attachments {
++		raw[i] = AttachmentInput{MimeType: a.MimeType, Data: a.Data}
++	}
++	decoded, attachErr := decodeSpawnAttachments(raw)
++	if attachErr != nil {
++		envelope.WriteAPIError(w, r, 400, "bad_request", attachErr.code, attachErr.message, nil)
++		return
++	}
++	in.DecodedAttachments = decoded
+ 	out, err := svc.BroadcastPeerRoom(r.Context(), chi.URLParam(r, "roomId"), in)
+ 	if err != nil {
+ 		envelope.WriteAPIError(w, r, 409, "conflict", "PEER_BROADCAST_REJECTED", err.Error(), nil)
+diff --git a/backend/internal/service/session/peer_broadcast.go b/backend/internal/service/session/peer_broadcast.go
+index 0558115..3f68986 100644
+--- a/backend/internal/service/session/peer_broadcast.go
++++ b/backend/internal/service/session/peer_broadcast.go
+@@ -15,12 +15,19 @@ import (
+ 	"github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+ )
+ 
++type PeerBroadcastAttachment struct {
++	Name     string `json:"name"`
++	MimeType string `json:"mimeType"`
++	Data     string `json:"data"`
++}
+ type PeerBroadcastRequest struct {
+-	ID           string   `json:"id"`
+-	Epoch        int64    `json:"epoch"`
+-	Message      string   `json:"message"`
+-	Targets      []string `json:"targets,omitempty"`
+-	ConnectPeers bool     `json:"connectPeers,omitempty"`
++	Attachments        []PeerBroadcastAttachment `json:"attachments,omitempty"`
++	DecodedAttachments []ports.SpawnAttachment   `json:"-"`
++	ID                 string                    `json:"id"`
++	Epoch              int64                     `json:"epoch"`
++	Message            string                    `json:"message"`
++	Targets            []string                  `json:"targets,omitempty"`
++	ConnectPeers       bool                      `json:"connectPeers,omitempty"`
+ }
+ type PeerBroadcastDelivery struct {
+ 	ID      string `json:"id"`
+@@ -40,9 +47,22 @@ type userRoomStore interface {
+ // no all-or-nothing or exactly-once provider execution claim is made.
+ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroadcastRequest) (PeerBroadcastResult, error) {
+ 	out := PeerBroadcastResult{Deliveries: []PeerBroadcastDelivery{}}
+-	if in.ID == "" || len(in.ID) > 100 || strings.TrimSpace(in.Message) == "" || len(in.Message) > 2000 {
++	if in.ID == "" || len(in.ID) > 100 || (strings.TrimSpace(in.Message) == "" && len(in.Attachments) == 0) || len(in.Message) > 2000 {
+ 		return out, fmt.Errorf("invalid broadcast")
+ 	}
++	if len(in.Attachments) != len(in.DecodedAttachments) || len(in.Attachments) > 8 {
++		return out, fmt.Errorf("attachments must be validated before delivery")
++	}
++	manifest := make([]domain.PeerAttachment, 0, len(in.Attachments))
++	total := 0
++	for i, a := range in.Attachments {
++		data := in.DecodedAttachments[i].Data
++		total += len(data)
++		if len(data) == 0 || len(data) > 50*1024*1024 || total > 100*1024*1024 || len(a.Name) > 255 || len(a.MimeType) > 255 {
++			return out, fmt.Errorf("invalid attachment")
++		}
++		manifest = append(manifest, domain.PeerAttachment{Name: a.Name, MimeType: a.MimeType, Size: len(data), SHA256: fmt.Sprintf("%x", sha256.Sum256(data))})
++	}
+ 	room, err := s.GetPeerRoom(ctx, id)
+ 	if err != nil {
+ 		return out, err
+@@ -104,7 +124,7 @@ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroad
+ 			}
+ 			continue
+ 		}
+-		m := domain.PeerMessage{BroadcastID: in.ID, ID: receipt, Target: target, Epoch: in.Epoch, Message: in.Message}
++		m := domain.PeerMessage{BroadcastID: in.ID, ID: receipt, Target: target, Epoch: in.Epoch, Message: in.Message, Attachments: manifest}
+ 		admitted, err := store.ReserveUserRoomMessage(ctx, id, m)
+ 		if err != nil {
+ 			out.Deliveries[i].State = "blocked"
+@@ -118,10 +138,32 @@ func (s *Service) BroadcastPeerRoom(ctx context.Context, id string, in PeerBroad
+ 		wg.Add(1)
+ 		go func(i int, target, receipt string) {
+ 			defer wg.Done()
+-			err := s.manager.SendWithOptions(peerpolicy.Admitted(ctx, "", target), domain.SessionID(target), peerBroadcastPrompt(id, target, targets, in), nil, ports.MessageDeliveryOptions{AuthoredByUser: true, ClientMessageID: domain.PeerDeliveryKey(id, receipt)})
++			var err error
++			prompt := peerBroadcastPrompt(id, target, targets, in)
++			attachmentFailure := false
++			if len(in.DecodedAttachments) > 0 {
++				var paths []string
++				paths, err = s.manager.StageAttachments(ctx, domain.SessionID(target), in.DecodedAttachments)
++				if err == nil && len(paths) != len(manifest) {
++					err = fmt.Errorf("incomplete attachment staging")
++				}
++				attachmentFailure = err != nil
++				if err == nil {
++					prompt += "\n\nAttached files (read these files in your own workspace; report any unsupported format instead of claiming to have read it):"
++					for j, path := range paths {
++						prompt += fmt.Sprintf("\n- %s (original name: %q; SHA256: %s)", path, manifest[j].Name, manifest[j].SHA256)
++					}
++				}
++			}
++			if err == nil {
++				err = s.manager.SendWithOptions(peerpolicy.Admitted(ctx, "", target), domain.SessionID(target), prompt, nil, ports.MessageDeliveryOptions{AuthoredByUser: true, ClientMessageID: domain.PeerDeliveryKey(id, receipt)})
++			}
+ 			detail := ""
+ 			if err != nil {
+ 				detail = peerDeliveryFailure(err)
++				if attachmentFailure {
++					detail = "附件保存未完成，未向此成员发送消息；请核查原生会话，不会自动重试。"
++				}
+ 				if s.logger != nil {
+ 					s.logger.Warn("peer delivery failed", "deliveryID", receipt, "sessionID", target, "reason", detail, "errorType", fmt.Sprintf("%T", err))
+ 				}
+diff --git a/backend/internal/service/session/peer_broadcast_test.go b/backend/internal/service/session/peer_broadcast_test.go
+index fb78a41..39dc73d 100644
+--- a/backend/internal/service/session/peer_broadcast_test.go
++++ b/backend/internal/service/session/peer_broadcast_test.go
+@@ -160,3 +160,68 @@ func TestPeerBroadcastExplicitRecipientsAndContext(t *testing.T) {
+ 		}
+ 	}
+ }
++
++type attachmentCommander struct {
++	*fakeCommander
++	stage func(domain.SessionID, []ports.SpawnAttachment) ([]string, error)
++}
++
++func (m *attachmentCommander) StageAttachments(_ context.Context, id domain.SessionID, a []ports.SpawnAttachment) ([]string, error) {
++	return m.stage(id, a)
++}
++func TestPeerBroadcastAttachmentsPerRecipientAndNoReplay(t *testing.T) {
++	for _, fail := range []bool{false, true} {
++		t.Run(fmt.Sprint(fail), func(t *testing.T) {
++			p := &broadcastStore{room: domain.PeerRoom{Epoch: 1, Budget: 4, Members: []string{"a", "b"}}, states: map[string]string{}}
++			var staged, sent atomic.Int32
++			m := &attachmentCommander{fakeCommander: &fakeCommander{sendFunc: func(id domain.SessionID, prompt string) error {
++				sent.Add(1)
++				for _, fragment := range []string{".ao/attachments/" + string(id) + ".txt", ".ao/attachments/" + string(id) + ".png", `original name: "说明.txt"`, "SHA256:"} {
++					if !strings.Contains(prompt, fragment) {
++						t.Errorf("missing %s in %s", fragment, prompt)
++					}
++				}
++				return nil
++			}}, stage: func(id domain.SessionID, files []ports.SpawnAttachment) ([]string, error) {
++				staged.Add(1)
++				if len(files) != 2 || string(files[0].Data) != "proof" || files[1].Ext != ".png" {
++					t.Errorf("wrong attachment bytes: %+v", files)
++				}
++				if fail && id == "b" {
++					return nil, errors.New("private internal path")
++				}
++				return []string{".ao/attachments/" + string(id) + ".txt", ".ao/attachments/" + string(id) + ".png"}, nil
++			}}
++			svc := NewWithDeps(Deps{Store: p, Manager: m})
++			in := PeerBroadcastRequest{ID: "files", Epoch: 1, Attachments: []PeerBroadcastAttachment{{Name: "说明.txt", MimeType: "text/plain"}, {Name: "figure.png", MimeType: "image/png"}}, DecodedAttachments: []ports.SpawnAttachment{{Ext: ".txt", Data: []byte("proof")}, {Ext: ".png", Data: []byte("png")}}}
++			out, err := svc.BroadcastPeerRoom(context.Background(), "r", in)
++			if err != nil || out.Deliveries[0].State != "accepted" {
++				t.Fatal(out, err)
++			}
++			want := int32(2)
++			if fail {
++				want = 1
++				if out.Deliveries[1].State != "uncertain" || !strings.Contains(out.Deliveries[1].Detail, "附件保存未完成") || strings.Contains(out.Deliveries[1].Detail, "private") {
++					t.Fatal(out)
++				}
++			}
++			if sent.Load() != want || staged.Load() != 2 {
++				t.Fatal(sent.Load(), staged.Load())
++			}
++			for _, msg := range p.messages {
++				if len(msg.Attachments) != 2 || msg.Attachments[0].Size != 5 || len(msg.Attachments[0].SHA256) != 64 {
++					t.Fatal(msg)
++				}
++			}
++			_, err = svc.BroadcastPeerRoom(context.Background(), "r", in)
++			if err != nil || sent.Load() != want || staged.Load() != 2 {
++				t.Fatal("replayed attachments", err, sent.Load(), staged.Load())
++			}
++			in.ID = "invalid"
++			in.DecodedAttachments = nil
++			if _, err = svc.BroadcastPeerRoom(context.Background(), "r", in); err == nil || staged.Load() != 2 {
++				t.Fatal("unvalidated bytes admitted")
++			}
++		})
++	}
++}
+diff --git a/backend/internal/storage/sqlite/migrate_burned_versions_test.go b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+index 7561771..0d02ac6 100644
+--- a/backend/internal/storage/sqlite/migrate_burned_versions_test.go
++++ b/backend/internal/storage/sqlite/migrate_burned_versions_test.go
+@@ -20,6 +20,7 @@ import (
+ // session list). Renaming, renumbering, or deleting a shipped migration
+ // produces exactly that class of failure, so this list is append-only.
+ var shippedMigrations = map[int64]string{
++	20261112171600257: "20261112171600257_peer_attachments.sql",
+ 	20261112093211037: "20261112093211037_peer_broadcast_groups.sql",
+ 	20261112072517589: "20261112072517589_peer_delivery_diagnostics.sql",
+ 	20261111201016434: "20261111201016434_peer_tool_grants.sql",
+diff --git a/backend/internal/storage/sqlite/migrations/20261112171600257_peer_attachments.sql b/backend/internal/storage/sqlite/migrations/20261112171600257_peer_attachments.sql
+new file mode 100644
+index 0000000..fe084d3
+--- /dev/null
++++ b/backend/internal/storage/sqlite/migrations/20261112171600257_peer_attachments.sql
+@@ -0,0 +1,5 @@
++-- +goose Up
++ALTER TABLE peer_deliveries ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';
++
++-- +goose Down
++ALTER TABLE peer_deliveries DROP COLUMN attachments;
+diff --git a/backend/internal/storage/sqlite/peer_rooms_test.go b/backend/internal/storage/sqlite/peer_rooms_test.go
+index 9940845..1f2ae6d 100644
+--- a/backend/internal/storage/sqlite/peer_rooms_test.go
++++ b/backend/internal/storage/sqlite/peer_rooms_test.go
+@@ -296,7 +296,7 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	hm := domain.PeerMessage{ID: "user-broadcast", Target: "a", Epoch: human.Epoch, Message: "hello"}
++	hm := domain.PeerMessage{ID: "user-broadcast", Target: "a", Epoch: human.Epoch, Attachments: []domain.PeerAttachment{{Name: "proof.txt", MimeType: "text/plain", Size: 5, SHA256: "abc"}}}
+ 	if ok, err := s.ReserveUserRoomMessage(ctx, "human", hm); !ok || err != nil {
+ 		t.Fatal(ok, err)
+ 	}
+@@ -309,6 +309,16 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 	if ok, err := s.ReserveUserRoomMessage(ctx, "human", hm); ok || err != nil {
+ 		t.Fatal("broadcast duplicate", ok, err)
+ 	}
++	history, err = s.ListPeerDeliveries(ctx, "human")
++	if err != nil || len(history) != 1 || len(history[0].Attachments) != 1 || history[0].Attachments[0] != hm.Attachments[0] {
++		t.Fatal("attachment history lost", history, err)
++	}
++	changed = hm
++	changed.Attachments = append([]domain.PeerAttachment(nil), hm.Attachments...)
++	changed.Attachments[0].SHA256 = "different-content"
++	if _, err = s.ReserveUserRoomMessage(ctx, "human", changed); err == nil {
++		t.Fatal("same ID with changed bytes accepted")
++	}
+ 	hm.ID = "other"
+ 	hm.Target = "b"
+ 	if _, err = s.ReserveUserRoomMessage(ctx, "human", hm); err == nil {
+diff --git a/backend/internal/storage/sqlite/store/peer_rooms.go b/backend/internal/storage/sqlite/store/peer_rooms.go
+index abfabb5..9c4d2ab 100644
+--- a/backend/internal/storage/sqlite/store/peer_rooms.go
++++ b/backend/internal/storage/sqlite/store/peer_rooms.go
+@@ -104,7 +104,10 @@ func (s *Store) ReserveUserRoomMessage(ctx context.Context, room string, m domai
+ 	return s.reservePeerMessage(ctx, room, m, true)
+ }
+ func (s *Store) reservePeerMessage(ctx context.Context, room string, m domain.PeerMessage, human bool) (bool, error) {
+-	if m.ID == "" || len(m.ID) > 100 || m.Sender == m.Target || strings.TrimSpace(m.Message) == "" || len(m.Message) > 2000 {
++	if !human && len(m.Attachments) > 0 {
++		return false, fmt.Errorf("peer attachments require a user broadcast")
++	}
++	if m.ID == "" || len(m.ID) > 100 || m.Sender == m.Target || (strings.TrimSpace(m.Message) == "" && !(human && len(m.Attachments) > 0)) || len(m.Message) > 2000 {
+ 		return false, fmt.Errorf("invalid peer message")
+ 	}
+ 	if err := s.writeMu.LockContext(ctx); err != nil {
+@@ -151,7 +154,8 @@ func (s *Store) reservePeerMessage(ctx context.Context, room string, m domain.Pe
+ 	if r.Used >= r.Budget {
+ 		return false, fmt.Errorf("room message budget exhausted")
+ 	}
+-	if _, err = tx.ExecContext(ctx, "INSERT INTO peer_deliveries(room_id,id,digest,state,sender,target,message,epoch,created_at,broadcast_id) VALUES(?,?,?,'pending',?,?,?,?,?,?)", room, m.ID, digest, m.Sender, m.Target, m.Message, m.Epoch, time.Now().UTC().Format(time.RFC3339Nano), m.BroadcastID); err != nil {
++	attachments, _ := json.Marshal(m.Attachments)
++	if _, err = tx.ExecContext(ctx, "INSERT INTO peer_deliveries(room_id,id,digest,state,sender,target,message,epoch,created_at,broadcast_id,attachments) VALUES(?,?,?,'pending',?,?,?,?,?,?,?)", room, m.ID, digest, m.Sender, m.Target, m.Message, m.Epoch, time.Now().UTC().Format(time.RFC3339Nano), m.BroadcastID, string(attachments)); err != nil {
+ 		return false, err
+ 	}
+ 	if _, err = tx.ExecContext(ctx, "UPDATE peer_rooms SET used=used+1 WHERE id=?", room); err != nil {
+@@ -183,7 +187,7 @@ func (s *Store) ListPeerDeliveries(ctx context.Context, room string) ([]domain.P
+ 	if _, err := s.GetPeerRoom(ctx, room); err != nil {
+ 		return nil, err
+ 	}
+-	rows, err := s.readDB.QueryContext(ctx, "SELECT id,sender,target,message,epoch,state,created_at,detail,broadcast_id FROM peer_deliveries WHERE room_id=? ORDER BY created_at,id", room)
++	rows, err := s.readDB.QueryContext(ctx, "SELECT id,sender,target,message,epoch,state,created_at,detail,broadcast_id,attachments FROM peer_deliveries WHERE room_id=? ORDER BY created_at,id", room)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -191,7 +195,11 @@ func (s *Store) ListPeerDeliveries(ctx context.Context, room string) ([]domain.P
+ 	out := []domain.PeerDelivery{}
+ 	for rows.Next() {
+ 		var d domain.PeerDelivery
+-		if err := rows.Scan(&d.ID, &d.Sender, &d.Target, &d.Message, &d.Epoch, &d.State, &d.CreatedAt, &d.Detail, &d.BroadcastID); err != nil {
++		var attachments string
++		if err := rows.Scan(&d.ID, &d.Sender, &d.Target, &d.Message, &d.Epoch, &d.State, &d.CreatedAt, &d.Detail, &d.BroadcastID, &attachments); err != nil {
++			return nil, err
++		}
++		if err := json.Unmarshal([]byte(attachments), &d.Attachments); err != nil {
+ 			return nil, err
+ 		}
+ 		out = append(out, d)
+diff --git a/frontend/src/api/schema.ts b/frontend/src/api/schema.ts
+index aa2500c..09bc26c 100644
+--- a/frontend/src/api/schema.ts
++++ b/frontend/src/api/schema.ts
+@@ -6236,6 +6236,12 @@ export interface components {
+             lastActivityAt: string;
+             state: string;
+         };
++        DomainPeerAttachment: {
++            mimeType: string;
++            name: string;
++            sha256: string;
++            size: number;
++        };
+         DomainReviewerConfig: {
+             agentConfig?: components["schemas"]["AgentConfig"];
+             harness: string;
+@@ -6779,6 +6785,7 @@ export interface components {
+             state: string;
+         };
+         PeerBroadcastRequest: {
++            attachments?: components["schemas"]["SessionPeerBroadcastAttachment"][];
+             connectPeers?: boolean;
+             /** Format: int64 */
+             epoch: number;
+@@ -6790,6 +6797,7 @@ export interface components {
+             deliveries: components["schemas"]["PeerBroadcastDelivery"][];
+         };
+         PeerDelivery: {
++            attachments?: components["schemas"]["DomainPeerAttachment"][];
+             broadcastId?: string;
+             createdAt: string;
+             detail?: string;
+@@ -6816,6 +6824,7 @@ export interface components {
+             tasks: string[];
+         };
+         PeerMessage: {
++            attachments?: components["schemas"]["DomainPeerAttachment"][];
+             broadcastId?: string;
+             /** Format: int64 */
+             epoch: number;
+@@ -7482,6 +7491,11 @@ export interface components {
+             reviewUrl?: string;
+             reviewerId: string;
+         };
++        SessionPeerBroadcastAttachment: {
++            data: string;
++            mimeType: string;
++            name: string;
++        };
+         SessionPreviewResponse: {
+             entry?: string;
+             previewUrl?: string;
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index d081b62..613850f 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -438,7 +438,7 @@ it("does not bypass send guards with Enter", async () => {
+ 	expect(api.POST).not.toHaveBeenCalled();
+ });
+ 
+-it("keeps room administration out of the composer and discloses unavailable attachments", async () => {
++it("keeps room administration out of the composer and opens the working attachment picker", async () => {
+ 	mount();
+ 	await screen.findByText("本房间的消息");
+ 	expect(
+@@ -446,12 +446,73 @@ it("keeps room administration out of the composer and discloses unavailable atta
+ 	).not.toBeInTheDocument();
+ 	expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+ 	await userEvent.click(screen.getByRole("button", { name: "添加" }));
+-	expect(await screen.findByRole("menuitem", { name: /文件/ })).toHaveAttribute(
+-		"aria-disabled",
+-		"true",
+-	);
++	expect(
++		await screen.findByRole("menuitem", { name: /文件/ }),
++	).not.toHaveAttribute("aria-disabled", "true");
+ 	expect(
+ 		screen.getByRole("menuitem", { name: /添加 Agent/ }),
+ 	).toBeInTheDocument();
+ 	expect(api.POST).not.toHaveBeenCalled();
+ });
++
++it("sends files and images together without requiring text and clears the sent draft", async () => {
++	api.POST.mockResolvedValue({
++		data: {
++			deliveries: [
++				{ session: "a", state: "accepted" },
++				{ session: "b", state: "accepted" },
++			],
++		},
++	});
++	mount();
++	await screen.findAllByText("原生回复");
++	fireEvent.change(screen.getByLabelText("添加文件或图片"), {
++		target: {
++			files: [
++				new File(["proof"], "说明.txt", { type: "text/plain" }),
++				new File(["png"], "图.png", { type: "image/png" }),
++			],
++		},
++	});
++	await screen.findByRole("img", { name: "图.png" });
++	await waitFor(() =>
++		expect(screen.getByRole("button", { name: /发送消息/ })).toBeEnabled(),
++	);
++	fireEvent.click(screen.getByRole("button", { name: /发送消息/ }));
++	await waitFor(() => expect(api.POST).toHaveBeenCalledTimes(1));
++	expect(api.POST.mock.calls[0][1].body).toMatchObject({
++		message: "",
++		targets: ["a", "b"],
++		attachments: [
++			{ name: "说明.txt", mimeType: "text/plain", data: "cHJvb2Y=" },
++			{ name: "图.png", mimeType: "image/png", data: "cG5n" },
++		],
++	});
++	await waitFor(() =>
++		expect(screen.queryByLabelText("待发送附件")).not.toBeInTheDocument(),
++	);
++});
++it("keeps rejected attachments editable without replay and supports removal", async () => {
++	api.POST.mockResolvedValue({
++		error: { message: "unsupported attachment" },
++		response: { status: 400 },
++	});
++	mount();
++	await screen.findAllByText("原生回复");
++	fireEvent.paste(screen.getByLabelText("群聊消息"), {
++		clipboardData: {
++			files: [new File(["proof"], "paste.txt", { type: "text/plain" })],
++		},
++	});
++	await screen.findByRole("button", { name: "移除附件 paste.txt" });
++	await waitFor(() =>
++		expect(screen.getByRole("button", { name: /发送消息/ })).toBeEnabled(),
++	);
++	fireEvent.click(screen.getByRole("button", { name: /发送消息/ }));
++	await screen.findByText("unsupported attachment");
++	expect(screen.getByRole("button", { name: /发送消息/ })).toBeEnabled();
++	expect(api.POST).toHaveBeenCalledTimes(1);
++	fireEvent.click(screen.getByRole("button", { name: "移除附件 paste.txt" }));
++	expect(screen.getByRole("button", { name: /发送消息/ })).toBeDisabled();
++	expect(api.POST).toHaveBeenCalledTimes(1);
++});
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index 2777861..72e7eb0 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -1,3 +1,5 @@
++import { useFileAttachments } from "../hooks/useFileAttachments";
++import { X } from "lucide-react";
+ import { PeerAccessControl } from "./PeerAccessControl";
+ import {
+ 	Plus,
+@@ -78,6 +80,9 @@ export function PeerRoom({
+ 	onOpenSession?: (id: string) => void;
+ }) {
+ 	const roomId = `project-${projectId}`;
++	const files = useFileAttachments({ initialKey: `peer-room:${projectId}` });
++	const filePicker = useRef<HTMLInputElement>(null);
++	const sending = useRef(false);
+ 	const cache = useQueryClient();
+ 	const key = ["peer-room", roomId];
+ 	const [draftMembers, setDraftMembers] = useState<string[] | null>(null);
+@@ -281,7 +286,9 @@ export function PeerRoom({
+ 		}
+ 	}
+ 	async function send() {
+-		if (!room.data || !canSend) return;
++		if (!room.data || !canSend || sending.current || files.hasPendingReads())
++			return;
++		sending.current = true;
+ 		setBusy(true);
+ 		setError("");
+ 		setReceipts([]);
+@@ -296,15 +303,39 @@ export function PeerRoom({
+ 						id: crypto.randomUUID(),
+ 						epoch: room.data.epoch,
+ 						message: text,
++						attachments: files
++							.getAttachments()
++							.flatMap((file) =>
++								file.data
++									? [
++											{
++												name: file.name,
++												mimeType: file.mimeType,
++												data: file.data,
++											},
++										]
++									: [],
++							),
+ 						targets: availableMembers,
+ 						connectPeers: true,
+ 					},
+ 				},
+ 			);
+-			if (result.error || !result.data) throw failure(result.error);
++			if (result.error || !result.data) {
++				if (
++					result.response?.status === 400 ||
++					result.response?.status === 413
++				) {
++					setError(failure(result.error).message);
++					markUncertain(false);
++					return;
++				}
++				throw failure(result.error);
++			}
+ 			setReceipts(result.data.deliveries);
+ 			// Never silently resend a partially delivered broadcast, even after editing the draft.
+ 			setText("");
++			files.clear();
+ 			markUncertain(
+ 				result.data.deliveries.some((r) => r.state === "uncertain"),
+ 			);
+@@ -312,6 +343,7 @@ export function PeerRoom({
+ 			setError(failure(e).message);
+ 			markUncertain(true);
+ 		} finally {
++			sending.current = false;
+ 			setBusy(false);
+ 			await cache.invalidateQueries({ queryKey: key });
+ 			await cache.invalidateQueries({
+@@ -363,7 +395,8 @@ export function PeerRoom({
+ 		!pendingChanges &&
+ 		availableMembers.length > 0 &&
+ 		!uncertain &&
+-		!!text.trim() &&
++		(!!text.trim() || files.attachments.length > 0) &&
++		!files.preparing &&
+ 		new TextEncoder().encode(text).length <= 2000;
+ 	return (
+ 		<section
+@@ -736,6 +769,7 @@ export function PeerRoom({
+ 								onClick={() => {
+ 									markUncertain(false);
+ 									setText("");
++									files.clear();
+ 								}}
+ 							>
+ 								已核查，撰写新消息
+@@ -753,17 +787,89 @@ export function PeerRoom({
+ 						</p>
+ 					)}
+ 					<form
++						onDragOver={(e) => {
++							if (e.dataTransfer.types.includes("Files")) e.preventDefault();
++						}}
++						onDrop={(e) => {
++							if (!e.dataTransfer.files.length) return;
++							e.preventDefault();
++							if (!busy && !uncertain)
++								void files.addFiles(Array.from(e.dataTransfer.files));
++						}}
+ 						className="rounded-[22px] border border-border/60 bg-secondary/70 p-2 transition-colors focus-within:border-border focus-within:bg-secondary motion-reduce:transition-none"
+ 						onSubmit={(e) => {
+ 							e.preventDefault();
+ 							if (canSend) void send();
+ 						}}
+ 					>
++						<input
++							ref={filePicker}
++							type="file"
++							multiple
++							className="sr-only"
++							aria-label="添加文件或图片"
++							disabled={busy || uncertain || files.preparing}
++							onChange={(e) => {
++								void files.addFiles(Array.from(e.target.files ?? []));
++								e.target.value = "";
++							}}
++						/>
++						{(files.attachments.length > 0 ||
++							files.pendingAttachments.length > 0) && (
++							<div
++								className="flex flex-wrap gap-2 px-3 py-2"
++								aria-label="待发送附件"
++							>
++								{files.attachments.map((file) => (
++									<div
++										key={file.id}
++										className="flex max-w-56 items-center gap-2 rounded-lg border border-border px-2 py-1 text-xs"
++									>
++										{file.dataUrl ? (
++											<img
++												src={file.dataUrl}
++												alt={file.name}
++												className="size-9 rounded object-cover"
++											/>
++										) : (
++											<Paperclip className="size-3.5 shrink-0" />
++										)}
++										<span className="truncate" title={file.name}>
++											{file.name}
++										</span>
++										<button
++											type="button"
++											aria-label={`移除附件 ${file.name}`}
++											disabled={busy || uncertain}
++											onClick={() => files.remove(file.id)}
++										>
++											<X className="size-3" />
++										</button>
++									</div>
++								))}
++								{files.pendingAttachments.map((file) => (
++									<span key={file.id} className="text-xs text-muted-foreground">
++										正在读取 {file.name}…
++									</span>
++								))}
++							</div>
++						)}
++						{files.error && (
++							<p role="alert" className="px-3 py-1 text-xs text-destructive">
++								{files.error}
++							</p>
++						)}
+ 						<label className="sr-only" htmlFor="peer-message">
+ 							群聊消息
+ 						</label>
+ 						<textarea
+ 							id="peer-message"
++							onPaste={(e) => {
++								if (e.clipboardData.files.length && !busy && !uncertain) {
++									e.preventDefault();
++									void files.addFiles(Array.from(e.clipboardData.files));
++								}
++							}}
+ 							rows={1}
+ 							className="block min-h-10 w-full resize-none overflow-y-auto border-0 bg-transparent px-3 py-2 text-[length:var(--font-size-base)]! leading-5 outline-none placeholder:text-muted-foreground"
+ 							style={{ fieldSizing: "content", maxHeight: "min(180px, 25dvh)" }}
+@@ -806,9 +912,9 @@ export function PeerRoom({
+ 									<ComposerMenuRow
+ 										icon={Paperclip}
+ 										title="文件"
+-										description="群聊附件尚未接通，请在原生会话添加"
+-										disabled
+-										onSelect={() => {}}
++										description="添加文件或图片，发送给本次接收成员"
++										disabled={busy || uncertain || files.preparing}
++										onSelect={() => filePicker.current?.click()}
+ 									/>
+ 									<ComposerMenuRow
+ 										icon={UserPlus}
+diff --git a/frontend/src/renderer/components/PeerTimeline.test.tsx b/frontend/src/renderer/components/PeerTimeline.test.tsx
+index 357c501..5087f83 100644
+--- a/frontend/src/renderer/components/PeerTimeline.test.tsx
++++ b/frontend/src/renderer/components/PeerTimeline.test.tsx
+@@ -26,7 +26,14 @@ it("renders a broadcast once with separately identified replies", () => {
+ 					...a,
+ 					id: "b",
+ 					target: "two",
+-					replies: [{ id: "r2", text: "我的验证", streaming: false, turnState: "completed" }],
++					replies: [
++						{
++							id: "r2",
++							text: "我的验证",
++							streaming: false,
++							turnState: "completed",
++						},
++					],
+ 				},
+ 			]}
+ 			label={(id) => id}
+@@ -52,3 +59,31 @@ it("never merges identical text across broadcasts or guesses legacy grouping", (
+ 		]),
+ 	).toHaveLength(4);
+ });
++it("keeps attachment metadata visible after reloading and never merges changed files", () => {
++	const withFile = {
++		...a,
++		message: "",
++		attachments: [
++			{ name: "图.png", mimeType: "image/png", size: 2048, sha256: "abc" },
++		],
++	};
++	render(
++		<PeerTimeline
++			deliveries={[withFile, { ...withFile, id: "b", target: "two" }]}
++			label={(id) => id}
++			provider={() => "codex"}
++			status={() => "已回复"}
++		/>,
++	);
++	expect(screen.getAllByText("图.png · 2 KB")).toHaveLength(1);
++	expect(
++		peerMessageGroups([
++			withFile,
++			{
++				...withFile,
++				id: "c",
++				attachments: [{ ...withFile.attachments[0], sha256: "other" }],
++			},
++		]),
++	).toHaveLength(2);
++});
+diff --git a/frontend/src/renderer/components/PeerTimeline.tsx b/frontend/src/renderer/components/PeerTimeline.tsx
+index 977a98a..33b8e61 100644
+--- a/frontend/src/renderer/components/PeerTimeline.tsx
++++ b/frontend/src/renderer/components/PeerTimeline.tsx
+@@ -8,7 +8,12 @@ export function peerMessageGroups(deliveries: Delivery[]) {
+ 	for (const d of deliveries) {
+ 		const key =
+ 			d.broadcastId && !d.sender
+-				? JSON.stringify([d.broadcastId, d.epoch, d.message])
++				? JSON.stringify([
++						d.broadcastId,
++						d.epoch,
++						d.message,
++						d.attachments ?? [],
++					])
+ 				: d.id;
+ 		const index = indexes.get(key);
+ 		if (index === undefined) {
+@@ -44,7 +49,11 @@ export function PeerTimeline({
+ 						>
+ 							<div className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
+ 								{first.sender && (
+-									<AgentAvatar provider={provider(first.sender) ?? ""} className="size-4 shrink-0" decorative />
++									<AgentAvatar
++										provider={provider(first.sender) ?? ""}
++										className="size-4 shrink-0"
++										decorative
++									/>
+ 								)}
+ 								<span>
+ 									{first.sender
+@@ -53,6 +62,22 @@ export function PeerTimeline({
+ 								</span>
+ 							</div>
+ 							<ChatMarkdown text={first.message} />
++							{first.attachments?.length ? (
++								<ul
++									aria-label="本次附件"
++									className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground"
++								>
++									{first.attachments.map((file, i) => (
++										<li
++											key={`${file.sha256}-${i}`}
++											className="rounded-md border border-border px-2 py-1"
++											title={`SHA256: ${file.sha256}`}
++										>
++											{file.name || "附件"} · {Math.ceil(file.size / 1024)} KB
++										</li>
++									))}
++								</ul>
++							) : null}
+ 						</div>
+ 						{group.map((d) => (
+ 							<article
+@@ -61,7 +86,11 @@ export function PeerTimeline({
+ 								aria-label={`来自 ${label(d.target)} 的回复`}
+ 							>
+ 								<div className="mb-3 flex items-center gap-2 text-xs text-muted-foreground">
+-									<AgentAvatar provider={provider(d.target) ?? ""} className="size-4 shrink-0" decorative />
++									<AgentAvatar
++										provider={provider(d.target) ?? ""}
++										className="size-4 shrink-0"
++										decorative
++									/>
+ 									<span className="font-medium text-foreground">
+ 										{label(d.target)}
+ 									</span>
+-- 
+2.54.0 (Apple Git-157)
+
