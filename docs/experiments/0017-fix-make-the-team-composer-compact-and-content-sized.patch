@@ -1,0 +1,191 @@
+From 53edc72148e52059856091addc8b62b5c5117a56 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 18:08:47 +0800
+Subject: [PATCH] fix: make the team composer compact and content sized
+
+Use native content sizing so text grows, shrinks and scrolls within a bounded height. Reduce toolbar and header weight, shorten generated member labels and keep overflow from displacing Send. TypeScript and 22 room/settings/timeline regressions pass.
+---
+ DESIGN.md                                     |  4 +++
+ .../renderer/components/PeerAccessControl.tsx |  5 +--
+ .../renderer/components/PeerAgentSettings.tsx |  8 +++--
+ frontend/src/renderer/components/PeerRoom.tsx | 32 ++++++++++++-------
+ 4 files changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/DESIGN.md b/DESIGN.md
+index 308b16c..4bd01ea 100644
+--- a/DESIGN.md
++++ b/DESIGN.md
+@@ -454,3 +454,7 @@ The project room follows the existing shell, typography, semantic color tokens a
+ 7. **Interaction:** existing subtle L1 transitions and reduced-motion handling. Enter sends, Shift+Enter adds a line, IME preserved. Saving member settings blocks send until confirmed; no optimistic permission escalation.
+ 8. **Guardrails:** no repeated recipient paragraph; no success receipt wall; no raw IDs in primary labels; no fabricated models; no universal effort list; no silent recipients change; no hiding actionable failures; no automatic old-message resend. Keep immutable session identity separate from editable display name.
+ 9. **Responsive:** toolbar wraps, icons remain accessible, popovers fit viewport, main area scrolls independently. At narrow widths preserve 44px touch targets and avoid horizontal overflow.
++
++### Composer density correction (2026-11-12)
++
++The composer is content-sized rather than manually resizable: one text row (40px with padding) at rest, a 32px toolbar, and 8px outer padding. Native CSS field-sizing grows and shrinks with wrapping, line breaks, deletion and width changes; the text region stops at min(180px, 25dvh) and scrolls internally. Keep a 22px radius, subtle neutral fill and border, and no heavy focus frame. Compact provider/number labels replace raw generated session IDs in the toolbar; custom names remain visible and full names remain accessible. Overflowing members scroll within their own row, never displace Send or create multiple toolbar rows. The secondary header uses small quiet controls instead of another row of filled buttons. Existing send, permissions and recipient rules are unchanged.
+diff --git a/frontend/src/renderer/components/PeerAccessControl.tsx b/frontend/src/renderer/components/PeerAccessControl.tsx
+index 9593d4b..78044e9 100644
+--- a/frontend/src/renderer/components/PeerAccessControl.tsx
++++ b/frontend/src/renderer/components/PeerAccessControl.tsx
+@@ -148,11 +148,12 @@ export function PeerAccessControl({
+ 				<button
+ 					type="button"
+ 					disabled={disabled || !sessions.length}
+-					className="inline-flex min-h-10 items-center gap-1 rounded-lg px-2 text-xs hover:bg-background focus-visible:ring-2 focus-visible:ring-ring"
++					className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs hover:bg-background focus-visible:ring-2 focus-visible:ring-ring"
++					title="访问权限"
+ 					aria-label="访问权限"
+ 				>
+ 					<ShieldCheck className="size-4" />
+-					访问权限
++					<span className="hidden sm:inline">访问权限</span>
+ 				</button>
+ 			</PopoverTrigger>
+ 			<PopoverContent
+diff --git a/frontend/src/renderer/components/PeerAgentSettings.tsx b/frontend/src/renderer/components/PeerAgentSettings.tsx
+index 46c07f7..c1fbf3b 100644
+--- a/frontend/src/renderer/components/PeerAgentSettings.tsx
++++ b/frontend/src/renderer/components/PeerAgentSettings.tsx
+@@ -50,6 +50,10 @@ export function PeerAgentSettings({
+ 	onOpenSession?: () => void;
+ }) {
+ 	const cache = useQueryClient();
++	const compactName =
++		session.title && session.title !== session.id
++			? session.title
++			: `${({ codex: "Codex", "deepseek-harness": "DeepSeek", agy: "Antigravity" } as Record<string, string>)[session.provider] || session.provider} ${session.id.split("-").at(-1)}`;
+ 	const [open, setOpen] = useState(false);
+ 	const [name, setName] = useState(session.title || session.id);
+ 	const [saving, setSaving] = useState(false);
+@@ -150,11 +154,11 @@ export function PeerAgentSettings({
+ 					type="button"
+ 					aria-label={`设置成员 ${session.title || session.id}`}
+ 					title={`${session.title || session.id} · ${issue || "就绪"}`}
+-					className="inline-flex min-h-9 max-w-48 items-center gap-1.5 rounded-lg px-2 text-sm hover:bg-secondary focus-visible:ring-2 focus-visible:ring-ring"
++					className="inline-flex h-8 max-w-32 shrink-0 items-center gap-1.5 rounded-lg px-2 text-xs text-muted-foreground hover:bg-background hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+ 					disabled={disabled}
+ 				>
+ 					<PeerAgentIcon provider={session.provider} />
+-					<span className="truncate">{session.title || session.id}</span>
++					<span className="max-w-24 truncate">{compactName}</span>
+ 					{issue && (
+ 						<span
+ 							className="size-1.5 rounded-full bg-destructive"
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index ab2b0b7..ca3773c 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -350,12 +350,16 @@ export function PeerRoom({
+ 			className="flex min-h-0 flex-1 flex-col overflow-hidden"
+ 			aria-label="项目群聊"
+ 		>
+-			<header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border p-4">
++			<header className="flex shrink-0 flex-wrap items-center justify-between gap-3 px-5 py-2">
+ 				<div>
+-					<h1 className="text-base font-medium">项目群聊</h1>
++					<h1 className="text-sm font-medium text-muted-foreground">
++						项目群聊
++					</h1>
+ 				</div>
+ 				<div className="flex gap-2">
+ 					<Button
++						size="sm"
++						variant="quiet"
+ 						disabled={
+ 							busy ||
+ 							addingMembers ||
+@@ -372,7 +376,8 @@ export function PeerRoom({
+ 						添加成员
+ 					</Button>
+ 					<Button
+-						variant="secondary"
++						variant="quiet"
++						size="sm"
+ 						disabled={busy}
+ 						onClick={onManageSessions}
+ 					>
+@@ -380,7 +385,8 @@ export function PeerRoom({
+ 					</Button>
+ 					{room.data && (
+ 						<Button
+-							variant="secondary"
++							variant="quiet"
++							size="sm"
+ 							disabled={busy || pendingChanges}
+ 							onClick={() => configure(!room.data!.paused, members)}
+ 						>
+@@ -685,7 +691,7 @@ export function PeerRoom({
+ 						</p>
+ 					)}
+ 					<form
+-						className="rounded-2xl border border-border bg-secondary p-2 focus-within:ring-1 focus-within:ring-ring"
++						className="rounded-[22px] border border-border/60 bg-secondary/70 p-2 transition-colors focus-within:border-border focus-within:bg-secondary motion-reduce:transition-none"
+ 						onSubmit={(e) => {
+ 							e.preventDefault();
+ 							if (canSend) void send();
+@@ -696,7 +702,9 @@ export function PeerRoom({
+ 						</label>
+ 						<textarea
+ 							id="peer-message"
+-							className="min-h-20 max-h-48 w-full resize-y border-0 bg-transparent px-3 py-2 text-base leading-7 outline-none"
++							rows={1}
++							className="block min-h-10 w-full resize-none overflow-y-auto border-0 bg-transparent px-3 py-2 text-sm leading-6 outline-none placeholder:text-muted-foreground"
++							style={{ fieldSizing: "content", maxHeight: "min(180px, 25dvh)" }}
+ 							value={text}
+ 							onChange={(e) => setText(e.target.value)}
+ 							onKeyDown={(e) => {
+@@ -717,12 +725,12 @@ export function PeerRoom({
+ 							placeholder="说明你希望团队完成什么…"
+ 							disabled={busy || uncertain || settingsBusy}
+ 						/>
+-						<div className="flex flex-wrap items-center gap-1">
++						<div className="flex items-center gap-1 pt-1">
+ 							<button
+ 								type="button"
+ 								aria-label="添加新成员"
+ 								title="添加成员"
+-								className="inline-flex size-10 items-center justify-center rounded-lg hover:bg-background focus-visible:ring-2 focus-visible:ring-ring"
++								className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-background focus-visible:ring-2 focus-visible:ring-ring"
+ 								disabled={busy || settingsBusy}
+ 								onClick={() => {
+ 									setAddingMembers(true);
+@@ -745,7 +753,7 @@ export function PeerRoom({
+ 								aria-label="房间设置"
+ 								title="房间设置"
+ 								aria-expanded={settingsOpen}
+-								className="inline-flex size-10 items-center justify-center rounded-lg hover:bg-background focus-visible:ring-2 focus-visible:ring-ring"
++								className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg hover:bg-background focus-visible:ring-2 focus-visible:ring-ring"
+ 								onClick={() => {
+ 									setSettingsOpen(!settingsOpen);
+ 									if (history.current) history.current.scrollTop = 0;
+@@ -754,7 +762,7 @@ export function PeerRoom({
+ 								<SlidersHorizontal className="size-4" />
+ 							</button>
+ 							<div
+-								className="flex min-w-0 flex-1 flex-wrap items-center"
++								className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto"
+ 								aria-label="项目成员"
+ 							>
+ 								{members.map((id, i) => {
+@@ -781,7 +789,7 @@ export function PeerRoom({
+ 								aria-label="发送消息"
+ 								title={`发送给 ${availableMembers.length} 位可用成员，连接同伴工具`}
+ 								disabled={!canSend}
+-								className="inline-flex size-9 shrink-0 items-center justify-center rounded-full bg-foreground text-background hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
++								className="inline-flex size-8 shrink-0 items-center justify-center rounded-full bg-foreground text-background hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
+ 							>
+ 								<ArrowUp className="size-5" />
+ 							</button>
+@@ -792,7 +800,7 @@ export function PeerRoom({
+ 							</p>
+ 						)}
+ 					</form>
+-					<p className="mt-2 text-center text-xs text-muted-foreground">
++					<p className="mt-1.5 text-center text-[11px] text-muted-foreground/70">
+ 						回车发送 · ⇧＋回车换行
+ 					</p>
+ 				</div>
+-- 
+2.54.0 (Apple Git-157)
+
