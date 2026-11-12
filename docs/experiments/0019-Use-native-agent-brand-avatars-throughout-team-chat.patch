@@ -1,0 +1,96 @@
+From 97cb3cc2aee752c9f0552f2a2588e17f9a9e592a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 20:16:44 +0800
+Subject: [PATCH] Use native agent brand avatars throughout team chat
+
+Replace the separate line-icon mapping and generic DeepSeek robot with the shared themed AgentAvatar assets. Normalize nullable native boolean options at the view boundary. Verified with 31 focused tests and typecheck.
+---
+ .../renderer/components/PeerAgentSettings.tsx | 19 ++++++-------------
+ .../src/renderer/components/PeerTimeline.tsx  |  6 +++---
+ 2 files changed, 9 insertions(+), 16 deletions(-)
+
+diff --git a/frontend/src/renderer/components/PeerAgentSettings.tsx b/frontend/src/renderer/components/PeerAgentSettings.tsx
+index 0b3a40d..774aab2 100644
+--- a/frontend/src/renderer/components/PeerAgentSettings.tsx
++++ b/frontend/src/renderer/components/PeerAgentSettings.tsx
+@@ -1,24 +1,14 @@
+ import { useRef, useState } from "react";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+-import { Bot } from "lucide-react";
+ import { apiClient } from "../lib/api-client";
+ import type { WorkspaceSession } from "../types/workspace";
+ import type { components } from "../../api/schema";
+ import { Button } from "./ui/button";
+ import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+-import { CodexIcon, AntigravityIcon } from "./icons";
++import { AgentAvatar } from "./AgentAvatar";
+ import { TurnSettingsBar } from "./chat/TurnSettingsBar";
+ import type { ChatConfigOptionValue } from "../types/conversation";
+ 
+-export function PeerAgentIcon({ provider }: { provider?: string }) {
+-	const Icon =
+-		provider === "codex"
+-			? CodexIcon
+-			: provider === "agy"
+-				? AntigravityIcon
+-				: Bot;
+-	return <Icon className="size-4 shrink-0" aria-hidden="true" />;
+-}
+ type Settings = components["schemas"]["ConversationTurnSettingsPayload"];
+ function message(e: unknown) {
+ 	return e && typeof e === "object" && "message" in e
+@@ -92,7 +82,10 @@ export function PeerAgentSettings({
+ 			return {
+ 				models: models.data?.models ?? [],
+ 				settings: models.data?.selected ?? {},
+-				options: config.data?.options ?? [],
++				options: (config.data?.options ?? []).map((option) => ({
++					...option,
++					currentBoolean: option.currentBoolean ?? undefined,
++				})),
+ 			};
+ 		},
+ 	});
+@@ -229,7 +222,7 @@ export function PeerAgentSettings({
+ 								/>
+ 							)}
+ 						</svg>
+-						<PeerAgentIcon provider={session.provider} />
++						<AgentAvatar provider={session.provider} className="size-5 shrink-0" decorative />
+ 					</span>
+ 					<span className="max-w-24 truncate">{compactName}</span>
+ 					{issue && (
+diff --git a/frontend/src/renderer/components/PeerTimeline.tsx b/frontend/src/renderer/components/PeerTimeline.tsx
+index 2118589..977a98a 100644
+--- a/frontend/src/renderer/components/PeerTimeline.tsx
++++ b/frontend/src/renderer/components/PeerTimeline.tsx
+@@ -1,6 +1,6 @@
+ import type { components } from "../../api/schema";
+ import { ChatMarkdown } from "./chat/ChatMarkdown";
+-import { PeerAgentIcon } from "./PeerAgentSettings";
++import { AgentAvatar } from "./AgentAvatar";
+ type Delivery = components["schemas"]["PeerDelivery"];
+ export function peerMessageGroups(deliveries: Delivery[]) {
+ 	const groups: Delivery[][] = [];
+@@ -44,7 +44,7 @@ export function PeerTimeline({
+ 						>
+ 							<div className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
+ 								{first.sender && (
+-									<PeerAgentIcon provider={provider(first.sender)} />
++									<AgentAvatar provider={provider(first.sender) ?? ""} className="size-4 shrink-0" decorative />
+ 								)}
+ 								<span>
+ 									{first.sender
+@@ -61,7 +61,7 @@ export function PeerTimeline({
+ 								aria-label={`来自 ${label(d.target)} 的回复`}
+ 							>
+ 								<div className="mb-3 flex items-center gap-2 text-xs text-muted-foreground">
+-									<PeerAgentIcon provider={provider(d.target)} />
++									<AgentAvatar provider={provider(d.target) ?? ""} className="size-4 shrink-0" decorative />
+ 									<span className="font-medium text-foreground">
+ 										{label(d.target)}
+ 									</span>
+-- 
+2.54.0 (Apple Git-157)
+
