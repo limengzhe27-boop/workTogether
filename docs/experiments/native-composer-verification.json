@@ -1,0 +1,90 @@
+{
+  "sourceCommit": "04edba79c560",
+  "oldDeliveriesUnchanged": 11,
+  "newDeliveries": [
+    {
+      "broadcastId": "78212500-14bd-4122-9efc-19e463037398",
+      "turnState": "completed",
+      "replies": [
+        {
+          "id": "c6e7615f-4261-4b0e-8c3d-5cf993be25a1",
+          "text": "My session ID is worktogether-2, and the other recipient is worktogether-3.",
+          "streaming": false,
+          "turnState": "completed"
+        }
+      ],
+      "repliesTruncated": false,
+      "id": "user-b32d4a33835a5a875c479cff31304c2505c752f4055b0cdbbf291bdbb1cb6505",
+      "sender": "",
+      "target": "worktogether-2",
+      "message": "[WT-COMPOSER-1112] New UI verification only. Reply with your session ID and the other recipient ID in one short sentence. Do not call tools, message peers, edit files, or repeat earlier tasks.",
+      "epoch": 2,
+      "state": "accepted",
+      "createdAt": "2026-11-12T09:53:13.265739Z"
+    },
+    {
+      "broadcastId": "78212500-14bd-4122-9efc-19e463037398",
+      "turnState": "completed",
+      "replies": [
+        {
+          "id": "602658e7-3d9c-40f4-b3bd-1374cb6a5e99",
+          "text": "My session ID is `worktogether-3`, and the other recipient is `worktogether-2`.",
+          "streaming": false,
+          "turnState": "completed"
+        }
+      ],
+      "repliesTruncated": false,
+      "id": "user-19340b6bb6004aef1c33fd3cede65ea280ea542c826271d3d5197d6e6f7bb490",
+      "sender": "",
+      "target": "worktogether-3",
+      "message": "[WT-COMPOSER-1112] New UI verification only. Reply with your session ID and the other recipient ID in one short sentence. Do not call tools, message peers, edit files, or repeat earlier tasks.",
+      "epoch": 2,
+      "state": "accepted",
+      "createdAt": "2026-11-12T09:53:13.266281Z"
+    }
+  ],
+  "settings": {
+    "worktogether-2": {
+      "approvalMode": "auto"
+    },
+    "worktogether-3": {
+      "approvalMode": "auto"
+    }
+  },
+  "catalog": {
+    "worktogether-2": {
+      "models": [
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-6.1-terra",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5"
+      ],
+      "optionIds": []
+    },
+    "worktogether-3": {
+      "models": [],
+      "optionIds": [
+        "model",
+        "reasoning_effort"
+      ]
+    }
+  },
+  "room": {
+    "id": "project-worktogether",
+    "projectId": "worktogether",
+    "members": [
+      "worktogether-2",
+      "worktogether-3",
+      "worktogether-1"
+    ],
+    "epoch": 2,
+    "budget": 24,
+    "used": 13,
+    "paused": false
+  }
+}
