@@ -1,0 +1,537 @@
+From 07569b4c82e97bb32aaf899cd9de2377b083788d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 12:19:03 +0800
+Subject: [PATCH] feat: add multiple native agents directly from a project room
+
+Replace the confusing single-agent task detour with per-client member counts. Create empty independent chat sessions, preserve partial success without replay, and save the selected members without implicit tool grants. Verify same-provider sessions never enqueue work and exercise mixed-agent creation, limits and failures with fakes.
+---
+ .../session_manager/chat_spawn_test.go        |  24 +++
+ .../components/PeerMemberPicker.test.tsx      | 110 +++++++++++
+ .../renderer/components/PeerMemberPicker.tsx  | 173 ++++++++++++++++++
+ .../src/renderer/components/PeerRoom.test.tsx |  40 ++++
+ frontend/src/renderer/components/PeerRoom.tsx |  66 ++++++-
+ 5 files changed, 405 insertions(+), 8 deletions(-)
+ create mode 100644 frontend/src/renderer/components/PeerMemberPicker.test.tsx
+ create mode 100644 frontend/src/renderer/components/PeerMemberPicker.tsx
+
+diff --git a/backend/internal/session_manager/chat_spawn_test.go b/backend/internal/session_manager/chat_spawn_test.go
+index 9ffcf52..6fef592 100644
+--- a/backend/internal/session_manager/chat_spawn_test.go
++++ b/backend/internal/session_manager/chat_spawn_test.go
+@@ -2085,3 +2085,27 @@ func TestChatSpawnDefaultRespectsProviderModes(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// Preparing room members must not enqueue work or widen native permissions.
++func TestPeerMemberEmptyChatSpawnDoesNotSendTask(t *testing.T) {
++	launcher := &recordingLauncher{}
++	m, _, _ := newChatManager(launcher)
++	for i := 0; i < 2; i++ {
++		_, _, _, err := m.Spawn(context.Background(), ports.SpawnConfig{
++			ProjectID: chatTestProject, Kind: domain.KindWorker, Harness: domain.HarnessCodex,
++			RequestedMode: domain.SessionModeChat,
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	if len(launcher.started) != 2 {
++		t.Fatalf("controllers = %d", len(launcher.started))
++	}
++	if len(launcher.turns) != 0 || len(launcher.queued) != 0 || len(launcher.relayed) != 0 {
++		t.Fatal("empty member spawn submitted work")
++	}
++	if launcher.started[0].SessionID == launcher.started[1].SessionID {
++		t.Fatal("members reused a session")
++	}
++}
+diff --git a/frontend/src/renderer/components/PeerMemberPicker.test.tsx b/frontend/src/renderer/components/PeerMemberPicker.test.tsx
+new file mode 100644
+index 0000000..542afc8
+--- /dev/null
++++ b/frontend/src/renderer/components/PeerMemberPicker.test.tsx
+@@ -0,0 +1,110 @@
++import {
++	render,
++	screen,
++	fireEvent,
++	waitFor,
++	cleanup,
++} from "@testing-library/react";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { beforeEach, afterEach, it, expect, vi } from "vitest";
++import { PeerMemberPicker } from "./PeerMemberPicker";
++const api = vi.hoisted(() => ({ GET: vi.fn(), POST: vi.fn() }));
++vi.mock("../lib/api-client", () => ({ apiClient: api }));
++afterEach(cleanup);
++beforeEach(() => {
++	vi.resetAllMocks();
++	api.GET.mockResolvedValue({
++		data: {
++			agents: ["codex", "deepseek-harness", "agy"].map((id) => ({
++				id,
++				installation: { state: id === "agy" ? "not_installed" : "installed" },
++				effectiveReadiness: "ready",
++			})),
++		},
++	});
++});
++function mount(selectedCount = 0) {
++	const added = vi.fn().mockResolvedValue(undefined);
++	render(
++		<QueryClientProvider
++			client={
++				new QueryClient({ defaultOptions: { queries: { retry: false } } })
++			}
++		>
++			<PeerMemberPicker
++				projectId="p"
++				selectedCount={selectedCount}
++				onAdded={added}
++				onClose={vi.fn()}
++				onBusyChange={vi.fn()}
++			/>
++		</QueryClientProvider>,
++	);
++	return added;
++}
++it("adds two Codex and a DeepSeek as independent empty chat sessions without sending work", async () => {
++	let n = 0;
++	api.POST.mockImplementation(async () => ({
++		data: { session: { id: `s${++n}` } },
++	}));
++	const added = mount();
++	await waitFor(() =>
++		expect(screen.getByLabelText("Codex 人数")).toBeEnabled(),
++	);
++	expect(api.POST).not.toHaveBeenCalled();
++	fireEvent.change(screen.getByLabelText("Codex 人数"), {
++		target: { value: "2" },
++	});
++	fireEvent.change(screen.getByLabelText("DeepSeek 人数"), {
++		target: { value: "1" },
++	});
++	fireEvent.click(screen.getByRole("button", { name: "添加 3 位成员" }));
++	await waitFor(() => expect(added).toHaveBeenCalledWith(["s1", "s2", "s3"]));
++	expect(api.POST.mock.calls.map((c) => c[1].body.harness)).toEqual([
++		"codex",
++		"codex",
++		"deepseek-harness",
++	]);
++	const keys = new Set();
++	for (const [path, options] of api.POST.mock.calls) {
++		expect(path).toBe("/api/v1/sessions");
++		expect(options.body).toMatchObject({
++			projectId: "p",
++			kind: "worker",
++			mode: "chat",
++			prompt: "",
++		});
++		expect(options.body.approvalMode).toBeUndefined();
++		keys.add(options.body.clientRequestId);
++	}
++	expect(keys.size).toBe(3);
++	expect(screen.getByRole("button", { name: "添加 3 位成员" })).toBeDisabled();
++});
++it("preserves partial success and does not replay an uncertain creation", async () => {
++	api.POST.mockResolvedValueOnce({
++		data: { session: { id: "s1" } },
++	}).mockRejectedValueOnce(new Error("connection lost"));
++	const added = mount();
++	await waitFor(() =>
++		expect(screen.getByLabelText("Codex 人数")).toBeEnabled(),
++	);
++	fireEvent.change(screen.getByLabelText("Codex 人数"), {
++		target: { value: "3" },
++	});
++	fireEvent.click(screen.getByRole("button", { name: "添加 3 位成员" }));
++	await waitFor(() => expect(added).toHaveBeenCalledWith(["s1"]));
++	expect(api.POST).toHaveBeenCalledTimes(2);
++	expect(screen.getByRole("button", { name: "添加 3 位成员" })).toBeDisabled();
++});
++it("blocks missing clients and exceeding room capacity", async () => {
++	mount(15);
++	await waitFor(() =>
++		expect(screen.getByLabelText("Codex 人数")).toBeEnabled(),
++	);
++	expect(screen.getByLabelText("Antigravity（Agy） 人数")).toBeDisabled();
++	fireEvent.change(screen.getByLabelText("Codex 人数"), {
++		target: { value: "2" },
++	});
++	expect(screen.getByRole("button", { name: "添加 2 位成员" })).toBeDisabled();
++	expect(api.POST).not.toHaveBeenCalled();
++});
+diff --git a/frontend/src/renderer/components/PeerMemberPicker.tsx b/frontend/src/renderer/components/PeerMemberPicker.tsx
+new file mode 100644
+index 0000000..85e3aac
+--- /dev/null
++++ b/frontend/src/renderer/components/PeerMemberPicker.tsx
+@@ -0,0 +1,173 @@
++import { useState } from "react";
++import { useQuery, useQueryClient } from "@tanstack/react-query";
++import { apiClient } from "../lib/api-client";
++import { Button } from "./ui/button";
++
++const choices = [
++	{ id: "codex", label: "Codex" },
++	{ id: "deepseek-harness", label: "DeepSeek" },
++	{ id: "agy", label: "Antigravity（Agy）" },
++] as const;
++
++/** Create independent native chat sessions without an initial task or permission override. */
++export function PeerMemberPicker({
++	projectId,
++	selectedCount,
++	onAdded,
++	onClose,
++	onBusyChange,
++}: {
++	projectId: string;
++	selectedCount: number;
++	onAdded: (ids: string[]) => Promise<string>;
++	onClose: () => void;
++	onBusyChange: (busy: boolean) => void;
++}) {
++	const cache = useQueryClient();
++	const [counts, setCounts] = useState<Record<string, number>>({});
++	const [busy, setBusy] = useState(false);
++	const [attempted, setAttempted] = useState(false);
++	const [notice, setNotice] = useState("");
++	const readiness = useQuery({
++		queryKey: ["peer-member-readiness"],
++		retry: false,
++		queryFn: async () => {
++			const r = await apiClient.GET("/api/v1/agents/readiness");
++			if (r.error || !r.data) throw new Error("无法读取客户端状态");
++			return r.data.agents;
++		},
++	});
++	const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
++	async function add() {
++		if (busy || attempted || !total || total + selectedCount > 16) return;
++		setBusy(true);
++		onBusyChange(true);
++		setAttempted(true);
++		const ids: string[] = [];
++		let failure = "";
++		let resultNotice = "";
++		try {
++			for (const choice of choices) {
++				for (let i = 0; i < (counts[choice.id] ?? 0); i++) {
++					setNotice(`正在准备 ${choice.label} ${i + 1}…`);
++					const r = await apiClient.POST("/api/v1/sessions", {
++						body: {
++							projectId,
++							kind: "worker",
++							mode: "chat",
++							harness: choice.id,
++							clientRequestId: crypto.randomUUID(),
++							prompt: "",
++						},
++					});
++					if (r.error || !r.data?.session.id) {
++						throw new Error(
++							`${choice.label} 创建未确认。请在成员列表或会话看板核查；不会自动重试。`,
++						);
++					}
++					ids.push(r.data.session.id);
++				}
++			}
++		} catch (e) {
++			failure = `${e instanceof Error ? e.message : "创建未确认"} 已停止后续创建；请核查会话看板，不会自动重试。`;
++		}
++		// Preserve successful sessions on partial failure. Never recreate them or send a task.
++		try {
++			await cache.invalidateQueries({ queryKey: ["workspaces"] });
++			if (ids.length) resultNotice = await onAdded(ids);
++		} catch {
++			failure += " 已创建的会话仍保留，请在成员列表选择并保存。";
++		} finally {
++			setNotice(failure || resultNotice);
++			setBusy(false);
++			onBusyChange(false);
++		}
++	}
++	return (
++		<section
++			aria-label="添加成员"
++			className="border-b border-border bg-secondary/30 p-4"
++		>
++			<div className="flex items-center justify-between gap-3">
++				<h2 className="font-medium">添加成员</h2>
++				<Button variant="quiet" disabled={busy} onClick={onClose}>
++					关闭
++				</Button>
++			</div>
++			<p className="my-2 text-sm text-muted-foreground">
++				选择每种智能体的人数，同一种也可以添加多位。只建立独立会话，不发送任务；客户端会启动并检查登录，权限沿用项目设置。
++			</p>
++			{readiness.isError && (
++				<p role="alert">无法读取客户端状态，请关闭后重试。</p>
++			)}
++			<div className="grid gap-3 sm:grid-cols-3">
++				{choices.map((choice) => {
++					const state = readiness.data?.find((a) => a.id === choice.id);
++					const missing = state?.installation.state === "not_installed";
++					return (
++						<label
++							key={choice.id}
++							className="flex flex-col gap-2 rounded border border-border p-3"
++						>
++							<span>{choice.label}</span>
++							<span className="text-xs text-muted-foreground">
++								{missing
++									? "未找到本机命令，暂不可添加"
++									: state?.effectiveReadiness === "ready"
++										? "客户端已就绪"
++										: "登录与连接仍需创建时验证"}
++							</span>
++							<input
++								aria-label={`${choice.label} 人数`}
++								type="number"
++								min={0}
++								max={16 - selectedCount}
++								value={counts[choice.id] ?? 0}
++								disabled={
++									busy ||
++									attempted ||
++									missing ||
++									readiness.isPending ||
++									readiness.isError
++								}
++								className="w-20 rounded border border-border bg-background p-2"
++								onChange={(e) =>
++									setCounts((old) => ({
++										...old,
++										[choice.id]: Math.max(
++											0,
++											Math.min(16, Math.floor(Number(e.target.value) || 0)),
++										),
++									}))
++								}
++							/>
++						</label>
++					);
++				})}
++			</div>
++			<div className="mt-3 flex flex-wrap items-center gap-3">
++				<Button
++					disabled={
++						busy ||
++						attempted ||
++						!total ||
++						selectedCount + total > 16 ||
++						readiness.isPending ||
++						readiness.isError
++					}
++					onClick={add}
++				>
++					{busy ? "正在准备成员…" : `添加 ${total} 位成员`}
++				</Button>
++				<span className="text-sm text-muted-foreground">
++					当前选择 {selectedCount} 位 · 房间最多 16 位
++				</span>
++			</div>
++			{notice && (
++				<p role="status" className="mt-3 text-sm">
++					{notice}
++				</p>
++			)}
++		</section>
++	);
++}
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index 7106316..175ef5d 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -204,3 +204,43 @@ it("renders exact correlated replies in the room and grants tools only on explic
+ 	expect(api.POST.mock.calls[0][0]).toContain("/bind");
+ 	expect(api.POST.mock.calls[0][1].body).toEqual({ epoch: 1 });
+ });
++
++it("adds multiple native members directly to the room without a message or implicit grant", async () => {
++	const get = api.GET.getMockImplementation()!;
++	api.GET.mockImplementation((path: string, ...args: any[]) =>
++		path.endsWith("/agents/readiness")
++			? Promise.resolve({
++					data: {
++						agents: [
++							{
++								id: "codex",
++								installation: { state: "installed" },
++								effectiveReadiness: "ready",
++							},
++						],
++					},
++				})
++			: get(path, ...args),
++	);
++	let n = 0;
++	api.POST.mockImplementation(async () => ({
++		data: { session: { id: `new-${++n}` } },
++	}));
++	mount();
++	await screen.findByText("本房间的消息");
++	fireEvent.click(screen.getByRole("button", { name: "添加成员" }));
++	await waitFor(() =>
++		expect(screen.getByLabelText("Codex 人数")).toBeEnabled(),
++	);
++	fireEvent.change(screen.getByLabelText("Codex 人数"), {
++		target: { value: "2" },
++	});
++	fireEvent.click(screen.getByRole("button", { name: "添加 2 位成员" }));
++	await waitFor(() => expect(api.PUT).toHaveBeenCalled());
++	expect(room.members).toEqual(["a", "b", "new-1", "new-2"]);
++	expect(api.POST.mock.calls.every((c) => c[0] === "/api/v1/sessions")).toBe(
++		true,
++	);
++	expect(api.POST).toHaveBeenCalledTimes(2);
++	await screen.findByText(/成员已加入房间/);
++});
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index 9445b35..4db8f37 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -1,3 +1,4 @@
++import { PeerMemberPicker } from "./PeerMemberPicker";
+ import { useEffect, useRef, useState } from "react";
+ import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+ import type { components } from "../../api/schema";
+@@ -16,7 +17,15 @@ const states: Record<string, string> = {
+ 	blocked: "未发送",
+ 	uncertain: "结果不确定，请核查",
+ };
+-const replyStates:Record<string,string>={queued:"等待处理",running:"正在工作",completed:"本轮已回复",recovered:"已恢复",interrupted:"已中断",failed:"本轮失败",cancelled:"已取消"};
++const replyStates: Record<string, string> = {
++	queued: "等待处理",
++	running: "正在工作",
++	completed: "本轮已回复",
++	recovered: "已恢复",
++	interrupted: "已中断",
++	failed: "本轮失败",
++	cancelled: "已取消",
++};
+ const controllerStates: Record<string, string> = {
+ 	busy: "正在工作",
+ 	ready: "就绪",
+@@ -52,6 +61,7 @@ export function PeerRoom({
+ 	const [draftBudget, setDraftBudget] = useState<number | null>(null);
+ 	const [text, setText] = useState("");
+ 	const [busy, setBusy] = useState(false);
++	const [addingMembers, setAddingMembers] = useState(false);
+ 	const [error, setError] = useState("");
+ 	const history = useRef<HTMLDivElement>(null);
+ 	const followLatest = useRef(true);
+@@ -191,12 +201,14 @@ export function PeerRoom({
+ 			cache.setQueryData(key, result.data);
+ 			setDraftMembers(null);
+ 			setDraftBudget(null);
++			return true;
+ 		} catch (e) {
+ 			setError(failure(e).message);
+ 			await cache.invalidateQueries({ queryKey: key });
+ 			await cache.invalidateQueries({
+ 				queryKey: ["peer-room-history", roomId],
+ 			});
++			return false;
+ 		} finally {
+ 			setBusy(false);
+ 		}
+@@ -264,8 +276,24 @@ export function PeerRoom({
+ 					</p>
+ 				</div>
+ 				<div className="flex gap-2">
+-					<Button variant="secondary" onClick={onManageSessions}>
+-						管理 / 新建会话
++					<Button
++						disabled={
++							busy ||
++							addingMembers ||
++							room.isPending ||
++							room.isError ||
++							selected.length >= 16
++						}
++						onClick={() => setAddingMembers(true)}
++					>
++						添加成员
++					</Button>
++					<Button
++						variant="secondary"
++						disabled={busy}
++						onClick={onManageSessions}
++					>
++						会话看板
+ 					</Button>
+ 					{room.data && (
+ 						<Button
+@@ -278,7 +306,27 @@ export function PeerRoom({
+ 					)}
+ 				</div>
+ 			</header>
+-			<details className="border-b border-border p-4" open={!room.data}>
++			{addingMembers && (
++				<PeerMemberPicker
++					onBusyChange={setBusy}
++					projectId={projectId}
++					selectedCount={selected.length}
++					onClose={() => setAddingMembers(false)}
++					onAdded={async (ids) => {
++						const next = [...new Set([...selected, ...ids])];
++						setDraftMembers(next);
++						if (next.length < 2)
++							return "已准备成员；请再添加一位或勾选已有会话，房间至少需要两位成员。";
++						if (!(await configure(room.data?.paused ?? false, next)))
++							throw new Error("房间保存未确认");
++						return "成员已加入房间。点击「连接 / 更新同伴工具」后，即可向全体发送任务。";
++					}}
++				/>
++			)}
++			<details
++				className="border-b border-border p-4"
++				open={!room.data || addingMembers}
++			>
+ 				<summary className="cursor-pointer text-sm">
+ 					房间成员（{members.length}）
+ 				</summary>
+@@ -306,7 +354,7 @@ export function PeerRoom({
+ 				</div>
+ 				{!eligible.length && (
+ 					<p className="my-2 text-sm">
+-						还没有可加入的本机对话会话，请先新建会话。同一种智能体可以创建多个会话。
++						点击上方「添加成员」，选择客户端及人数，无需先发一条任务。
+ 					</p>
+ 				)}
+ 				<label className="mt-3 flex items-center gap-2 text-sm">
+@@ -323,14 +371,14 @@ export function PeerRoom({
+ 					/>
+ 				</label>
+ 				<p className="my-3 text-sm text-muted-foreground">
+-					加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员或恢复房间后，请点击连接按钮明确更新同伴工具授权。
++					至少选择两位成员。加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员或恢复房间后，请点击连接按钮明确更新同伴工具授权。
+ 				</p>
+ 				<Button
+ 					disabled={
+ 						busy ||
+ 						room.isPending ||
+ 						room.isError ||
+-						!selected.length ||
++						selected.length < 2 ||
+ 						selected.length > 16 ||
+ 						!Number.isInteger(draftBudget ?? 24) ||
+ 						(draftBudget !== null &&
+@@ -414,7 +462,9 @@ export function PeerRoom({
+ 								>
+ 									<p className="mb-2 text-xs text-muted-foreground">
+ 										{label(d.target)} ·{" "}
+-										{reply.streaming ? "正在回复" : (replyStates[reply.turnState] ?? "状态待确认")}
++										{reply.streaming
++											? "正在回复"
++											: (replyStates[reply.turnState] ?? "状态待确认")}
+ 									</p>
+ 									<ChatMarkdown text={reply.text} streaming={reply.streaming} />
+ 								</section>
+-- 
+2.54.0 (Apple Git-157)
+
