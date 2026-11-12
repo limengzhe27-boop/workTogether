@@ -1,0 +1,543 @@
+From a67319ed1764837557b6a68cc20e2ea5d98866d7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 14:29:54 +0800
+Subject: [PATCH] fix: keep expanded room panels inside the scrollable viewport
+
+Share one scroll area across membership, tasks and history so expanded controls cannot push the composer out of view. Keep header and bounded composer outside the scroll area.
+---
+ frontend/src/renderer/components/PeerRoom.tsx | 494 +++++++++---------
+ 1 file changed, 248 insertions(+), 246 deletions(-)
+
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index 551a94f..b936f23 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -307,8 +307,8 @@ export function PeerRoom({
+ 		!!text.trim() &&
+ 		new TextEncoder().encode(text).length <= 2000;
+ 	return (
+-		<section className="flex min-h-0 flex-1 flex-col" aria-label="项目群聊">
+-			<header className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-4">
++		<section className="flex min-h-0 flex-1 flex-col overflow-hidden" aria-label="项目群聊">
++			<header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-border p-4">
+ 				<div>
+ 					<h1 className="text-base font-medium">项目群聊</h1>
+ 					<p className="text-sm text-muted-foreground">
+@@ -349,165 +349,6 @@ export function PeerRoom({
+ 					)}
+ 				</div>
+ 			</header>
+-			{addingMembers && (
+-				<PeerMemberPicker
+-					onBusyChange={setBusy}
+-					projectId={projectId}
+-					selectedCount={selected.length}
+-					onClose={() => setAddingMembers(false)}
+-					onAdded={async (ids) => {
+-						const next = [...new Set([...selected, ...ids])];
+-						editMembers(next);
+-						if (next.length < 2)
+-							return "已准备成员；请再添加一位或勾选已有会话，房间至少需要两位成员。";
+-						if (!(await configure(room.data?.paused ?? false, next)))
+-							throw new Error("房间保存未确认");
+-						setAddingMembers(false);
+-						return "成员已加入房间。点击「连接 / 更新同伴工具」后，即可向全体发送任务。";
+-					}}
+-				/>
+-			)}
+-			<details
+-				className="border-b border-border p-4"
+-				open={!room.data || addingMembers || pendingChanges || !!saveNotice}
+-			>
+-				<summary className="cursor-pointer text-sm">
+-					已加入房间：{members.length} 位
+-					{pendingChanges ? ` · 未保存选择：${selected.length} 位` : ""}
+-				</summary>
+-				<Button
+-					disabled={
+-						busy ||
+-						draftConflict ||
+-						(!!room.data && !pendingChanges) ||
+-						room.isPending ||
+-						room.isError ||
+-						selected.length < 2 ||
+-						selected.length > 16 ||
+-						!Number.isInteger(draftBudget ?? 24) ||
+-						(draftBudget !== null &&
+-							(draftBudget < Math.max(1, room.data?.used ?? 0) ||
+-								draftBudget > 100))
+-					}
+-					onClick={() => configure(room.data?.paused ?? false)}
+-				>
+-					{room.data
+-						? pendingChanges
+-							? `保存选择（${selected.length} 位）`
+-							: "成员已保存"
+-						: "创建项目房间"}
+-				</Button>
+-				{pendingChanges && (
+-					<div
+-						role="status"
+-						className="my-3 rounded border border-border bg-secondary p-3 text-sm"
+-					>
+-						{draftConflict
+-							? "房间已被其他操作更新。你的选择仍保留，请重新载入已保存成员后再修改。"
+-							: `有未保存修改：已加入 ${members.length} 位，当前选择 ${selected.length} 位。请点击「保存选择」。保存前不会更改接收消息的成员。`}
+-						<Button variant="quiet" disabled={busy} onClick={discardDraft}>
+-							取消修改，载入已保存成员
+-						</Button>
+-					</div>
+-				)}
+-				{!pendingChanges && saveNotice && (
+-					<p role="status" className="my-3 text-sm">
+-						{saveNotice}
+-					</p>
+-				)}
+-				<div className="mt-3 flex flex-wrap gap-3">
+-					{eligible.map((s) => (
+-						<label
+-							key={s.id}
+-							className="flex min-h-11 items-center gap-2 text-sm"
+-						>
+-							<input
+-								type="checkbox"
+-								checked={selected.includes(s.id)}
+-								disabled={busy}
+-								onChange={(e) =>
+-									editMembers(
+-										e.target.checked
+-											? [...selected, s.id]
+-											: selected.filter((id) => id !== s.id),
+-									)
+-								}
+-							/>
+-							{label(s.id)}
+-							<span className="text-xs text-muted-foreground">
+-								{members.includes(s.id)
+-									? selected.includes(s.id)
+-										? "已加入"
+-										: "待移出 · 未保存"
+-									: selected.includes(s.id)
+-										? "待加入 · 未保存"
+-										: "未加入"}
+-							</span>
+-						</label>
+-					))}
+-				</div>
+-				{!eligible.length && (
+-					<p className="my-2 text-sm">
+-						点击上方「添加成员」，选择客户端及人数，无需先发一条任务。
+-					</p>
+-				)}
+-				<label className="mt-3 flex items-center gap-2 text-sm">
+-					总投递上限
+-					<input
+-						aria-label="总投递上限"
+-						type="number"
+-						min={Math.max(1, room.data?.used ?? 0)}
+-						max={100}
+-						value={draftBudget ?? room.data?.budget ?? 24}
+-						disabled={busy}
+-						onChange={(e) => {
+-							if (draftEpoch.current === null)
+-								draftEpoch.current = room.data?.epoch ?? 0;
+-							setDraftBudget(Number(e.target.value));
+-							setSaveNotice("");
+-						}}
+-						className="w-20 rounded border border-border bg-secondary p-2 focus-visible:ring-2 focus-visible:ring-ring"
+-					/>
+-				</label>
+-				<p className="my-3 text-sm text-muted-foreground">
+-					至少选择两位成员。加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员或恢复房间后，请点击连接按钮明确更新同伴工具授权。
+-				</p>
+-			</details>
+-			{room.data && (
+-				<div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
+-					<Button
+-						variant="secondary"
+-						disabled={busy || room.data.paused || pendingChanges}
+-						onClick={bindTools}
+-					>
+-						连接 / 更新同伴工具
+-					</Button>
+-					<p className="text-xs text-muted-foreground">
+-						{
+-							members.filter(
+-								(_, i) =>
+-									bindings[i]?.data?.roomId === roomId &&
+-									bindings[i]?.data?.epoch === room.data?.epoch,
+-							).length
+-						}{" "}
+-						/ {members.length} 位成员已授权当前房间。此操作不会启动模型。
+-					</p>
+-				</div>
+-			)}
+-			{room.data && (
+-				<PeerTasks
+-					key={roomId}
+-					roomId={roomId}
+-					epoch={room.data.epoch}
+-					paused={room.data.paused}
+-				/>
+-			)}
+-
+-			{(error || room.isError) && (
+-				<p role="alert" className="p-4 text-destructive">
+-					{error || failure(room.error).message}
+-				</p>
+-			)}
+ 			<div
+ 				ref={history}
+ 				onScroll={(e) => {
+@@ -515,101 +356,262 @@ export function PeerRoom({
+ 					followLatest.current =
+ 						el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+ 				}}
+-				className="min-h-0 flex-1 overflow-auto p-4"
+-				aria-label="成员对话记录"
++				className="min-h-0 flex-1 overflow-y-auto"
++				aria-label="群聊内容"
+ 			>
+-				<div className="mx-auto max-w-3xl space-y-6">
+-					<h2 className="text-sm font-medium">本房间投递记录</h2>
+-					<p className="text-xs text-muted-foreground">
+-						记录获准发送的消息和接收状态。未获准的请求不在历史中；已接收不等于已完成回复。
+-					</p>
+-					{deliveries.isError && (
+-						<p role="alert">房间记录加载失败，请稍后刷新；不要据此重复发送。</p>
++				{addingMembers && (
++					<PeerMemberPicker
++						onBusyChange={setBusy}
++						projectId={projectId}
++						selectedCount={selected.length}
++						onClose={() => setAddingMembers(false)}
++						onAdded={async (ids) => {
++							const next = [...new Set([...selected, ...ids])];
++							editMembers(next);
++							if (next.length < 2)
++								return "已准备成员；请再添加一位或勾选已有会话，房间至少需要两位成员。";
++							if (!(await configure(room.data?.paused ?? false, next)))
++								throw new Error("房间保存未确认");
++							setAddingMembers(false);
++							return "成员已加入房间。点击「连接 / 更新同伴工具」后，即可向全体发送任务。";
++						}}
++					/>
++				)}
++				<details
++					className="border-b border-border p-4"
++					open={!room.data || addingMembers || pendingChanges || !!saveNotice}
++				>
++					<summary className="cursor-pointer text-sm">
++						已加入房间：{members.length} 位
++						{pendingChanges ? ` · 未保存选择：${selected.length} 位` : ""}
++					</summary>
++					<Button
++						disabled={
++							busy ||
++							draftConflict ||
++							(!!room.data && !pendingChanges) ||
++							room.isPending ||
++							room.isError ||
++							selected.length < 2 ||
++							selected.length > 16 ||
++							!Number.isInteger(draftBudget ?? 24) ||
++							(draftBudget !== null &&
++								(draftBudget < Math.max(1, room.data?.used ?? 0) ||
++									draftBudget > 100))
++						}
++						onClick={() => configure(room.data?.paused ?? false)}
++					>
++						{room.data
++							? pendingChanges
++								? `保存选择（${selected.length} 位）`
++								: "成员已保存"
++							: "创建项目房间"}
++					</Button>
++					{pendingChanges && (
++						<div
++							role="status"
++							className="my-3 rounded border border-border bg-secondary p-3 text-sm"
++						>
++							{draftConflict
++								? "房间已被其他操作更新。你的选择仍保留，请重新载入已保存成员后再修改。"
++								: `有未保存修改：已加入 ${members.length} 位，当前选择 ${selected.length} 位。请点击「保存选择」。保存前不会更改接收消息的成员。`}
++							<Button variant="quiet" disabled={busy} onClick={discardDraft}>
++								取消修改，载入已保存成员
++							</Button>
++						</div>
+ 					)}
+-					{(deliveries.data ?? []).map((d) => (
+-						<article key={d.id} className="rounded-xl bg-secondary p-4">
+-							<p className="mb-2 text-xs text-muted-foreground">
+-								{d.target
+-									? `${d.sender ? label(d.sender) : "你"} → ${label(d.target)}`
+-									: "旧版投递（未保存正文和成员信息）"}{" "}
+-								· {states[d.state] ?? d.state}
+-								{d.createdAt
+-									? ` · ${new Date(d.createdAt).toLocaleString()}`
+-									: ""}
+-							</p>
+-							{d.message && <ChatMarkdown text={d.message} />}
+-							{(d.replies ?? []).map((reply) => (
+-								<section
+-									key={reply.id}
+-									className="mt-4 border-t border-border pt-3"
+-								>
+-									<p className="mb-2 text-xs text-muted-foreground">
+-										{label(d.target)} ·{" "}
+-										{reply.streaming
+-											? "正在回复"
+-											: (replyStates[reply.turnState] ?? "状态待确认")}
+-									</p>
+-									<ChatMarkdown text={reply.text} streaming={reply.streaming} />
+-								</section>
+-							))}
+-							{d.repliesTruncated && (
+-								<p className="text-xs text-muted-foreground">
+-									此轮回复较长，更多内容请查看原生会话。
+-								</p>
+-							)}
+-						</article>
+-					))}
+-					<details>
+-						<summary className="cursor-pointer text-sm">
+-							查看成员原生会话（包含其他对话，不代表房间回复）
+-						</summary>
+-
+-						{members.map((id, i) => (
+-							<p key={id} className="text-sm text-muted-foreground">
+-								{label(id)}：
+-								{onOpenSession && (
+-									<Button variant="quiet" onClick={() => onOpenSession(id)}>
+-										打开原生会话 / 处理授权
+-									</Button>
+-								)}
+-								{conversations[i]?.isError
+-									? "记录加载失败，不能确认当前状态"
+-									: (controllerStates[
+-											conversations[i]?.data?.controller ?? ""
+-										] ?? "加载中")}
+-								{conversations[i]?.data?.hasMoreBefore
+-									? " · 仅显示最近记录，完整历史请在会话中查看"
+-									: ""}
+-							</p>
++					{!pendingChanges && saveNotice && (
++						<p role="status" className="my-3 text-sm">
++							{saveNotice}
++						</p>
++					)}
++					<div className="mt-3 flex flex-wrap gap-3">
++						{eligible.map((s) => (
++							<label
++								key={s.id}
++								className="flex min-h-11 items-center gap-2 text-sm"
++							>
++								<input
++									type="checkbox"
++									checked={selected.includes(s.id)}
++									disabled={busy}
++									onChange={(e) =>
++										editMembers(
++											e.target.checked
++												? [...selected, s.id]
++												: selected.filter((id) => id !== s.id),
++										)
++									}
++								/>
++								{label(s.id)}
++								<span className="text-xs text-muted-foreground">
++									{members.includes(s.id)
++										? selected.includes(s.id)
++											? "已加入"
++											: "待移出 · 未保存"
++										: selected.includes(s.id)
++											? "待加入 · 未保存"
++											: "未加入"}
++								</span>
++							</label>
+ 						))}
+-						{!messages.length && (
+-							<p className="py-12 text-center text-muted-foreground">
+-								在这里说明目标，消息将发给房间中的每个成员。
+-							</p>
++					</div>
++					{!eligible.length && (
++						<p className="my-2 text-sm">
++							点击上方「添加成员」，选择客户端及人数，无需先发一条任务。
++						</p>
++					)}
++					<label className="mt-3 flex items-center gap-2 text-sm">
++						总投递上限
++						<input
++							aria-label="总投递上限"
++							type="number"
++							min={Math.max(1, room.data?.used ?? 0)}
++							max={100}
++							value={draftBudget ?? room.data?.budget ?? 24}
++							disabled={busy}
++							onChange={(e) => {
++								if (draftEpoch.current === null)
++									draftEpoch.current = room.data?.epoch ?? 0;
++								setDraftBudget(Number(e.target.value));
++								setSaveNotice("");
++							}}
++							className="w-20 rounded border border-border bg-secondary p-2 focus-visible:ring-2 focus-visible:ring-ring"
++						/>
++					</label>
++					<p className="my-3 text-sm text-muted-foreground">
++						至少选择两位成员。加入后通过本房间发送，原单聊发送入口会受限。暂停不强杀在途工作。修改成员或恢复房间后，请点击连接按钮明确更新同伴工具授权。
++					</p>
++				</details>
++				{room.data && (
++					<div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
++						<Button
++							variant="secondary"
++							disabled={busy || room.data.paused || pendingChanges}
++							onClick={bindTools}
++						>
++							连接 / 更新同伴工具
++						</Button>
++						<p className="text-xs text-muted-foreground">
++							{
++								members.filter(
++									(_, i) =>
++										bindings[i]?.data?.roomId === roomId &&
++										bindings[i]?.data?.epoch === room.data?.epoch,
++								).length
++							}{" "}
++							/ {members.length} 位成员已授权当前房间。此操作不会启动模型。
++						</p>
++					</div>
++				)}
++				{room.data && (
++					<PeerTasks
++						key={roomId}
++						roomId={roomId}
++						epoch={room.data.epoch}
++						paused={room.data.paused}
++					/>
++				)}
++
++				{(error || room.isError) && (
++					<p role="alert" className="p-4 text-destructive">
++						{error || failure(room.error).message}
++					</p>
++				)}
++				<div className="p-4" aria-label="成员对话记录">
++					<div className="mx-auto max-w-3xl space-y-6">
++						<h2 className="text-sm font-medium">本房间投递记录</h2>
++						<p className="text-xs text-muted-foreground">
++							记录获准发送的消息和接收状态。未获准的请求不在历史中；已接收不等于已完成回复。
++						</p>
++						{deliveries.isError && (
++							<p role="alert">房间记录加载失败，请稍后刷新；不要据此重复发送。</p>
+ 						)}
+-						{messages.map((m) => (
+-							<article
+-								key={`${m.session}:${m.id}`}
+-								className={
+-									m.role === "user"
+-										? "ml-auto max-w-[90%] rounded-xl bg-secondary p-4"
+-										: "py-2"
+-								}
+-							>
++						{(deliveries.data ?? []).map((d) => (
++							<article key={d.id} className="rounded-xl bg-secondary p-4">
+ 								<p className="mb-2 text-xs text-muted-foreground">
+-									{m.role === "assistant"
+-										? label(m.session)
+-										: `${m.senderDisplayName || m.senderSessionId || "你"} → ${label(m.session)}`}{" "}
+-									· {new Date(m.createdAt).toLocaleTimeString()}
+-									{m.streaming ? " · 正在回复" : ""}
++									{d.target
++										? `${d.sender ? label(d.sender) : "你"} → ${label(d.target)}`
++										: "旧版投递（未保存正文和成员信息）"}{" "}
++									· {states[d.state] ?? d.state}
++									{d.createdAt
++										? ` · ${new Date(d.createdAt).toLocaleString()}`
++										: ""}
+ 								</p>
+-								<ChatMarkdown text={m.text} streaming={m.streaming} />
++								{d.message && <ChatMarkdown text={d.message} />}
++								{(d.replies ?? []).map((reply) => (
++									<section
++										key={reply.id}
++										className="mt-4 border-t border-border pt-3"
++									>
++										<p className="mb-2 text-xs text-muted-foreground">
++											{label(d.target)} ·{" "}
++											{reply.streaming
++												? "正在回复"
++												: (replyStates[reply.turnState] ?? "状态待确认")}
++										</p>
++										<ChatMarkdown text={reply.text} streaming={reply.streaming} />
++									</section>
++								))}
++								{d.repliesTruncated && (
++									<p className="text-xs text-muted-foreground">
++										此轮回复较长，更多内容请查看原生会话。
++									</p>
++								)}
+ 							</article>
+ 						))}
+-					</details>
++						<details>
++							<summary className="cursor-pointer text-sm">
++								查看成员原生会话（包含其他对话，不代表房间回复）
++							</summary>
++
++							{members.map((id, i) => (
++								<p key={id} className="text-sm text-muted-foreground">
++									{label(id)}：
++									{onOpenSession && (
++										<Button variant="quiet" onClick={() => onOpenSession(id)}>
++											打开原生会话 / 处理授权
++										</Button>
++									)}
++									{conversations[i]?.isError
++										? "记录加载失败，不能确认当前状态"
++										: (controllerStates[
++												conversations[i]?.data?.controller ?? ""
++											] ?? "加载中")}
++									{conversations[i]?.data?.hasMoreBefore
++										? " · 仅显示最近记录，完整历史请在会话中查看"
++										: ""}
++								</p>
++							))}
++							{!messages.length && (
++								<p className="py-12 text-center text-muted-foreground">
++									在这里说明目标，消息将发给房间中的每个成员。
++								</p>
++							)}
++							{messages.map((m) => (
++								<article
++									key={`${m.session}:${m.id}`}
++									className={
++										m.role === "user"
++											? "ml-auto max-w-[90%] rounded-xl bg-secondary p-4"
++											: "py-2"
++									}
++								>
++									<p className="mb-2 text-xs text-muted-foreground">
++										{m.role === "assistant"
++											? label(m.session)
++											: `${m.senderDisplayName || m.senderSessionId || "你"} → ${label(m.session)}`}{" "}
++										· {new Date(m.createdAt).toLocaleTimeString()}
++										{m.streaming ? " · 正在回复" : ""}
++									</p>
++									<ChatMarkdown text={m.text} streaming={m.streaming} />
++								</article>
++							))}
++						</details>
++					</div>
+ 				</div>
+ 			</div>
+-			<footer className="border-t border-border p-4">
++			<footer className="max-h-[40%] shrink-0 overflow-y-auto border-t border-border p-4">
+ 				<div className="mx-auto max-w-3xl">
+ 					<div aria-live="polite">
+ 						{receipts.map((r) => (
+-- 
+2.54.0 (Apple Git-157)
+
