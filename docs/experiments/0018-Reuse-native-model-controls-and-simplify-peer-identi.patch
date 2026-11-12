@@ -1,0 +1,622 @@
+From 56455558e2a97a04b069837c88c169f7181211ed Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Thu, 12 Nov 2026 19:22:04 +0800
+Subject: [PATCH] Reuse native model controls and simplify peer identity
+ editing
+
+Use the same turn settings menu as native chats, save names on blur or Enter with duplicate-write protection, and show reported per-session context around member icons. Verified by 149 focused tests and frontend typecheck.
+---
+ .../renderer/components/PeerAgentSettings.tsx | 331 ++++++++----------
+ frontend/src/renderer/components/PeerRoom.tsx |   1 +
+ .../renderer/components/PeerSettings.test.tsx |  98 +++++-
+ 3 files changed, 238 insertions(+), 192 deletions(-)
+
+diff --git a/frontend/src/renderer/components/PeerAgentSettings.tsx b/frontend/src/renderer/components/PeerAgentSettings.tsx
+index c1fbf3b..0b3a40d 100644
+--- a/frontend/src/renderer/components/PeerAgentSettings.tsx
++++ b/frontend/src/renderer/components/PeerAgentSettings.tsx
+@@ -1,12 +1,14 @@
+-import { useState } from "react";
++import { useRef, useState } from "react";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+-import { Bot, ChevronDown } from "lucide-react";
++import { Bot } from "lucide-react";
+ import { apiClient } from "../lib/api-client";
+ import type { WorkspaceSession } from "../types/workspace";
+ import type { components } from "../../api/schema";
+ import { Button } from "./ui/button";
+ import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
+ import { CodexIcon, AntigravityIcon } from "./icons";
++import { TurnSettingsBar } from "./chat/TurnSettingsBar";
++import type { ChatConfigOptionValue } from "../types/conversation";
+ 
+ export function PeerAgentIcon({ provider }: { provider?: string }) {
+ 	const Icon =
+@@ -17,15 +19,6 @@ export function PeerAgentIcon({ provider }: { provider?: string }) {
+ 				: Bot;
+ 	return <Icon className="size-4 shrink-0" aria-hidden="true" />;
+ }
+-const effortLabels: Record<string, string> = {
+-	off: "关闭",
+-	low: "低",
+-	medium: "中",
+-	high: "高",
+-	xhigh: "极高",
+-	max: "最高",
+-	ultra: "超高",
+-};
+ type Settings = components["schemas"]["ConversationTurnSettingsPayload"];
+ function message(e: unknown) {
+ 	return e && typeof e === "object" && "message" in e
+@@ -41,8 +34,10 @@ export function PeerAgentSettings({
+ 	onBusyChange,
+ 	onRenamed,
+ 	onOpenSession,
++	usage,
+ }: {
+ 	session: WorkspaceSession;
++	usage?: { contextUsed: number; contextWindow: number };
+ 	issue: string;
+ 	disabled: boolean;
+ 	onBusyChange: (busy: boolean) => void;
+@@ -58,6 +53,25 @@ export function PeerAgentSettings({
+ 	const [name, setName] = useState(session.title || session.id);
+ 	const [saving, setSaving] = useState(false);
+ 	const [error, setError] = useState("");
++	const savedName = useRef(session.title || session.id);
++	const nameWrite = useRef<Promise<boolean> | null>(null);
++	const savingRef = useRef(false);
++	const known =
++		!!usage &&
++		Number.isFinite(usage.contextUsed) &&
++		Number.isFinite(usage.contextWindow) &&
++		usage.contextUsed >= 0 &&
++		usage.contextWindow > 0;
++	const percent = known
++		? Math.min(
++				100,
++				Math.max(0, (usage!.contextUsed / usage!.contextWindow) * 100),
++			)
++		: undefined;
++	const contextLabel =
++		percent === undefined
++			? "上下文用量未上报"
++			: `上下文已用 ${Math.round(percent)}%（${usage!.contextUsed.toLocaleString()} / ${usage!.contextWindow.toLocaleString()} tokens）`;
+ 	const key = ["peer-agent-settings", session.id];
+ 	const catalog = useQuery({
+ 		queryKey: key,
+@@ -83,7 +97,8 @@ export function PeerAgentSettings({
+ 		},
+ 	});
+ 	async function save(action: () => Promise<void>) {
+-		if (saving || disabled) return;
++		if (savingRef.current || disabled) return false;
++		savingRef.current = true;
+ 		setSaving(true);
+ 		onBusyChange(true);
+ 		setError("");
+@@ -91,19 +106,22 @@ export function PeerAgentSettings({
+ 			await action();
+ 			await cache.invalidateQueries({ queryKey: key });
+ 			await cache.invalidateQueries({ queryKey: ["peer-room-conversation"] });
++			return true;
+ 		} catch (e) {
+ 			setError(message(e));
++			return false;
+ 		} finally {
++			savingRef.current = false;
+ 			setSaving(false);
+ 			onBusyChange(false);
+ 		}
+ 	}
+-	async function nativeOption(id: string, value: string) {
++	async function nativeOption(id: string, value: ChatConfigOptionValue) {
+ 		const r = await apiClient.PATCH(
+ 			"/api/v1/sessions/{sessionId}/conversation/config-options/{configId}",
+ 			{
+ 				params: { path: { sessionId: session.id, configId: id } },
+-				body: { value },
++				body: value,
+ 			},
+ 		);
+ 		if (r.error) throw r.error;
+@@ -118,34 +136,47 @@ export function PeerAgentSettings({
+ 		);
+ 		if (r.error) throw r.error;
+ 	}
++	async function rename(): Promise<boolean> {
++		if (nameWrite.current) return nameWrite.current;
++		const next = name.trim();
++		if (next === savedName.current) return true;
++		if (!next) {
++			setError("名称不能为空");
++			return false;
++		}
++		const pending = save(async () => {
++			const r = await apiClient.PATCH("/api/v1/sessions/{sessionId}", {
++				params: { path: { sessionId: session.id } },
++				body: { displayName: next },
++			});
++			if (r.error) throw r.error;
++			savedName.current = next;
++			setName(next);
++			onRenamed(next);
++			await cache.invalidateQueries({ queryKey: ["workspaces"] });
++		});
++		nameWrite.current = pending;
++		try {
++			return await pending;
++		} finally {
++			nameWrite.current = null;
++		}
++	}
+ 	const data = catalog.data;
+-	const modelOption = data?.options.find(
+-		(o) => o.type === "select" && (o.category === "model" || o.id === "model"),
+-	);
+-	const thoughtOption = data?.options.find(
+-		(o) =>
+-			o.type === "select" &&
+-			(o.category === "thought_level" || o.id === "reasoning_effort"),
+-	);
+-	const model =
+-		data?.models.find((m) => m.id === data.settings.model) ??
+-		data?.models.find((m) => m.default);
+-	const modelName =
+-		modelOption?.choices?.find((c) => c.value === modelOption.currentValue)
+-			?.name || model?.displayName;
+ 	const blocked = saving || disabled || !!issue;
+-	const selectClass =
+-		"w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-ring";
+ 	return (
+ 		<Popover
+ 			open={open}
+ 			onOpenChange={(v) => {
+-				if (!saving) {
+-					setOpen(v);
+-					if (v) {
+-						setName(session.title || session.id);
+-						setError("");
+-					}
++				if (v) {
++					setOpen(true);
++					savedName.current = session.title || session.id;
++					setName(savedName.current);
++					setError("");
++				} else {
++					void rename().then((ok) => {
++						if (ok) setOpen(false);
++					});
+ 				}
+ 			}}
+ 		>
+@@ -153,11 +184,53 @@ export function PeerAgentSettings({
+ 				<button
+ 					type="button"
+ 					aria-label={`设置成员 ${session.title || session.id}`}
+-					title={`${session.title || session.id} · ${issue || "就绪"}`}
++					title={`${session.title || session.id} · ${issue || "就绪"} · ${contextLabel}`}
+ 					className="inline-flex h-8 max-w-32 shrink-0 items-center gap-1.5 rounded-lg px-2 text-xs text-muted-foreground hover:bg-background hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+ 					disabled={disabled}
+ 				>
+-					<PeerAgentIcon provider={session.provider} />
++					<span
++						className="relative inline-flex size-8 shrink-0 items-center justify-center"
++						role="img"
++						aria-label={contextLabel}
++					>
++						<svg
++							viewBox="0 0 36 36"
++							className="absolute inset-0 size-8 -rotate-90"
++							aria-hidden="true"
++						>
++							<circle
++								cx="18"
++								cy="18"
++								r="16"
++								fill="none"
++								stroke="currentColor"
++								strokeWidth="2"
++								className="text-border"
++								strokeDasharray={known ? undefined : "2 3"}
++							/>
++							{percent !== undefined && (
++								<circle
++									cx="18"
++									cy="18"
++									r="16"
++									fill="none"
++									stroke="currentColor"
++									strokeWidth="2"
++									pathLength="100"
++									strokeDasharray={`${percent} 100`}
++									strokeLinecap="round"
++									className={
++										percent >= 90
++											? "text-status-exited"
++											: percent >= 70
++												? "text-status-needs-you"
++												: "text-muted-foreground"
++									}
++								/>
++							)}
++						</svg>
++						<PeerAgentIcon provider={session.provider} />
++					</span>
+ 					<span className="max-w-24 truncate">{compactName}</span>
+ 					{issue && (
+ 						<span
+@@ -165,55 +238,42 @@ export function PeerAgentSettings({
+ 							aria-label="暂不可用"
+ 						/>
+ 					)}
+-					<ChevronDown className="size-3 text-muted-foreground" />
+ 				</button>
+ 			</PopoverTrigger>
+ 			<PopoverContent
+ 				side="top"
+ 				align="start"
+-				className="w-80 max-w-[calc(100vw-2rem)] space-y-4 p-4"
++				className="w-80 max-w-[calc(100vw-2rem)] space-y-3 p-3"
++				onEscapeKeyDown={(e) => {
++					if (name !== savedName.current) {
++						e.preventDefault();
++						setName(savedName.current);
++						setError("");
++					}
++				}}
+ 			>
+-				<div className="flex items-center gap-2">
+-					<PeerAgentIcon provider={session.provider} />
+-					<strong className="text-sm">{session.title || session.id}</strong>
+-					<span className="ml-auto text-xs text-muted-foreground">
+-						{session.provider}
+-					</span>
+-				</div>
+-				<label className="block space-y-1 text-xs">
+-					成员名称
++				<label className="block text-xs">
++					<span className="sr-only">成员名称</span>
+ 					<input
+ 						aria-label="成员名称"
+-						className={selectClass}
++						className="w-full rounded-md bg-transparent px-2 py-1.5 text-sm outline-none hover:bg-secondary focus:bg-secondary focus-visible:ring-1 focus-visible:ring-ring"
+ 						maxLength={100}
+ 						value={name}
+ 						disabled={saving || disabled}
+ 						onChange={(e) => setName(e.target.value)}
++						onBlur={() => void rename()}
++						onKeyDown={(e) => {
++							if (
++								e.key === "Enter" &&
++								!e.nativeEvent.isComposing &&
++								e.keyCode !== 229
++							) {
++								e.preventDefault();
++								void rename();
++							}
++						}}
+ 					/>
+ 				</label>
+-				<Button
+-					size="sm"
+-					variant="secondary"
+-					disabled={
+-						saving ||
+-						disabled ||
+-						!name.trim() ||
+-						name.trim() === (session.title || session.id)
+-					}
+-					onClick={() =>
+-						void save(async () => {
+-							const r = await apiClient.PATCH("/api/v1/sessions/{sessionId}", {
+-								params: { path: { sessionId: session.id } },
+-								body: { displayName: name.trim() },
+-							});
+-							if (r.error) throw r.error;
+-							onRenamed(name.trim());
+-							await cache.invalidateQueries({ queryKey: ["workspaces"] });
+-						})
+-					}
+-				>
+-					保存名称
+-				</Button>
+ 				{issue ? (
+ 					<p role="status" className="text-sm text-muted-foreground">
+ 						{issue}。未发送不代表模型回复失败。
+@@ -223,117 +283,22 @@ export function PeerAgentSettings({
+ 						{catalog.isPending && (
+ 							<p className="text-xs text-muted-foreground">读取客户端选项…</p>
+ 						)}
+-						{modelOption ? (
+-							<label className="block space-y-1 text-xs">
+-								模型
+-								<select
+-									aria-label="模型"
+-									className={selectClass}
+-									disabled={blocked}
+-									value={modelOption.currentValue}
+-									onChange={(e) =>
+-										void save(() =>
+-											nativeOption(modelOption.id, e.target.value),
+-										)
+-									}
+-								>
+-									{modelOption.choices?.map((c) => (
+-										<option key={c.value} value={c.value}>
+-											{c.name}
+-											{c.groupName ? ` · ${c.groupName}` : ""}
+-										</option>
+-									))}
+-								</select>
+-							</label>
+-						) : !!data?.models.length ? (
+-							<label className="block space-y-1 text-xs">
+-								模型
+-								<select
+-									aria-label="模型"
+-									className={selectClass}
+-									disabled={blocked}
+-									value={model?.id ?? ""}
+-									onChange={(e) => {
+-										const m = data.models.find((x) => x.id === e.target.value);
+-										void save(() =>
+-											settings({
+-												model: e.target.value,
+-												reasoningEffort: m?.defaultEffort || "",
+-											}),
+-										);
+-									}}
+-								>
+-									{data.models.map((m) => (
+-										<option key={m.id} value={m.id}>
+-											{m.displayName}
+-										</option>
+-									))}
+-								</select>
+-							</label>
+-						) : (
+-							data && (
+-								<p className="text-xs text-muted-foreground">
+-									跟随客户端模型；此会话未提供可切换列表。
+-								</p>
+-							)
+-						)}
+-						{thoughtOption ? (
+-							<label className="block space-y-1 text-xs">
+-								推理强度
+-								<select
+-									aria-label="推理强度"
+-									className={selectClass}
+-									disabled={blocked}
+-									value={thoughtOption.currentValue}
+-									onChange={(e) =>
+-										void save(() =>
+-											nativeOption(thoughtOption.id, e.target.value),
+-										)
+-									}
+-								>
+-									{thoughtOption.choices?.map((c) => (
+-										<option key={c.value} value={c.value}>
+-											{effortLabels[c.value] || c.name}
+-										</option>
+-									))}
+-								</select>
+-							</label>
+-						) : (
+-							!!model?.efforts?.length && (
+-								<label className="block space-y-1 text-xs">
+-									推理强度
+-									<select
+-										aria-label="推理强度"
+-										className={selectClass}
+-										disabled={blocked}
+-										value={
+-											data?.settings.reasoningEffort ||
+-											model.defaultEffort ||
+-											""
+-										}
+-										onChange={(e) =>
+-											void save(() =>
+-												settings({
+-													model: model.id,
+-													reasoningEffort: e.target.value,
+-												}),
+-											)
+-										}
+-									>
+-										{model.efforts.map((v) => (
+-											<option key={v} value={v}>
+-												{effortLabels[v] || v}
+-											</option>
+-										))}
+-									</select>
+-								</label>
+-							)
+-						)}
+-						{modelName && (
+-							<p className="text-xs text-muted-foreground">
+-								设置用于这位成员的后续消息。
+-							</p>
++						{data && (
++							<TurnSettingsBar
++								harness={session.provider}
++								models={data.models}
++								settings={data.settings}
++								configOptions={data.options}
++								showApprovalMode={false}
++								disabled={blocked}
++								configPending={saving}
++								onChange={(next) => void save(() => settings(next))}
++								onChangeConfigOption={(id, value) =>
++									save(() => nativeOption(id, value))
++								}
++							/>
+ 						)}
++						<p className="text-xs text-muted-foreground">{contextLabel}</p>
+ 					</>
+ 				)}
+ 				{(error || catalog.error) && (
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index ca3773c..b92c240 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -772,6 +772,7 @@ export function PeerRoom({
+ 											key={id}
+ 											session={{ ...session, title: label(id) }}
+ 											issue={memberIssue(i)}
++											usage={conversations[i]?.data?.usage}
+ 											disabled={busy || settingsBusy}
+ 											onBusyChange={setSettingsBusy}
+ 											onRenamed={(name) =>
+diff --git a/frontend/src/renderer/components/PeerSettings.test.tsx b/frontend/src/renderer/components/PeerSettings.test.tsx
+index ff80948..01a547f 100644
+--- a/frontend/src/renderer/components/PeerSettings.test.tsx
++++ b/frontend/src/renderer/components/PeerSettings.test.tsx
+@@ -1,3 +1,4 @@
++import userEvent from "@testing-library/user-event";
+ import {
+ 	render,
+ 	screen,
+@@ -119,7 +120,7 @@ it("does not invent permission choices when the native client has none", async (
+ 	expect(screen.queryByRole("radio")).not.toBeInTheDocument();
+ 	expect(api.PATCH).not.toHaveBeenCalled();
+ });
+-it("switches native Codex models with the supported default effort and preserves permissions", async () => {
++it("switches Codex models through the native menu and preserves permissions", async () => {
+ 	api.GET.mockImplementation(async (path: string) =>
+ 		path.endsWith("models")
+ 			? {
+@@ -158,13 +159,20 @@ it("switches native Codex models with the supported default effort and preserves
+ 		/>,
+ 	);
+ 	fireEvent.click(screen.getByRole("button", { name: "设置成员 开发" }));
+-	fireEvent.change(await screen.findByLabelText("模型"), {
+-		target: { value: "two" },
+-	});
++	const user = userEvent.setup();
++	await user.click(
++		await screen.findByRole("button", {
++			name: "Model and reasoning effort for the next turn",
++		}),
++	);
++	await user.keyboard("{ArrowDown}{ArrowRight}");
++	await user.click(
++		await screen.findByRole("menuitemradio", { name: "模型二" }),
++	);
+ 	await waitFor(() => expect(api.PATCH).toHaveBeenCalledTimes(1));
+ 	expect(api.PATCH.mock.calls[0][1].body).toEqual({
+ 		model: "two",
+-		reasoningEffort: "low",
++		reasoningEffort: undefined,
+ 		approvalMode: "auto",
+ 	});
+ });
+@@ -177,6 +185,7 @@ it("uses ACP option identifiers and opaque values, and persists the display name
+ 						options: [
+ 							{
+ 								id: "model",
++								name: "Model",
+ 								type: "select",
+ 								category: "model",
+ 								currentValue: '["p","a"]',
+@@ -200,9 +209,11 @@ it("uses ACP option identifiers and opaque values, and persists the display name
+ 		/>,
+ 	);
+ 	fireEvent.click(screen.getByRole("button", { name: "设置成员 开发" }));
+-	fireEvent.change(await screen.findByLabelText("模型"), {
+-		target: { value: '["p","b"]' },
+-	});
++	const user = userEvent.setup();
++	await user.click(await screen.findByRole("button", { name: "Model" }));
++	await user.click(
++		await screen.findByRole("menuitemradio", { name: "新模型" }),
++	);
+ 	await waitFor(() => expect(api.PATCH).toHaveBeenCalledTimes(1));
+ 	expect(api.PATCH.mock.calls[0]).toEqual([
+ 		"/api/v1/sessions/{sessionId}/conversation/config-options/{configId}",
+@@ -215,10 +226,79 @@ it("uses ACP option identifiers and opaque values, and persists the display name
+ 	fireEvent.change(screen.getByLabelText("成员名称"), {
+ 		target: { value: "验证伙伴" },
+ 	});
+-	fireEvent.click(screen.getByRole("button", { name: "保存名称" }));
++	fireEvent.keyDown(screen.getByLabelText("成员名称"), { key: "Enter" });
++	fireEvent.blur(screen.getByLabelText("成员名称"));
+ 	await waitFor(() => expect(renamed).toHaveBeenCalledWith("验证伙伴"));
+ 	expect(api.PATCH.mock.calls[1]).toEqual([
+ 		"/api/v1/sessions/{sessionId}",
+ 		{ params: { path: { sessionId: "a" } }, body: { displayName: "验证伙伴" } },
+ 	]);
+ });
++it("keeps failed inline renames visible without a save button or automatic replay", async () => {
++	api.PATCH.mockResolvedValue({ error: { message: "名称保存失败" } });
++	mount(
++		<PeerAgentSettings
++			session={session}
++			issue="已停止"
++			disabled={false}
++			onBusyChange={() => {}}
++			onRenamed={() => {}}
++		/>,
++	);
++	fireEvent.click(screen.getByRole("button", { name: "设置成员 开发" }));
++	const input = screen.getByLabelText("成员名称");
++	fireEvent.change(input, { target: { value: "测试名称" } });
++	fireEvent.blur(input);
++	expect(await screen.findByRole("alert")).toHaveTextContent("名称保存失败");
++	expect(input).toHaveValue("测试名称");
++	expect(screen.queryByText("保存名称")).not.toBeInTheDocument();
++	expect(api.PATCH).toHaveBeenCalledTimes(1);
++});
++it("uses per-session context readings, clamps overflow and distinguishes unknown from empty", () => {
++	const props = {
++		session,
++		issue: "",
++		disabled: false,
++		onBusyChange: () => {},
++		onRenamed: () => {},
++	};
++	const view = mount(
++		<PeerAgentSettings
++			{...props}
++			usage={{ contextUsed: 25, contextWindow: 100 }}
++		/>,
++	);
++	expect(
++		screen.getByRole("img", { name: /上下文已用 25%/ }),
++	).toBeInTheDocument();
++	view.unmount();
++	mount(
++		<PeerAgentSettings
++			{...props}
++			usage={{ contextUsed: 120, contextWindow: 100 }}
++		/>,
++	);
++	expect(
++		screen.getByRole("img", { name: /上下文已用 100%/ }),
++	).toBeInTheDocument();
++	cleanup();
++	mount(
++		<PeerAgentSettings
++			{...props}
++			usage={{ contextUsed: 20, contextWindow: 0 }}
++		/>,
++	);
++	expect(
++		screen.getByRole("img", { name: "上下文用量未上报" }),
++	).toBeInTheDocument();
++	cleanup();
++	mount(
++		<PeerAgentSettings
++			{...props}
++			usage={{ contextUsed: 0, contextWindow: 100 }}
++		/>,
++	);
++	expect(
++		screen.getByRole("img", { name: /上下文已用 0%/ }),
++	).toBeInTheDocument();
++});
+-- 
+2.54.0 (Apple Git-157)
+
