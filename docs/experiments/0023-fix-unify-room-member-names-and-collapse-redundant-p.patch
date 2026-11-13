@@ -1,0 +1,576 @@
+From 4ecb16adbe82d886b5c3bf1dad3a2362594e1cb0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 11:40:15 +0800
+Subject: [PATCH] fix: unify room member names and collapse redundant progress
+ updates
+
+Use one display-name policy across room controls and replies, remove the duplicate native-history stream, and keep the latest reply visible with earlier updates collapsed. Preserve original records, delivery grouping and no-replay behavior; verified with 33 renderer tests and typecheck.
+---
+ .../renderer/components/PeerAccessControl.tsx |   3 +-
+ .../renderer/components/PeerAgentSettings.tsx |  16 ++-
+ .../src/renderer/components/PeerRoom.test.tsx |  32 +++---
+ frontend/src/renderer/components/PeerRoom.tsx | 107 ++++--------------
+ .../src/renderer/components/PeerTasks.tsx     |   7 +-
+ .../renderer/components/PeerTimeline.test.tsx |  57 ++++++++++
+ .../src/renderer/components/PeerTimeline.tsx  |  43 +++++--
+ .../renderer/lib/peer-display-name.test.ts    |  15 +++
+ .../src/renderer/lib/peer-display-name.ts     |  22 ++++
+ 9 files changed, 179 insertions(+), 123 deletions(-)
+ create mode 100644 frontend/src/renderer/lib/peer-display-name.test.ts
+ create mode 100644 frontend/src/renderer/lib/peer-display-name.ts
+
+diff --git a/frontend/src/renderer/components/PeerAccessControl.tsx b/frontend/src/renderer/components/PeerAccessControl.tsx
+index 9fc6a51..e44f305 100644
+--- a/frontend/src/renderer/components/PeerAccessControl.tsx
++++ b/frontend/src/renderer/components/PeerAccessControl.tsx
+@@ -1,3 +1,4 @@
++import { peerDisplayName } from "../lib/peer-display-name";
+ import { useState } from "react";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+ import { ShieldCheck, Hand, ShieldAlert, Check } from "lucide-react";
+@@ -175,7 +176,7 @@ export function PeerAccessControl({
+ 				>
+ 					{sessions.map((s) => (
+ 						<option key={s.id} value={s.id}>
+-							{s.title || s.id}
++							{peerDisplayName(s)}
+ 						</option>
+ 					))}
+ 				</select>
+diff --git a/frontend/src/renderer/components/PeerAgentSettings.tsx b/frontend/src/renderer/components/PeerAgentSettings.tsx
+index c550fd4..e396ace 100644
+--- a/frontend/src/renderer/components/PeerAgentSettings.tsx
++++ b/frontend/src/renderer/components/PeerAgentSettings.tsx
+@@ -1,3 +1,4 @@
++import { peerDisplayName } from "../lib/peer-display-name";
+ import { useRef, useState } from "react";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+ import { apiClient } from "../lib/api-client";
+@@ -39,15 +40,12 @@ export function PeerAgentSettings({
+ 	onOpenSession?: () => void;
+ }) {
+ 	const cache = useQueryClient();
+-	const compactName =
+-		session.title && session.title !== session.id
+-			? session.title
+-			: `${({ codex: "Codex", "deepseek-harness": "DeepSeek", agy: "Antigravity" } as Record<string, string>)[session.provider] || session.provider} ${session.id.split("-").at(-1)}`;
++	const compactName = peerDisplayName(session);
+ 	const [open, setOpen] = useState(false);
+-	const [name, setName] = useState(session.title || session.id);
++	const [name, setName] = useState(compactName);
+ 	const [saving, setSaving] = useState(false);
+ 	const [error, setError] = useState("");
+-	const savedName = useRef(session.title || session.id);
++	const savedName = useRef(compactName);
+ 	const nameWrite = useRef<Promise<boolean> | null>(null);
+ 	const savingRef = useRef(false);
+ 	const known =
+@@ -169,7 +167,7 @@ export function PeerAgentSettings({
+ 			onOpenChange={(v) => {
+ 				if (v) {
+ 					setOpen(true);
+-					savedName.current = session.title || session.id;
++					savedName.current = compactName;
+ 					setName(savedName.current);
+ 					setError("");
+ 				} else if (name.trim() === savedName.current) {
+@@ -184,8 +182,8 @@ export function PeerAgentSettings({
+ 			<OptionMenuTrigger
+ 				showCaret={false}
+ 				type="button"
+-				aria-label={`设置成员 ${session.title || session.id}`}
+-				title={`${session.title || session.id} · ${issue || "就绪"} · ${contextLabel}`}
++				aria-label={`设置成员 ${compactName}`}
++				title={`${compactName} · ${issue || "就绪"} · ${contextLabel}`}
+ 				className="inline-flex h-7 max-w-32 shrink-0 items-center gap-1.5 rounded-lg px-1.5 text-[length:var(--font-size-base)]! text-muted-foreground hover:bg-background hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+ 				disabled={disabled}
+ 			>
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index 613850f..6d5f8e9 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -20,7 +20,7 @@ const sessions = ["a", "b", "c"].map(
+ 	(id) =>
+ 		({
+ 			id,
+-			title: id,
++			title: `成员 ${id}`,
+ 			provider: "codex",
+ 			mode: "chat",
+ 			workspaceId: "p",
+@@ -118,7 +118,7 @@ beforeEach(() => {
+ afterEach(cleanup);
+ it("broadcasts once to same-provider sessions and blocks replay of uncertain delivery", async () => {
+ 	mount();
+-	await screen.findAllByText("原生回复");
++	await screen.findAllByText("准确关联的回复");
+ 	fireEvent.change(screen.getByLabelText("群聊消息"), {
+ 		target: { value: "请一起分析" },
+ 	});
+@@ -149,11 +149,11 @@ it("creates a room with selected session IDs and restores server history on remo
+ 	expect(api.PUT.mock.calls[0][1].body.members).toEqual(["a", "b"]);
+ 	first.unmount();
+ 	mount();
+-	expect((await screen.findAllByText("原生回复")).length).toBe(2);
++	expect((await screen.findAllByText("准确关联的回复")).length).toBe(1);
+ });
+ it("pauses without altering members and disables sending", async () => {
+ 	mount();
+-	await screen.findAllByText("原生回复");
++	await screen.findAllByText("准确关联的回复");
+ 	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
+ 	await userEvent.click(
+ 		await screen.findByRole("menuitem", { name: "暂停房间" }),
+@@ -193,7 +193,7 @@ it("retains an interrupted-send warning across remount without replay", async ()
+ });
+ it("rejects budget changes above the backend maximum", async () => {
+ 	mount();
+-	await screen.findAllByText("原生回复");
++	await screen.findAllByText("准确关联的回复");
+ 	await userEvent.click(screen.getByRole("button", { name: "群聊菜单" }));
+ 	await userEvent.click(
+ 		await screen.findByRole("menuitem", { name: "房间设置" }),
+@@ -209,9 +209,8 @@ it("rejects budget changes above the backend maximum", async () => {
+ it("keeps durable receipts after remount and labels native history separately", async () => {
+ 	const first = mount();
+ 	await screen.findByText("本房间的消息");
+-	expect(
+-		screen.getByText(/查看成员原生会话/).closest("details"),
+-	).not.toHaveAttribute("open");
++	expect(screen.queryByText(/查看成员原生会话/)).not.toBeInTheDocument();
++	expect(screen.queryByText("原生回复")).not.toBeInTheDocument();
+ 	first.unmount();
+ 	mount();
+ 	await screen.findByText("本房间的消息");
+@@ -350,10 +349,9 @@ it("sends only to visible available recipients without restarting stopped member
+ 	fireEvent.change(screen.getByLabelText("群聊消息"), {
+ 		target: { value: "do not send" },
+ 	});
+-	expect(screen.getByRole("button", { name: "设置成员 b" })).toHaveAttribute(
+-		"title",
+-		expect.stringContaining("会话已停止"),
+-	);
++	expect(
++		screen.getByRole("button", { name: "设置成员 成员 b" }),
++	).toHaveAttribute("title", expect.stringContaining("会话已停止"));
+ 	fireEvent.click(screen.getByRole("button", { name: /发送消息/ }));
+ 	await waitFor(() => expect(api.POST).toHaveBeenCalledTimes(1));
+ 	expect(api.POST.mock.calls[0][1].body).toMatchObject({
+@@ -392,7 +390,7 @@ it("updates receipts using the exact delivery id rather than another turn from t
+ 		data: { deliveries: [{ id: "current", session: "a", state: "accepted" }] },
+ 	});
+ 	const { client } = mount();
+-	await screen.findAllByText("原生回复");
++	await screen.findByText("current");
+ 	fireEvent.change(screen.getByLabelText("群聊消息"), {
+ 		target: { value: "new message" },
+ 	});
+@@ -410,7 +408,7 @@ it("updates receipts using the exact delivery id rather than another turn from t
+ 
+ it("sends on Enter but preserves Shift+Enter and IME composition", async () => {
+ 	mount();
+-	await screen.findAllByText("原生回复");
++	await screen.findAllByText("准确关联的回复");
+ 	const input = screen.getByLabelText("群聊消息");
+ 	fireEvent.change(input, { target: { value: "键盘发送" } });
+ 	for (const options of [
+@@ -430,7 +428,7 @@ it("sends on Enter but preserves Shift+Enter and IME composition", async () => {
+ });
+ it("does not bypass send guards with Enter", async () => {
+ 	mount();
+-	await screen.findAllByText("原生回复");
++	await screen.findAllByText("准确关联的回复");
+ 	const input = screen.getByLabelText("群聊消息");
+ 	fireEvent.keyDown(input, { key: "Enter" });
+ 	fireEvent.change(input, { target: { value: "   " } });
+@@ -465,7 +463,7 @@ it("sends files and images together without requiring text and clears the sent d
+ 		},
+ 	});
+ 	mount();
+-	await screen.findAllByText("原生回复");
++	await screen.findAllByText("准确关联的回复");
+ 	fireEvent.change(screen.getByLabelText("添加文件或图片"), {
+ 		target: {
+ 			files: [
+@@ -498,7 +496,7 @@ it("keeps rejected attachments editable without replay and supports removal", as
+ 		response: { status: 400 },
+ 	});
+ 	mount();
+-	await screen.findAllByText("原生回复");
++	await screen.findAllByText("准确关联的回复");
+ 	fireEvent.paste(screen.getByLabelText("群聊消息"), {
+ 		clipboardData: {
+ 			files: [new File(["proof"], "paste.txt", { type: "text/plain" })],
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index 72e7eb0..b8b365b 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -1,3 +1,4 @@
++import { peerDisplayName } from "../lib/peer-display-name";
+ import { useFileAttachments } from "../hooks/useFileAttachments";
+ import { X } from "lucide-react";
+ import { PeerAccessControl } from "./PeerAccessControl";
+@@ -31,7 +32,6 @@ import {
+ import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+ import { ComposerMenuRow } from "./chat/TurnSettingsBar";
+ import { PeerTasks } from "./PeerTasks";
+-import { ChatMarkdown } from "./chat/ChatMarkdown";
+ 
+ type Room = components["schemas"]["PeerRoom"];
+ type Receipt = components["schemas"]["PeerBroadcastDelivery"];
+@@ -51,14 +51,6 @@ const replyStates: Record<string, string> = {
+ 	failed: "本轮失败",
+ 	cancelled: "已取消",
+ };
+-const controllerStates: Record<string, string> = {
+-	busy: "正在工作",
+-	ready: "就绪",
+-	connecting: "连接中",
+-	recovering: "恢复中",
+-	hibernated: "已休眠",
+-	stopped: "已停止",
+-};
+ function failure(value: unknown): Error {
+ 	return new Error(
+ 		typeof value === "object" && value !== null && "message" in value
+@@ -226,26 +218,13 @@ export function PeerRoom({
+ 			},
+ 		})),
+ 	});
+-	const messages = conversations
+-		.flatMap((q, i) =>
+-			(q.data?.messages ?? []).map((message) => ({
+-				...message,
+-				session: members[i],
+-			})),
+-		)
+-		.sort(
+-			(a, b) =>
+-				a.createdAt.localeCompare(b.createdAt) ||
+-				a.session.localeCompare(b.session) ||
+-				a.sequence - b.sequence,
+-		);
+ 	useEffect(() => {
+ 		if (followLatest.current && history.current)
+ 			history.current.scrollTop = history.current.scrollHeight;
+-	}, [deliveries.data?.length, messages.length, messages.at(-1)?.text]);
++	}, [deliveries.data]);
+ 	const label = (id: string) => {
+ 		const session = sessions.find((s) => s.id === id);
+-		return session ? names[id] || session.title || session.id : id;
++		return session ? peerDisplayName(session, names[id]) : "已移出的成员";
+ 	};
+ 	async function configure(paused: boolean, nextMembers = selected) {
+ 		setBusy(true);
+@@ -303,19 +282,17 @@ export function PeerRoom({
+ 						id: crypto.randomUUID(),
+ 						epoch: room.data.epoch,
+ 						message: text,
+-						attachments: files
+-							.getAttachments()
+-							.flatMap((file) =>
+-								file.data
+-									? [
+-											{
+-												name: file.name,
+-												mimeType: file.mimeType,
+-												data: file.data,
+-											},
+-										]
+-									: [],
+-							),
++						attachments: files.getAttachments().flatMap((file) =>
++							file.data
++								? [
++										{
++											name: file.name,
++											mimeType: file.mimeType,
++											data: file.data,
++										},
++									]
++								: [],
++						),
+ 						targets: availableMembers,
+ 						connectPeers: true,
+ 					},
+@@ -670,6 +647,7 @@ export function PeerRoom({
+ 							<PeerTasks
+ 								key={roomId}
+ 								roomId={roomId}
++								label={label}
+ 								epoch={room.data.epoch}
+ 								paused={room.data.paused}
+ 							/>
+@@ -686,60 +664,19 @@ export function PeerRoom({
+ 						{deliveries.isError && (
+ 							<p role="alert">群聊记录加载失败，请稍后刷新；不会重复发送。</p>
+ 						)}
++						{!deliveries.isPending &&
++							!deliveries.isError &&
++							!deliveries.data?.length && (
++								<p className="py-12 text-center text-sm text-muted-foreground">
++									说明目标，和项目成员一起开始。
++								</p>
++							)}
+ 						<PeerTimeline
+ 							deliveries={deliveries.data ?? []}
+ 							label={label}
+ 							provider={(id) => sessions.find((s) => s.id === id)?.provider}
+ 							status={deliveryStatus}
+ 						/>
+-						<details>
+-							<summary className="cursor-pointer text-sm">
+-								查看成员原生会话（包含其他对话，不代表房间回复）
+-							</summary>
+-
+-							{members.map((id, i) => (
+-								<p key={id} className="text-sm text-muted-foreground">
+-									{label(id)}：
+-									{onOpenSession && (
+-										<Button variant="quiet" onClick={() => onOpenSession(id)}>
+-											打开原生会话 / 处理授权
+-										</Button>
+-									)}
+-									{conversations[i]?.isError
+-										? "记录加载失败，不能确认当前状态"
+-										: (controllerStates[
+-												conversations[i]?.data?.controller ?? ""
+-											] ?? "加载中")}
+-									{conversations[i]?.data?.hasMoreBefore
+-										? " · 仅显示最近记录，完整历史请在会话中查看"
+-										: ""}
+-								</p>
+-							))}
+-							{!messages.length && (
+-								<p className="py-12 text-center text-muted-foreground">
+-									在这里说明目标，消息将发给房间中的每个成员。
+-								</p>
+-							)}
+-							{messages.map((m) => (
+-								<article
+-									key={`${m.session}:${m.id}`}
+-									className={
+-										m.role === "user"
+-											? "ml-auto max-w-[90%] rounded-xl bg-secondary p-4"
+-											: "py-2"
+-									}
+-								>
+-									<p className="mb-2 text-xs text-muted-foreground">
+-										{m.role === "assistant"
+-											? label(m.session)
+-											: `${m.senderDisplayName || m.senderSessionId || "你"} → ${label(m.session)}`}{" "}
+-										· {new Date(m.createdAt).toLocaleTimeString()}
+-										{m.streaming ? " · 正在回复" : ""}
+-									</p>
+-									<ChatMarkdown text={m.text} streaming={m.streaming} />
+-								</article>
+-							))}
+-						</details>
+ 					</div>
+ 				</div>
+ 			</div>
+diff --git a/frontend/src/renderer/components/PeerTasks.tsx b/frontend/src/renderer/components/PeerTasks.tsx
+index fed921c..6439b9e 100644
+--- a/frontend/src/renderer/components/PeerTasks.tsx
++++ b/frontend/src/renderer/components/PeerTasks.tsx
+@@ -12,10 +12,12 @@ export function PeerTasks({
+ 	roomId,
+ 	epoch = 0,
+ 	paused = false,
++	label = (id: string) => id,
+ }: {
+ 	roomId: string;
+ 	epoch?: number;
+ 	paused?: boolean;
++	label?: (id: string) => string;
+ }) {
+ 	const cache = useQueryClient();
+ 	const [goal, setGoal] = useState("");
+@@ -96,8 +98,9 @@ export function PeerTasks({
+ 					<li key={t.id} className="border-b border-border pb-3">
+ 						<p>{t.goal}</p>
+ 						<p className="text-sm text-muted-foreground">
+-							{labels[t.state] ?? t.state} · {t.owner || "尚未认领"}
+-							{t.reviewer ? ` · 验收：${t.reviewer}` : ""}
++							{labels[t.state] ?? t.state} ·{" "}
++							{t.owner ? label(t.owner) : "尚未认领"}
++							{t.reviewer ? ` · 验收：${label(t.reviewer)}` : ""}
+ 						</p>
+ 						{t.evidence && (
+ 							<details>
+diff --git a/frontend/src/renderer/components/PeerTimeline.test.tsx b/frontend/src/renderer/components/PeerTimeline.test.tsx
+index 5087f83..63c5f56 100644
+--- a/frontend/src/renderer/components/PeerTimeline.test.tsx
++++ b/frontend/src/renderer/components/PeerTimeline.test.tsx
+@@ -87,3 +87,60 @@ it("keeps attachment metadata visible after reloading and never merges changed f
+ 		]),
+ 	).toHaveLength(2);
+ });
++it("collapses earlier updates once per member and keeps the latest streaming answer visible", () => {
++	const replies = [
++		{ id: "p1", text: "先看仓库", streaming: false, turnState: "running" },
++		{ id: "p2", text: "再看 README", streaming: false, turnState: "running" },
++		{ id: "last", text: "当前答复", streaming: true, turnState: "running" },
++	];
++	const view = render(
++		<PeerTimeline
++			deliveries={[{ ...a, replies }]}
++			label={() => "小安"}
++			provider={() => "codex"}
++			status={() => "正在工作"}
++		/>,
++	);
++	const details = screen.getByText("查看过程 · 2 条更新").closest("details");
++	expect(details).not.toHaveAttribute("open");
++	expect(details).toContainElement(screen.getByText("先看仓库"));
++	expect(details).not.toContainElement(screen.getByText("当前答复"));
++	expect(screen.getAllByText("小安")).toHaveLength(1);
++	view.rerender(
++		<PeerTimeline
++			deliveries={[
++				{
++					...a,
++					replies: [
++						...replies.slice(0, -1),
++						{
++							...replies[2],
++							text: "最终答复",
++							streaming: false,
++							turnState: "completed",
++						},
++					],
++				},
++			]}
++			label={() => "小安"}
++			provider={() => "codex"}
++			status={() => "本轮已回复"}
++		/>,
++	);
++	expect(screen.getByText("最终答复")).toBeInTheDocument();
++	expect(
++		screen.getByText("查看过程 · 2 条更新").closest("details"),
++	).not.toHaveAttribute("open");
++});
++it("does not hide a single reply behind a disclosure", () => {
++	render(
++		<PeerTimeline
++			deliveries={[a]}
++			label={() => "小安"}
++			provider={() => "codex"}
++			status={() => "本轮已回复"}
++		/>,
++	);
++	expect(screen.queryByText(/查看过程/)).not.toBeInTheDocument();
++	expect(screen.getByText("我的分析")).toBeVisible();
++});
+diff --git a/frontend/src/renderer/components/PeerTimeline.tsx b/frontend/src/renderer/components/PeerTimeline.tsx
+index 33b8e61..3ff16c6 100644
+--- a/frontend/src/renderer/components/PeerTimeline.tsx
++++ b/frontend/src/renderer/components/PeerTimeline.tsx
+@@ -108,15 +108,7 @@ export function PeerTimeline({
+ 										<p>投递编号：{d.id}</p>
+ 									</details>
+ 								)}
+-								<div className="space-y-4 text-base leading-7">
+-									{(d.replies ?? []).map((r) => (
+-										<ChatMarkdown
+-											key={r.id}
+-											text={r.text}
+-											streaming={r.streaming}
+-										/>
+-									))}
+-								</div>
++								<PeerReplies replies={d.replies ?? []} />
+ 								{d.repliesTruncated && (
+ 									<p className="text-xs text-muted-foreground">
+ 										更多内容请查看原生会话。
+@@ -130,3 +122,36 @@ export function PeerTimeline({
+ 		</div>
+ 	);
+ }
++
++/** Earlier updates remain available, while the latest answer stays readable during streaming. */
++function PeerReplies({
++	replies,
++}: {
++	replies: NonNullable<Delivery["replies"]>;
++}) {
++	const visible = replies.filter((r) => r.text.trim());
++	const latest = visible.at(-1);
++	if (!latest) return null;
++	const earlier = visible.slice(0, -1);
++	return (
++		<div className="space-y-3 text-base leading-7">
++			{earlier.length > 0 && (
++				<details className="text-sm text-muted-foreground">
++					<summary className="cursor-pointer select-none py-1">
++						查看过程 · {earlier.length} 条更新
++					</summary>
++					<div className="mt-2 space-y-3 border-l border-border pl-3">
++						{earlier.map((r) => (
++							<ChatMarkdown key={r.id} text={r.text} streaming={r.streaming} />
++						))}
++					</div>
++				</details>
++			)}
++			<ChatMarkdown
++				key={latest.id}
++				text={latest.text}
++				streaming={latest.streaming}
++			/>
++		</div>
++	);
++}
+diff --git a/frontend/src/renderer/lib/peer-display-name.test.ts b/frontend/src/renderer/lib/peer-display-name.test.ts
+new file mode 100644
+index 0000000..3b5ef99
+--- /dev/null
++++ b/frontend/src/renderer/lib/peer-display-name.test.ts
+@@ -0,0 +1,15 @@
++import { expect, it } from "vitest";
++import { peerDisplayName } from "./peer-display-name";
++it("uses custom names first and a consistent provider name for generated session titles", () => {
++	const s = {
++		id: "worktogether-3",
++		title: "worktogether-3",
++		provider: "deepseek-harness" as const,
++	};
++	expect(peerDisplayName(s)).toBe("DeepSeek 3");
++	expect(peerDisplayName({ ...s, title: "小安" })).toBe("小安");
++	expect(peerDisplayName(s, "审查伙伴")).toBe("审查伙伴");
++	expect(
++		peerDisplayName({ id: "worktogether_2", title: "", provider: "codex" }),
++	).toBe("Codex 2");
++});
+diff --git a/frontend/src/renderer/lib/peer-display-name.ts b/frontend/src/renderer/lib/peer-display-name.ts
+new file mode 100644
+index 0000000..b5e6491
+--- /dev/null
++++ b/frontend/src/renderer/lib/peer-display-name.ts
+@@ -0,0 +1,22 @@
++import type { WorkspaceSession } from "../types/workspace";
++
++/** One display policy for room messages, composer, permissions and task owners. */
++export function peerDisplayName(
++	session: Pick<WorkspaceSession, "id" | "title" | "provider">,
++	override?: string,
++): string {
++	const title = (override || session.title || "").trim();
++	if (title && title !== session.id) return title;
++	const provider =
++		(
++			{
++				codex: "Codex",
++				"deepseek-harness": "DeepSeek",
++				agy: "Antigravity",
++			} as Record<string, string>
++		)[session.provider] ||
++		session.provider ||
++		"Agent";
++	const suffix = session.id.match(/(?:-|_)(\d+)$/)?.[1];
++	return suffix ? `${provider} ${suffix}` : provider;
++}
+-- 
+2.54.0 (Apple Git-157)
+
