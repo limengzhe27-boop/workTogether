@@ -1,0 +1,30 @@
+{
+  "test": "Stopped native sessions recover on a new group send beyond legacy budget",
+  "legacyBudget": 24,
+  "usedAfter": 26,
+  "newDeliveries": [
+    {
+      "member": "worktogether-2",
+      "state": "accepted",
+      "turnState": "completed",
+      "sameNativeConversation": true,
+      "replies": [
+        "我是GPT老大，已收到新消息。"
+      ]
+    },
+    {
+      "member": "worktogether-3",
+      "state": "accepted",
+      "turnState": "completed",
+      "sameNativeConversation": true,
+      "replies": [
+        "我是 DeepSeek 3，已收到新消息。"
+      ]
+    }
+  ],
+  "memberSettingsRestored": {
+    "worktogether-1": {
+      "disabled": false
+    }
+  }
+}

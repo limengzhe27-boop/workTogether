@@ -1,0 +1,55 @@
+From c0776f207b41c7ecd309ba4ec04d271ed442d5ec Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 16:16:13 +0800
+Subject: [PATCH] Distinguish connecting from uncertain delivery in the group
+ composer
+
+---
+ frontend/src/renderer/components/PeerAgentSettings.tsx | 2 +-
+ frontend/src/renderer/components/PeerRoom.test.tsx     | 2 +-
+ frontend/src/renderer/components/PeerRoom.tsx          | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/frontend/src/renderer/components/PeerAgentSettings.tsx b/frontend/src/renderer/components/PeerAgentSettings.tsx
+index cf16551..ee6876b 100644
+--- a/frontend/src/renderer/components/PeerAgentSettings.tsx
++++ b/frontend/src/renderer/components/PeerAgentSettings.tsx
+@@ -191,7 +191,7 @@ export function PeerAgentSettings({
+ 				showCaret={false}
+ 				type="button"
+ 				aria-label={`设置成员 ${compactName}`}
+-				title={`${compactName} · ${issue || "就绪"} · ${contextLabel}`}
++				title={`${compactName} · ${issue || "可发送，必要时自动连接"} · ${contextLabel}`}
+ 				className="inline-flex h-7 max-w-32 shrink-0 items-center gap-1.5 rounded-lg px-1.5 text-[length:var(--font-size-base)]! text-muted-foreground hover:bg-background hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+ 				disabled={disabled}
+ 			>
+diff --git a/frontend/src/renderer/components/PeerRoom.test.tsx b/frontend/src/renderer/components/PeerRoom.test.tsx
+index 2b31a79..6840c0f 100644
+--- a/frontend/src/renderer/components/PeerRoom.test.tsx
++++ b/frontend/src/renderer/components/PeerRoom.test.tsx
+@@ -348,7 +348,7 @@ it("includes enabled stopped members for server-side recovery before delivery",
+ 	});
+ 	expect(
+ 		screen.getByRole("button", { name: "设置成员 成员 b" }),
+-	).toHaveAttribute("title", expect.stringContaining("就绪"));
++	).toHaveAttribute("title", expect.stringContaining("自动连接"));
+ 	fireEvent.click(screen.getByRole("button", { name: /发送消息/ }));
+ 	await waitFor(() => expect(api.POST).toHaveBeenCalledTimes(1));
+ 	expect(api.POST.mock.calls[0][1].body).toMatchObject({
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index 5134223..5763b31 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -692,7 +692,7 @@ export function PeerRoom({
+ 								</p>
+ 							))}
+ 					</div>
+-					{uncertain && (
++					{uncertain && !busy && (
+ 						<div role="alert" className="my-2 text-sm">
+ 							部分结果未确认。先检查成员记录，不会自动重发。
+ 							<Button
+-- 
+2.54.0 (Apple Git-157)
+

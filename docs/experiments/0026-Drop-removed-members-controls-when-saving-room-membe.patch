@@ -1,0 +1,31 @@
+From 12d9b9925077c31272d8db6b9a60ed487d839e8a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 16:11:57 +0800
+Subject: [PATCH 26/26] Drop removed members' controls when saving room
+ membership
+
+---
+ frontend/src/renderer/components/PeerRoom.tsx | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/frontend/src/renderer/components/PeerRoom.tsx b/frontend/src/renderer/components/PeerRoom.tsx
+index d28964c..5134223 100644
+--- a/frontend/src/renderer/components/PeerRoom.tsx
++++ b/frontend/src/renderer/components/PeerRoom.tsx
+@@ -249,7 +249,11 @@ export function PeerRoom({
+ 				members: nextMembers,
+ 				paused,
+ 				budget: room.data?.budget ?? 24,
+-				memberSettings: room.data?.memberSettings,
++				memberSettings: Object.fromEntries(
++					Object.entries(room.data?.memberSettings ?? {}).filter(([id]) =>
++						nextMembers.includes(id),
++					),
++				),
+ 				used: room.data?.used ?? 0,
+ 			};
+ 			const result = await apiClient.PUT("/api/v1/peer-rooms/{roomId}", {
+-- 
+2.54.0 (Apple Git-157)
+
