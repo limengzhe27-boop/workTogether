@@ -1,0 +1,56 @@
+From 988377321049c8ee48e28b961ac4d917de44f912 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 17:12:17 +0800
+Subject: [PATCH] test: provide persisted timestamps in reply timeline fixtures
+
+---
+ .../renderer/components/PeerTimeline.test.tsx | 25 ++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/frontend/src/renderer/components/PeerTimeline.test.tsx b/frontend/src/renderer/components/PeerTimeline.test.tsx
+index f1a85d7..7425b2b 100644
+--- a/frontend/src/renderer/components/PeerTimeline.test.tsx
++++ b/frontend/src/renderer/components/PeerTimeline.test.tsx
+@@ -33,6 +33,7 @@ it("renders a broadcast once with separately identified replies", () => {
+ 					replies: [
+ 						{
+ 							id: "r2",
++							createdAt: "2026-11-13T09:00:00Z",
+ 							text: "我的验证",
+ 							streaming: false,
+ 							turnState: "completed",
+@@ -93,9 +94,27 @@ it("keeps attachment metadata visible after reloading and never merges changed f
+ });
+ it("collapses earlier updates once per member and keeps the latest streaming answer visible", () => {
+ 	const replies = [
+-		{ id: "p1", text: "先看仓库", streaming: false, turnState: "running" },
+-		{ id: "p2", text: "再看 README", streaming: false, turnState: "running" },
+-		{ id: "last", text: "当前答复", streaming: true, turnState: "running" },
++		{
++			id: "p1",
++			createdAt: "2026-11-13T09:00:00Z",
++			text: "先看仓库",
++			streaming: false,
++			turnState: "running",
++		},
++		{
++			id: "p2",
++			createdAt: "2026-11-13T09:00:01Z",
++			text: "再看 README",
++			streaming: false,
++			turnState: "running",
++		},
++		{
++			id: "last",
++			createdAt: "2026-11-13T09:00:02Z",
++			text: "当前答复",
++			streaming: true,
++			turnState: "running",
++		},
+ 	];
+ 	const view = render(
+ 		<PeerTimeline
+-- 
+2.54.0 (Apple Git-157)
+

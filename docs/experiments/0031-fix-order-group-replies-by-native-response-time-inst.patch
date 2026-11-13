@@ -1,0 +1,249 @@
+From c38e9cd990b87a87111a784a507a4235ee58cf4c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 17:11:09 +0800
+Subject: [PATCH] fix: order group replies by native response time instead of
+ member position
+
+---
+ backend/internal/domain/peer_room.go          |  1 +
+ backend/internal/httpd/apispec/openapi.yaml   |  3 +
+ .../storage/sqlite/peer_rooms_test.go         |  4 +-
+ .../storage/sqlite/store/peer_rooms.go        |  6 +-
+ frontend/src/api/schema.ts                    |  1 +
+ .../renderer/components/PeerTimeline.test.tsx | 79 ++++++++++++++++++-
+ .../src/renderer/components/PeerTimeline.tsx  | 24 +++++-
+ 7 files changed, 112 insertions(+), 6 deletions(-)
+
+diff --git a/backend/internal/domain/peer_room.go b/backend/internal/domain/peer_room.go
+index abf9611..bcf1e3c 100644
+--- a/backend/internal/domain/peer_room.go
++++ b/backend/internal/domain/peer_room.go
+@@ -82,6 +82,7 @@ func PeerDeliveryKey(room, id string) string {
+ }
+ 
+ type PeerReply struct {
++	CreatedAt string `json:"createdAt"`
+ 	ID        string `json:"id"`
+ 	Text      string `json:"text"`
+ 	Streaming bool   `json:"streaming"`
+diff --git a/backend/internal/httpd/apispec/openapi.yaml b/backend/internal/httpd/apispec/openapi.yaml
+index db17fea..c48e615 100644
+--- a/backend/internal/httpd/apispec/openapi.yaml
++++ b/backend/internal/httpd/apispec/openapi.yaml
+@@ -19587,6 +19587,8 @@ components:
+       type: object
+     PeerReply:
+       properties:
++        createdAt:
++          type: string
+         id:
+           type: string
+         streaming:
+@@ -19596,6 +19598,7 @@ components:
+         turnState:
+           type: string
+       required:
++      - createdAt
+       - id
+       - text
+       - streaming
+diff --git a/backend/internal/storage/sqlite/peer_rooms_test.go b/backend/internal/storage/sqlite/peer_rooms_test.go
+index 4ea98f4..f4d687f 100644
+--- a/backend/internal/storage/sqlite/peer_rooms_test.go
++++ b/backend/internal/storage/sqlite/peer_rooms_test.go
+@@ -103,7 +103,7 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 	for _, q := range []string{
+ 		"INSERT INTO conversations(id,scope,project_id,session_id,current_session_id,created_at,updated_at) VALUES('conv','session','p','b','b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+ 		"INSERT INTO conversation_turns(id,conversation_id,handled_by_session_id,state,requested_at) VALUES('turn','conv','b','completed',CURRENT_TIMESTAMP),('unrelated','conv','b','completed',CURRENT_TIMESTAMP)",
+-		"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,created_at,updated_at) VALUES('reply','conv','turn',2,'assistant','provider','room answer',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other-reply','conv','unrelated',4,'assistant','provider','unrelated answer',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
++		"INSERT INTO conversation_messages(id,conversation_id,turn_id,sequence,role,origin,text,created_at,updated_at) VALUES('reply','conv','turn',2,'assistant','provider','room answer','2026-11-13T09:00:01.123Z',CURRENT_TIMESTAMP),('other-reply','conv','unrelated',4,'assistant','provider','unrelated answer',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+ 	} {
+ 		if _, err = db.Exec(q); err != nil {
+ 			t.Fatal(err)
+@@ -113,7 +113,7 @@ func TestPeerRoomDurableAdmission(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	joined, err := s.ListPeerDeliveries(ctx, "r")
+-	if err != nil || len(joined[0].Replies) != 1 || joined[0].TurnState != "completed" || joined[0].Replies[0].Text != "room answer" {
++	if err != nil || len(joined[0].Replies) != 1 || joined[0].TurnState != "completed" || joined[0].Replies[0].Text != "room answer" || joined[0].Replies[0].CreatedAt != "2026-11-13T09:00:01.123Z" {
+ 		t.Fatal(joined, err)
+ 	}
+ 	if _, err = db.Exec("DELETE FROM conversation_messages WHERE id='reply'"); err != nil {
+diff --git a/backend/internal/storage/sqlite/store/peer_rooms.go b/backend/internal/storage/sqlite/store/peer_rooms.go
+index ac07cf9..ef4b30b 100644
+--- a/backend/internal/storage/sqlite/store/peer_rooms.go
++++ b/backend/internal/storage/sqlite/store/peer_rooms.go
+@@ -257,7 +257,7 @@ func (s *Store) ListPeerDeliveries(ctx context.Context, room string) ([]domain.P
+ 			return nil, turnErr
+ 		}
+ 		// Match a persisted input key and native turn, never text similarity or a time window.
+-		replies, err := s.readDB.QueryContext(ctx, `SELECT DISTINCT a.id,a.text,a.streaming,t.state,a.sequence
++		replies, err := s.readDB.QueryContext(ctx, `SELECT DISTINCT a.id,a.text,a.streaming,t.state,a.sequence,a.created_at
+    FROM conversation_messages u JOIN conversations c ON c.id=u.conversation_id
+    JOIN conversation_turns t ON t.id=u.turn_id AND t.conversation_id=c.id
+    JOIN conversation_messages a ON a.conversation_id=c.id AND a.turn_id=t.id
+@@ -270,10 +270,12 @@ func (s *Store) ListPeerDeliveries(ctx context.Context, room string) ([]domain.P
+ 		for replies.Next() {
+ 			var reply domain.PeerReply
+ 			var seq int64
+-			if err := replies.Scan(&reply.ID, &reply.Text, &reply.Streaming, &reply.TurnState, &seq); err != nil {
++			var createdAt time.Time
++			if err := replies.Scan(&reply.ID, &reply.Text, &reply.Streaming, &reply.TurnState, &seq, &createdAt); err != nil {
+ 				replies.Close()
+ 				return nil, err
+ 			}
++			reply.CreatedAt = createdAt.UTC().Format(time.RFC3339Nano)
+ 			out[i].Replies = append(out[i].Replies, reply)
+ 		}
+ 		err = replies.Err()
+diff --git a/frontend/src/api/schema.ts b/frontend/src/api/schema.ts
+index cf3851f..997e766 100644
+--- a/frontend/src/api/schema.ts
++++ b/frontend/src/api/schema.ts
+@@ -6839,6 +6839,7 @@ export interface components {
+             target: string;
+         };
+         PeerReply: {
++            createdAt: string;
+             id: string;
+             streaming: boolean;
+             text: string;
+diff --git a/frontend/src/renderer/components/PeerTimeline.test.tsx b/frontend/src/renderer/components/PeerTimeline.test.tsx
+index 63c5f56..f1a85d7 100644
+--- a/frontend/src/renderer/components/PeerTimeline.test.tsx
++++ b/frontend/src/renderer/components/PeerTimeline.test.tsx
+@@ -1,6 +1,10 @@
+ import { render, screen, cleanup } from "@testing-library/react";
+ import { afterEach, it, expect, vi } from "vitest";
+-import { PeerTimeline, peerMessageGroups } from "./PeerTimeline";
++import {
++	PeerTimeline,
++	peerMessageGroups,
++	orderPeerReplies,
++} from "./PeerTimeline";
+ import type { components } from "../../api/schema";
+ vi.mock("./chat/ChatMarkdown", () => ({
+ 	ChatMarkdown: ({ text }: { text: string }) => <p>{text}</p>,
+@@ -144,3 +148,76 @@ it("does not hide a single reply behind a disclosure", () => {
+ 	expect(screen.queryByText(/查看过程/)).not.toBeInTheDocument();
+ 	expect(screen.getByText("我的分析")).toBeVisible();
+ });
++
++const reply = (id: string, createdAt: string, text = id) => ({
++	id,
++	createdAt,
++	text,
++	streaming: true,
++	turnState: "running",
++});
++it("orders responses by first reply rather than creation order, including after reload", () => {
++	const deliveries = [
++		{ ...a, target: "GPT1", replies: [reply("g1", "2026-11-13T09:00:03Z")] },
++		{
++			...a,
++			id: "b",
++			target: "DeepSeek",
++			replies: [reply("d", "2026-11-13T09:00:01Z")],
++		},
++		{
++			...a,
++			id: "c",
++			target: "GPT2",
++			replies: [reply("g2", "2026-11-13T09:00:02Z")],
++		},
++	];
++	const props = {
++		label: (id: string) => id,
++		provider: () => "codex",
++		status: () => "正在回复",
++	};
++	const view = render(<PeerTimeline {...props} deliveries={deliveries} />);
++	const order = () =>
++		screen.getAllByRole("article").map((el) => el.getAttribute("aria-label"));
++	expect(order()).toEqual([
++		"来自 DeepSeek 的回复",
++		"来自 GPT2 的回复",
++		"来自 GPT1 的回复",
++	]);
++	// Later commentary/final messages must not move the first responder down.
++	deliveries[1].replies.push(reply("final", "2026-11-13T09:01:00Z"));
++	view.rerender(<PeerTimeline {...props} deliveries={deliveries} />);
++	expect(order()[0]).toBe("来自 DeepSeek 的回复");
++	view.unmount();
++	render(
++		<PeerTimeline
++			{...props}
++			deliveries={JSON.parse(JSON.stringify(deliveries))}
++		/>,
++	);
++	expect(order()[0]).toBe("来自 DeepSeek 的回复");
++	expect(deliveries.map((d) => d.target)).toEqual(["GPT1", "DeepSeek", "GPT2"]);
++});
++it("keeps pending, empty and failed responses behind actual replies with stable ties", () => {
++	const deliveries = [
++		{ ...a, id: "pending", replies: [] },
++		{
++			...a,
++			id: "empty",
++			replies: [reply("empty", "2026-11-13T08:00:00Z", "  ")],
++		},
++		{ ...a, id: "failed", state: "uncertain", replies: [] },
++		{ ...a, id: "fast", replies: [reply("fast", "2026-11-13T09:00:00Z")] },
++		{ ...a, id: "tie", replies: [reply("tie", "2026-11-13T09:00:00Z")] },
++		{ ...a, id: "legacy", replies: [reply("old", "invalid")] },
++	];
++	expect(orderPeerReplies(deliveries).map((d) => d.id)).toEqual([
++		"fast",
++		"tie",
++		"legacy",
++		"pending",
++		"empty",
++		"failed",
++	]);
++});
+diff --git a/frontend/src/renderer/components/PeerTimeline.tsx b/frontend/src/renderer/components/PeerTimeline.tsx
+index 3ff16c6..9a4b19e 100644
+--- a/frontend/src/renderer/components/PeerTimeline.tsx
++++ b/frontend/src/renderer/components/PeerTimeline.tsx
+@@ -23,6 +23,28 @@ export function peerMessageGroups(deliveries: Delivery[]) {
+ 	}
+ 	return groups;
+ }
++// Native message creation time survives refresh and does not change with streaming updates.
++export function orderPeerReplies(group: Delivery[]) {
++	const firstReply = (d: Delivery) => {
++		const visible = (d.replies ?? []).filter((r) => r.text.trim());
++		const times = visible
++			.map((r) => Date.parse(r.createdAt))
++			.filter(Number.isFinite);
++		return {
++			replied: visible.length > 0,
++			time: times.length ? Math.min(...times) : Infinity,
++		};
++	};
++	return group
++		.map((delivery, index) => ({ delivery, index, ...firstReply(delivery) }))
++		.sort(
++			(a, b) =>
++				Number(b.replied) - Number(a.replied) ||
++				a.time - b.time ||
++				a.index - b.index,
++		)
++		.map(({ delivery }) => delivery);
++}
+ export function PeerTimeline({
+ 	deliveries,
+ 	label,
+@@ -79,7 +101,7 @@ export function PeerTimeline({
+ 								</ul>
+ 							) : null}
+ 						</div>
+-						{group.map((d) => (
++						{orderPeerReplies(group).map((d) => (
+ 							<article
+ 								key={d.id}
+ 								className="py-1"
+-- 
+2.54.0 (Apple Git-157)
+
