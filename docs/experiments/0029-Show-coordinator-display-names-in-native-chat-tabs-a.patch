@@ -1,0 +1,110 @@
+From 400a5314bd3e6fbbdf28e9a106f638e96e069792 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 16:58:09 +0800
+Subject: [PATCH] Show coordinator display names in native chat tabs and
+ attributed updates
+
+---
+ .../src/renderer/components/SessionLinkPreviewCard.test.tsx | 4 ++--
+ frontend/src/renderer/components/SessionLinkPreviewCard.tsx | 2 +-
+ .../src/renderer/components/chat/ChatWorkspace.test.tsx     | 6 +++---
+ frontend/src/renderer/components/chat/ChatWorkspace.tsx     | 4 +---
+ frontend/src/renderer/components/chat/WorkerUpdates.tsx     | 2 +-
+ 5 files changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/frontend/src/renderer/components/SessionLinkPreviewCard.test.tsx b/frontend/src/renderer/components/SessionLinkPreviewCard.test.tsx
+index e45f389..f0158f0 100644
+--- a/frontend/src/renderer/components/SessionLinkPreviewCard.test.tsx
++++ b/frontend/src/renderer/components/SessionLinkPreviewCard.test.tsx
+@@ -354,13 +354,13 @@ describe("ArtifactLinkPreviewCard", () => {
+ 	});
+ 
+ 	it("names an orchestrator's artifacts as the orchestrator's, with the session id once", () => {
+-		const orchestrator = session({ id: "skills-1", title: "skills-1", kind: "orchestrator", artifactFiles: [artifact()] });
++		const orchestrator = session({ id: "skills-1", title: "GP2", kind: "orchestrator", artifactFiles: [artifact()] });
+ 		mocks.source.mockReturnValue(source({ workspaces: [workspace(orchestrator)] }));
+ 		mocks.artifactFile.mockResolvedValue({ binary: false, content: "Plan" });
+ 
+ 		renderWithQuery(<ArtifactLinkPreviewCard href="ao://sessions/project-a/skills-1/artifacts/plans/plan.md" />);
+ 
+-		expect(screen.getByText(/^Orchestrator/)).toHaveTextContent(/^Orchestrator · skills-1$/);
++		expect(screen.getByText(/^GP2/)).toHaveTextContent(/^GP2 · skills-1$/);
+ 		expect(screen.queryByText(/#s-1/)).not.toBeInTheDocument();
+ 	});
+ 
+diff --git a/frontend/src/renderer/components/SessionLinkPreviewCard.tsx b/frontend/src/renderer/components/SessionLinkPreviewCard.tsx
+index f88ccde..4cfb2b9 100644
+--- a/frontend/src/renderer/components/SessionLinkPreviewCard.tsx
++++ b/frontend/src/renderer/components/SessionLinkPreviewCard.tsx
+@@ -397,7 +397,7 @@ function ArtifactContentPreview({ artifact, session, remote }: { artifact: Sessi
+ function ArtifactCardBody({ artifact, session, remote }: { artifact: SessionArtifact; session: WorkspaceSession; remote: boolean }) {
+ 	const { t } = useTranslation();
+ 	const Icon = artifact.kind === "html" ? BrowserIcon : tabularDelimiter(artifact.path) ? Sheet : FileText;
+-	const author = session.kind === "orchestrator" ? t("shell.orchestrator") : session.title;
++	const author = session.title || t("shell.orchestrator");
+ 	return (
+ 		<div className="space-y-2" role="status" aria-label={artifact.name}>
+ 			<div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5">
+diff --git a/frontend/src/renderer/components/chat/ChatWorkspace.test.tsx b/frontend/src/renderer/components/chat/ChatWorkspace.test.tsx
+index 70a55a1..77d1211 100644
+--- a/frontend/src/renderer/components/chat/ChatWorkspace.test.tsx
++++ b/frontend/src/renderer/components/chat/ChatWorkspace.test.tsx
+@@ -891,7 +891,7 @@ describe("ChatWorkspace timeline", () => {
+ 		const actionRegion = screen.getByTestId("session-action-region");
+ 		expect(actionRegion).toHaveClass("session-topbar-actions");
+ 		expect(actionRegion).not.toHaveClass("px-3");
+-		expect(screen.getByRole("tab", { name: "Orchestrator · Codex · Working" })).toBeInTheDocument();
++		expect(screen.getByRole("tab", { name: "Reviewer chat · Codex · Working" })).toBeInTheDocument();
+ 
+ 		view.rerender(
+ 			<ChatWorkspace
+@@ -899,7 +899,7 @@ describe("ChatWorkspace timeline", () => {
+ 				session={{ ...chatSession, id: "legacy-orchestrator", kind: undefined }}
+ 			/>,
+ 		);
+-		expect(screen.getByRole("tab", { name: "Orchestrator · Codex · Working" })).toBeInTheDocument();
++		expect(screen.getByRole("tab", { name: "Reviewer chat · Codex · Working" })).toBeInTheDocument();
+ 	});
+ 
+ 	it("shows live provider context usage beside the composer settings", () => {
+@@ -959,7 +959,7 @@ describe("ChatWorkspace timeline", () => {
+ 			/>,
+ 		);
+ 
+-		const tab = screen.getByRole("tab", { name: "Orchestrator · Codex · Working" });
++		const tab = screen.getByRole("tab", { name: "Reviewer chat · Codex · Working" });
+ 		await user.dblClick(tab);
+ 		fireEvent.contextMenu(tab);
+ 
+diff --git a/frontend/src/renderer/components/chat/ChatWorkspace.tsx b/frontend/src/renderer/components/chat/ChatWorkspace.tsx
+index bdb5153..3c8e91f 100644
+--- a/frontend/src/renderer/components/chat/ChatWorkspace.tsx
++++ b/frontend/src/renderer/components/chat/ChatWorkspace.tsx
+@@ -2376,9 +2376,7 @@ function ChatHeader({
+ 	const sessionIsOrchestrator = session
+ 		? isOrchestratorSession(session)
+ 		: sessionRole === "orchestrator";
+-	const label = sessionIsOrchestrator
+-		? t("shell.orchestrator")
+-		: (sessionTitle || session?.title || snapshot.title || snapshot.sessionId);
++	const label = sessionTitle || session?.title || snapshot.title || (sessionIsOrchestrator ? t("shell.orchestrator") : snapshot.sessionId);
+ 	const tabScrollWatch = `${session?.id ?? ""}|${orderedAuxiliaryTabs.map((tab) => tab.key).join("|")}`;
+ 	const {
+ 		scrollRef: tabsOverflowRef,
+diff --git a/frontend/src/renderer/components/chat/WorkerUpdates.tsx b/frontend/src/renderer/components/chat/WorkerUpdates.tsx
+index c128f22..d21d6c3 100644
+--- a/frontend/src/renderer/components/chat/WorkerUpdates.tsx
++++ b/frontend/src/renderer/components/chat/WorkerUpdates.tsx
+@@ -415,7 +415,7 @@ export function FromAgent({ item, queued, children }: { item: ConversationItem;
+ 		);
+ 	}
+ 	if (!update || !session) return <>{children}</>;
+-	const name = session.kind === "orchestrator" ? t("shell.orchestrator") : session.title || update.name;
++	const name = session.title || (session.kind === "orchestrator" ? t("shell.orchestrator") : update.name);
+ 	const href = sessionHref({ sessionId: update.sessionId, projectId: update.projectId ?? session.workspaceId });
+ 	return (
+ 		<SenderRow avatar={<AgentAvatar provider={session.provider} decorative className="absolute left-0 top-[3px] size-4" />} createdAt={update.createdAt} body={update.body}>
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,172 @@
+From 2d68a692c2a836781214e7b194e1e0d5321ea313 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 16:55:25 +0800
+Subject: [PATCH] Allow coordinator display names and compact the member enable
+ switch
+
+---
+ backend/internal/service/session/service.go   |  8 +----
+ .../internal/service/session/service_test.go  | 14 ++++----
+ .../skillassets/using-ao/commands/session.md  |  2 +-
+ .../renderer/components/PeerAgentSettings.tsx | 33 +++++++++----------
+ .../renderer/components/PeerSettings.test.tsx | 23 +++++++++++++
+ 5 files changed, 46 insertions(+), 34 deletions(-)
+
+diff --git a/backend/internal/service/session/service.go b/backend/internal/service/session/service.go
+index 1c6be97..4624e6d 100644
+--- a/backend/internal/service/session/service.go
++++ b/backend/internal/service/session/service.go
+@@ -1270,10 +1270,7 @@ func (s *Service) SendWithOptions(ctx context.Context, id domain.SessionID, mess
+ 
+ // Rename updates the user-facing session display name.
+ //
+-// The project orchestrator is refused: the app labels it "Orchestrator" rather
+-// than by its display name, so a rename looked like it did nothing. The check is
+-// on the target's kind because the request carries no caller, which also stops
+-// the orchestrator agent from renaming itself through `ao session rename`.
++// Display names are independent of orchestration identity, routing and permissions.
+ func (s *Service) Rename(ctx context.Context, id domain.SessionID, displayName string) error {
+ 	displayName = strings.TrimSpace(displayName)
+ 	if displayName == "" {
+@@ -1289,9 +1286,6 @@ func (s *Service) Rename(ctx context.Context, id domain.SessionID, displayName s
+ 	if !ok {
+ 		return apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+ 	}
+-	if rec.Kind == domain.KindOrchestrator {
+-		return apierr.Invalid("ORCHESTRATOR_RENAME_UNSUPPORTED", "The project orchestrator cannot be renamed", nil)
+-	}
+ 	renamed, err := s.store.RenameSession(ctx, id, displayName, time.Now().UTC())
+ 	if err != nil {
+ 		wrapped := fmt.Errorf("rename %s: %w", id, err)
+diff --git a/backend/internal/service/session/service_test.go b/backend/internal/service/session/service_test.go
+index a497e12..3cee591 100644
+--- a/backend/internal/service/session/service_test.go
++++ b/backend/internal/service/session/service_test.go
+@@ -650,18 +650,16 @@ func TestSessionRenameUpdatesDisplayName(t *testing.T) {
+ 	}
+ }
+ 
+-func TestSessionRenameRejectsOrchestrator(t *testing.T) {
++func TestSessionRenamePreservesOrchestratorIdentity(t *testing.T) {
+ 	for _, terminated := range []bool{false, true} {
+ 		st := newFakeStore()
+ 		st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", Kind: domain.KindOrchestrator, IsTerminated: terminated}
+-
+-		err := (&Service{store: st}).Rename(context.Background(), "mer-1", "My orchestrator")
+-		var e *apierr.Error
+-		if !errors.As(err, &e) || e.Kind != apierr.KindInvalid || e.Code != "ORCHESTRATOR_RENAME_UNSUPPORTED" {
+-			t.Fatalf("terminated=%v: err = %v, want apierr Invalid ORCHESTRATOR_RENAME_UNSUPPORTED", terminated, err)
++		if err := (&Service{store: st}).Rename(context.Background(), "mer-1", "GP2"); err != nil {
++			t.Fatal(err)
+ 		}
+-		if got := st.sessions["mer-1"].DisplayName; got != "" {
+-			t.Fatalf("terminated=%v: display name = %q, want unchanged", terminated, got)
++		rec := st.sessions["mer-1"]
++		if rec.DisplayName != "GP2" || rec.Kind != domain.KindOrchestrator || rec.ID != "mer-1" || rec.ProjectID != "mer" || rec.IsTerminated != terminated {
++			t.Fatal(rec)
+ 		}
+ 	}
+ }
+diff --git a/backend/internal/skillassets/using-ao/commands/session.md b/backend/internal/skillassets/using-ao/commands/session.md
+index 68ca15d..6d24e70 100644
+--- a/backend/internal/skillassets/using-ao/commands/session.md
++++ b/backend/internal/skillassets/using-ao/commands/session.md
+@@ -193,7 +193,7 @@ ao session kill mer-3
+ 
+ ### ao session rename
+ 
+-Rename a worker session. The project orchestrator cannot be renamed, including by itself; the daemon refuses with `ORCHESTRATOR_RENAME_UNSUPPORTED`.
++Rename a session display name, including a project orchestrator. This changes the label only; session identity, orchestration role and permissions are unchanged.
+ 
+ **Syntax:**
+ ```
+diff --git a/frontend/src/renderer/components/PeerAgentSettings.tsx b/frontend/src/renderer/components/PeerAgentSettings.tsx
+index ee6876b..8f508a1 100644
+--- a/frontend/src/renderer/components/PeerAgentSettings.tsx
++++ b/frontend/src/renderer/components/PeerAgentSettings.tsx
+@@ -1,3 +1,4 @@
++import { Switch } from "./ui/switch";
+ import { peerDisplayName } from "../lib/peer-display-name";
+ import { useRef, useState } from "react";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+@@ -286,6 +287,20 @@ export function PeerAgentSettings({
+ 							}}
+ 						/>
+ 					</label>
++					{onMemberSettingsChange && (
++						<Switch
++							aria-label="启用成员"
++							title={policy.disabled ? "启用成员" : "停用成员"}
++							className="mx-2 after:hidden"
++							checked={!policy.disabled}
++							disabled={saving || disabled}
++							onCheckedChange={(checked) =>
++								void save(() =>
++									onMemberSettingsChange({ ...policy, disabled: !checked }),
++								)
++							}
++						/>
++					)}
+ 					{onOpenSession && (
+ 						<button
+ 							type="button"
+@@ -300,24 +315,6 @@ export function PeerAgentSettings({
+ 				</div>
+ 				{onMemberSettingsChange && (
+ 					<div className="space-y-1 border-b border-border/60 pb-1 mb-1">
+-						<label className="flex items-center justify-between px-2 py-1.5">
+-							启用
+-							<input
+-								type="checkbox"
+-								role="switch"
+-								aria-label="启用成员"
+-								checked={!policy.disabled}
+-								disabled={saving || disabled}
+-								onChange={(e) =>
+-									void save(() =>
+-										onMemberSettingsChange({
+-											...policy,
+-											disabled: !e.target.checked,
+-										}),
+-									)
+-								}
+-							/>
+-						</label>
+ 						<label className="flex items-center justify-between gap-2 px-2 py-1.5">
+ 							主动联系同伴
+ 							<select
+diff --git a/frontend/src/renderer/components/PeerSettings.test.tsx b/frontend/src/renderer/components/PeerSettings.test.tsx
+index e188d41..838c897 100644
+--- a/frontend/src/renderer/components/PeerSettings.test.tsx
++++ b/frontend/src/renderer/components/PeerSettings.test.tsx
+@@ -352,3 +352,26 @@ it("saves a per-round limit and can close proactive contact", async () => {
+ 		expect(change).toHaveBeenCalledWith({ disabled: false, peerLimit: 0 }),
+ 	);
+ });
++
++it("keeps the enable switch beside the native-session action in the name header", async () => {
++	mount(
++		<PeerAgentSettings
++			session={session}
++			issue=""
++			disabled={false}
++			onBusyChange={() => {}}
++			onRenamed={() => {}}
++			onOpenSession={() => {}}
++			onMemberSettingsChange={vi.fn().mockResolvedValue(undefined)}
++		/>,
++	);
++	await userEvent.click(screen.getByRole("button", { name: "设置成员 开发" }));
++	const toggle = screen.getByRole("switch", { name: "启用成员" });
++	expect(toggle.parentElement).toContainElement(
++		screen.getByRole("button", { name: "打开原生会话" }),
++	);
++	expect(toggle.parentElement).toContainElement(
++		screen.getByLabelText("成员名称"),
++	);
++	expect(screen.queryByText("启用")).not.toBeInTheDocument();
++});
+-- 
+2.54.0 (Apple Git-157)
+

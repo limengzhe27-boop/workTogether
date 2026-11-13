@@ -1,0 +1,195 @@
+From 5365399890e4a12a4676ba43471e6dccb72a87f2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E5=AD=9F=E5=93=B2?=
+ <limengzhe@limengzhedeMacBook-Pro.local>
+Date: Fri, 13 Nov 2026 17:02:32 +0800
+Subject: [PATCH] Connect stopped native sessions before loading member model
+ settings
+
+---
+ .../renderer/components/PeerAgentSettings.tsx | 69 ++++++++++++++++---
+ .../renderer/components/PeerSettings.test.tsx | 54 ++++++++++++++-
+ 2 files changed, 111 insertions(+), 12 deletions(-)
+
+diff --git a/frontend/src/renderer/components/PeerAgentSettings.tsx b/frontend/src/renderer/components/PeerAgentSettings.tsx
+index 8f508a1..594da65 100644
+--- a/frontend/src/renderer/components/PeerAgentSettings.tsx
++++ b/frontend/src/renderer/components/PeerAgentSettings.tsx
+@@ -17,6 +17,13 @@ import type { ChatConfigOptionValue } from "../types/conversation";
+ 
+ type Settings = components["schemas"]["ConversationTurnSettingsPayload"];
+ function message(e: unknown) {
++	const code = e && typeof e === "object" && "code" in e ? String(e.code) : "";
++	const known: Record<string, string> = {
++		CHAT_CONTROLLER_NOT_READY: "会话尚未连接，暂时无法读取模型。请重试连接。",
++		CHAT_AUTH_REQUIRED: "客户端需要登录，请打开原生会话完成登录。",
++		AGENT_RESUME_IN_PROGRESS: "会话正在连接，请稍后重试。",
++	};
++	if (known[code]) return known[code];
+ 	return e && typeof e === "object" && "message" in e
+ 		? String(e.message)
+ 		: "设置未保存，请稍后再试";
+@@ -79,16 +86,34 @@ export function PeerAgentSettings({
+ 		enabled: open && !issue,
+ 		retry: false,
+ 		staleTime: 0,
++		refetchOnWindowFocus: false,
+ 		queryFn: async () => {
+-			const [models, config] = await Promise.all([
+-				apiClient.GET("/api/v1/sessions/{sessionId}/conversation/models", {
+-					params: { path: { sessionId: session.id } },
+-				}),
+-				apiClient.GET(
+-					"/api/v1/sessions/{sessionId}/conversation/config-options",
+-					{ params: { path: { sessionId: session.id } } },
+-				),
+-			]);
++			const readCatalog = () =>
++				Promise.all([
++					apiClient.GET("/api/v1/sessions/{sessionId}/conversation/models", {
++						params: { path: { sessionId: session.id } },
++					}),
++					apiClient.GET(
++						"/api/v1/sessions/{sessionId}/conversation/config-options",
++						{ params: { path: { sessionId: session.id } } },
++					),
++				]);
++			let [models, config] = await readCatalog();
++			if (
++				[models.error, config.error].some(
++					(e) => e?.code === "CHAT_CONTROLLER_NOT_READY",
++				)
++			) {
++				const resumed = await apiClient.POST(
++					"/api/v1/sessions/{sessionId}/resume-agent",
++					{
++						params: { path: { sessionId: session.id } },
++					},
++				);
++				if (resumed.error) throw resumed.error;
++				[models, config] = await readCatalog();
++				await cache.invalidateQueries({ queryKey: ["peer-room-conversation"] });
++			}
+ 			if (models.error || config.error) throw models.error || config.error;
+ 			return {
+ 				models: models.data?.models ?? [],
+@@ -389,7 +414,9 @@ export function PeerAgentSettings({
+ 				) : (
+ 					<>
+ 						{catalog.isPending && (
+-							<p className="text-xs text-muted-foreground">读取客户端选项…</p>
++							<p className="text-xs text-muted-foreground">
++								正在连接并读取模型…
++							</p>
+ 						)}
+ 						{data && (
+ 							<TurnSettingsBar
+@@ -411,9 +438,29 @@ export function PeerAgentSettings({
+ 				)}
+ 				{(error || catalog.error) && (
+ 					<p role="alert" className="text-sm text-destructive">
+-						{error || message(catalog.error)}
++						{error ||
++							(catalog.error &&
++							typeof catalog.error === "object" &&
++							"code" in catalog.error &&
++							[
++								"CHAT_CONTROLLER_NOT_READY",
++								"CHAT_AUTH_REQUIRED",
++								"AGENT_RESUME_IN_PROGRESS",
++							].includes(String(catalog.error.code))
++								? message(catalog.error)
++								: "模型选项暂时无法加载。请重试；若仍失败，打开原生会话检查登录与客户端状态。")}
+ 					</p>
+ 				)}
++				{catalog.isError && (
++					<button
++						type="button"
++						className="px-2 py-1 text-xs text-muted-foreground underline"
++						disabled={catalog.isFetching || saving || disabled}
++						onClick={() => void catalog.refetch()}
++					>
++						重试连接
++					</button>
++				)}
+ 				{saving && (
+ 					<p role="status" className="text-xs">
+ 						正在保存…
+diff --git a/frontend/src/renderer/components/PeerSettings.test.tsx b/frontend/src/renderer/components/PeerSettings.test.tsx
+index 838c897..c764909 100644
+--- a/frontend/src/renderer/components/PeerSettings.test.tsx
++++ b/frontend/src/renderer/components/PeerSettings.test.tsx
+@@ -11,7 +11,7 @@ import { vi, beforeEach, afterEach, it, expect } from "vitest";
+ import { PeerAccessControl } from "./PeerAccessControl";
+ import { PeerAgentSettings } from "./PeerAgentSettings";
+ import type { WorkspaceSession } from "../types/workspace";
+-const api = vi.hoisted(() => ({ GET: vi.fn(), PATCH: vi.fn() }));
++const api = vi.hoisted(() => ({ GET: vi.fn(), PATCH: vi.fn(), POST: vi.fn() }));
+ vi.mock("../lib/api-client", () => ({ apiClient: api }));
+ const session = {
+ 	id: "a",
+@@ -34,6 +34,7 @@ function mount(ui: React.ReactNode) {
+ beforeEach(() => {
+ 	vi.clearAllMocks();
+ 	api.PATCH.mockResolvedValue({ data: {} });
++	api.POST.mockResolvedValue({ data: {} });
+ 	api.GET.mockImplementation(async (path: string) =>
+ 		path.endsWith("permission-modes")
+ 			? {
+@@ -375,3 +376,54 @@ it("keeps the enable switch beside the native-session action in the name header"
+ 	);
+ 	expect(screen.queryByText("启用")).not.toBeInTheDocument();
+ });
++
++it("connects a stopped native controller before loading models, without sending a task", async () => {
++	let connected = false;
++	api.GET.mockImplementation(async () =>
++		connected
++			? { data: { models: [], options: [] } }
++			: {
++					error: { code: "CHAT_CONTROLLER_NOT_READY", message: "not running" },
++				},
++	);
++	api.POST.mockImplementation(async () => {
++		connected = true;
++		return { data: {} };
++	});
++	mount(
++		<PeerAgentSettings
++			session={session}
++			issue=""
++			disabled={false}
++			onBusyChange={() => {}}
++			onRenamed={() => {}}
++		/>,
++	);
++	await userEvent.click(screen.getByRole("button", { name: "设置成员 开发" }));
++	await waitFor(() => expect(api.POST).toHaveBeenCalledTimes(1));
++	expect(api.POST.mock.calls[0][0]).toBe(
++		"/api/v1/sessions/{sessionId}/resume-agent",
++	);
++	await waitFor(() =>
++		expect(screen.queryByText("重试连接")).not.toBeInTheDocument(),
++	);
++	expect(api.PATCH).not.toHaveBeenCalled();
++});
++
++it("shows a retry entry when restoring the controller fails without looping", async () => {
++	api.GET.mockResolvedValue({ error: { code: "CHAT_CONTROLLER_NOT_READY" } });
++	api.POST.mockResolvedValue({ error: { code: "CHAT_AUTH_REQUIRED" } });
++	mount(
++		<PeerAgentSettings
++			session={session}
++			issue=""
++			disabled={false}
++			onBusyChange={() => {}}
++			onRenamed={() => {}}
++		/>,
++	);
++	await userEvent.click(screen.getByRole("button", { name: "设置成员 开发" }));
++	expect(await screen.findByRole("alert")).toHaveTextContent("需要登录");
++	expect(screen.getByText("重试连接")).toBeInTheDocument();
++	expect(api.POST).toHaveBeenCalledTimes(1);
++});
+-- 
+2.54.0 (Apple Git-157)
+
