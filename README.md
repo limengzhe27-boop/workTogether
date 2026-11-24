@@ -26,7 +26,7 @@ npm --prefix frontend run dev
 ```sh
 go -C backend test ./internal/service/chat ./internal/service/session ./internal/storage/sqlite ./internal/httpd/...
 npm --prefix frontend run typecheck
-npm --prefix frontend test -- PeerRoom PeerTimeline PeerExecution PeerSettings PeerMemberPicker PeerTasks Sidebar CreateProjectFlow
+npm --prefix frontend test -- PeerRoom PeerTimeline PeerExecution PeerSettings PeerMemberPicker PeerTasks Sidebar CreateProjectFlow SessionsBoard shell-new-session-shortcut
 ```
 
 旧 Python/Web 版保留在 [legacy-python-web](https://github.com/limengzhe27-boop/workTogether/tree/legacy-python-web)，当前桌面版在 `main`。

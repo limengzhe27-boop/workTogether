@@ -43,7 +43,7 @@ function mount(watch = false, steerSupported?: boolean, roomEpoch?: number, stee
 		</QueryClientProvider>,
 	);
 }
-function records(id: string) {
+function records(id: string): components["schemas"]["ControllersPeerExecutionResponse"] {
 	return {
 		sessionId: id,
 		epoch: 3,
@@ -117,7 +117,7 @@ it("shows in-run guidance only for a conversation that advertises it", async () 
 it("keeps generated media out of the collapsible execution record", async () => {
 	const data = records("a");
 	const activity = data.activities[0];
-	const image = { ...activity, id: "image", activityKind: "system", summary: "Generated image", detail: { event: "image.generated" } };
+	const image = { ...activity, id: "image", activityKind: "system" as const, summary: "Generated image", detail: { event: "image.generated" } };
 	api.GET.mockResolvedValue({ data: { ...data, activities: [activity, image] } });
 	mount();
 	openDetails(screen.getAllByText("执行记录")[0].closest("details")!);
@@ -182,7 +182,7 @@ it("stops or approves an exact run after a room update and prevents steering or 
 		status: "pending",
 		requestId: "request-a",
 		detail: { decisions: [{ id: "deny", label: "拒绝" }] },
-	}] as typeof data.activities;
+	}];
 	api.GET.mockResolvedValue({ data });
 	api.POST
 		.mockResolvedValueOnce({ data: { status: "decision_submitted" } })
@@ -216,7 +216,7 @@ it("failed controls are not replayed and only offered approval choices are rende
 			summary: "需审批",
 			requestId: "request-a",
 			detail: { decisions: [{ id: "deny", label: "拒绝" }] },
-		} as any,
+		},
 	];
 	api.GET.mockResolvedValue({ data });
 	api.POST.mockResolvedValue({ error: { message: "请求已失效" } });

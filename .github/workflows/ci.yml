@@ -36,4 +36,4 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npm ci --prefix packages/product-ui
       - run: npm --prefix frontend run typecheck
-      - run: npm --prefix frontend test -- PeerRoom PeerTimeline PeerExecution PeerSettings PeerMemberPicker PeerTasks Sidebar CreateProjectFlow
+      - run: npm --prefix frontend test -- PeerRoom PeerTimeline PeerExecution PeerSettings PeerMemberPicker PeerTasks Sidebar CreateProjectFlow SessionsBoard shell-new-session-shortcut

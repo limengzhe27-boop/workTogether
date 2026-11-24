@@ -45,8 +45,8 @@ const shellMocks = vi.hoisted(() => {
 						createProject?: (input: {
 							path: string;
 							defaultBranch?: string;
-							workerAgent: string;
-							orchestratorAgent: string;
+							workerAgent?: string;
+							orchestratorAgent?: string;
 							asWorkspace?: boolean;
 							clonePreparationId?: string;
 						}) => Promise<void>;
@@ -189,7 +189,7 @@ vi.mock("../hooks/useWorkspaceQuery", () => ({
 	useWorkspaceTraySessions: () => ({ data: [] }),
 	workspaceQueryKey: ["workspaces"],
 	remoteWorkspaceQueryKey: (hostId: string) => ["remote-workspaces", hostId],
-	workspaceQueryOptions: {},
+	workspaceQueryOptions: { queryKey: ["workspaces"] },
 	toWorkspaceSession: (session: { id: string }, project: { id: string; name: string }) => ({ ...session, workspaceId: project.id, workspaceName: project.name }),
 }));
 
@@ -213,8 +213,6 @@ vi.mock("../hooks/useDaemonStatus", () => ({
 vi.mock("../lib/api-client", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../lib/api-client")>()),
 	apiClient: { POST: vi.fn(), DELETE: vi.fn(), PATCH: vi.fn() },
-	apiErrorCode: (error: { code?: string } | undefined) => error?.code,
-	apiErrorMessage: (error: { message?: string } | undefined) => error?.message ?? "request failed",
 	hasTrustedApiBaseUrl: () => true,
 }));
 
@@ -466,10 +464,13 @@ beforeEach(() => {
 	};
 	shellMocks.state.daemonStatus = { state: "error", code: "not_ready" };
 	shellMocks.state.shellValue = undefined;
+	vi.mocked(apiClient.POST).mockReset();
 	vi.mocked(apiClient.PATCH).mockReset().mockResolvedValue({ error: undefined });
 	shellMocks.queryClient.fetchQuery.mockReset().mockResolvedValue(workspaces);
 	shellMocks.queryClient.getQueryData.mockReset().mockReturnValue(workspaces);
 	shellMocks.queryClient.getQueryState.mockReset().mockReturnValue({ dataUpdatedAt: 0 });
+	shellMocks.queryClient.cancelQueries.mockClear();
+	shellMocks.queryClient.setQueryData.mockClear();
 	useUiStore.setState({
 		projectCreationPending: false,
 		provisioningProjectIds: new Set(),
@@ -574,8 +575,6 @@ describe("shell workspace startup", () => {
 		await expect(
 			shellMocks.state.shellValue?.createProject?.({
 				path: "/one/",
-				workerAgent: "codex",
-				orchestratorAgent: "codex",
 			}),
 		).resolves.toBeUndefined();
 
@@ -586,30 +585,24 @@ describe("shell workspace startup", () => {
 		expect(screen.getByTestId("global-toast")).toHaveTextContent("Project already added");
 	});
 
-	it("finishes clone provisioning after registration committed but its response was lost", async () => {
+	it("opens the registered clone after its registration response was lost", async () => {
 		shellMocks.state.daemonStatus = { state: "ready", port: 4777 };
 		shellMocks.state.routeParams = { projectId: "proj-1" };
 		vi.mocked(apiClient.POST)
-			.mockReset()
 			.mockRejectedValueOnce(new TypeError("Failed to fetch"))
 			.mockResolvedValueOnce({ error: {
 				code: "PATH_ALREADY_REGISTERED", message: "Already registered", details: { existingProjectId: "proj-1" },
-			} })
-			.mockResolvedValueOnce({ data: { session: {
-				id: "orch-existing", projectId: "proj-1", kind: "orchestrator", mode: "chat",
-			} } });
+			} });
 		await renderShell();
-		const input = { path: "/one", workerAgent: "codex", orchestratorAgent: "codex", clonePreparationId: "prepared" };
+		const input = { path: "/one", clonePreparationId: "prepared" };
 		await expect(shellMocks.state.shellValue?.createProject?.(input)).rejects.toThrow("Failed to fetch");
+		expect(shellMocks.navigate).not.toHaveBeenCalled();
 		await expect(shellMocks.state.shellValue?.createProject?.(input)).resolves.toBeUndefined();
-		await waitFor(() => expect(shellMocks.navigate).toHaveBeenCalledWith({
-			to: "/projects/$projectId/sessions/$sessionId",
-			params: { projectId: "proj-1", sessionId: "orch-existing" },
-		}));
-		expect(apiClient.POST).toHaveBeenCalledWith("/api/v1/sessions", {
-			body: { projectId: "proj-1", kind: "orchestrator", harness: "codex" },
+		expect(shellMocks.navigate).toHaveBeenCalledExactlyOnceWith({
+			to: "/projects/$projectId", params: { projectId: "proj-1" },
 		});
-		expect(apiClient.POST).toHaveBeenCalledTimes(3);
+		const registration = ["/api/v1/projects", { body: { ...input, asWorkspace: undefined, config: {} } }];
+		expect(vi.mocked(apiClient.POST).mock.calls).toEqual([registration, registration]);
 		expect(useUiStore.getState().provisioningProjectIds.has("proj-1")).toBe(false);
 	});
 
@@ -620,7 +613,7 @@ describe("shell workspace startup", () => {
 		} });
 		await renderShell();
 		await expect(shellMocks.state.shellValue?.createProject?.({
-			path: "/alias/one", workerAgent: "codex", orchestratorAgent: "codex",
+			path: "/alias/one",
 		})).resolves.toBeUndefined();
 		expect(shellMocks.navigate).toHaveBeenCalledWith({
 			to: "/projects/$projectId", params: { projectId: "proj-1" },
@@ -634,24 +627,36 @@ describe("shell workspace startup", () => {
 		} });
 		await renderShell();
 		shellMocks.queryClient.fetchQuery.mockResolvedValueOnce([{ ...workspaces[0], id: "new-registration", path: "/canonical" }]);
-		await expect(shellMocks.state.shellValue?.createProject?.({ path: "/alias", workerAgent: "codex", orchestratorAgent: "codex" })).resolves.toBeUndefined();
-		expect(shellMocks.queryClient.fetchQuery).toHaveBeenCalledWith(expect.objectContaining({ staleTime: 0, retry: false }));
+		await expect(shellMocks.state.shellValue?.createProject?.({ path: "/alias" })).resolves.toBeUndefined();
+		expect(shellMocks.queryClient.fetchQuery).toHaveBeenCalledWith({ queryKey: ["workspaces"], staleTime: 0, retry: false });
 		expect(shellMocks.navigate).toHaveBeenCalledWith({ to: "/projects/$projectId", params: { projectId: "new-registration" } });
 	});
 
-	it.each([undefined, null, 123, [], "", "missing", "../outside"])(
-		"does not navigate to an unverified conflict identity: %j", async (existingProjectId) => {
+	it.each([undefined, null, 123, [], "", "missing", "../outside"].map((existingProjectId) => ({ existingProjectId })))(
+		"does not navigate to an unverified conflict identity: $existingProjectId", async ({ existingProjectId }) => {
 			shellMocks.state.daemonStatus = { state: "ready", port: 4777 };
 			vi.mocked(apiClient.POST).mockResolvedValueOnce({ error: {
 				code: "PATH_ALREADY_REGISTERED", message: "Already registered", requestId: "request-4403", details: { existingProjectId },
 			} });
 			await renderShell();
-			await expect(shellMocks.state.shellValue?.createProject?.({ path: "/unknown", workerAgent: "codex", orchestratorAgent: "codex" })).rejects.toMatchObject({
+			await expect(shellMocks.state.shellValue?.createProject?.({ path: "/unknown" })).rejects.toMatchObject({
 				code: "PATH_ALREADY_REGISTERED", requestId: "request-4403", details: { existingProjectId },
 			});
 			expect(shellMocks.navigate).not.toHaveBeenCalled();
 		},
 	);
+
+	it("does not open a registered project when registration is denied", async () => {
+		shellMocks.state.daemonStatus = { state: "ready", port: 4777 };
+		vi.mocked(apiClient.POST).mockResolvedValueOnce({ error: {
+			code: "FORBIDDEN", message: "Access denied", details: { existingProjectId: "proj-1" },
+		} });
+		await renderShell();
+		await expect(shellMocks.state.shellValue?.createProject?.({ path: "/one" })).rejects.toMatchObject({
+			code: "FORBIDDEN", message: "Access denied",
+		});
+		expect(shellMocks.navigate).not.toHaveBeenCalled();
+	});
 
 	it("preserves the original conflict when refreshing registered projects fails", async () => {
 		shellMocks.state.daemonStatus = { state: "ready", port: 4777 };
@@ -660,7 +665,7 @@ describe("shell workspace startup", () => {
 		} });
 		await renderShell();
 		shellMocks.queryClient.fetchQuery.mockRejectedValueOnce(new Error("refresh failed"));
-		await expect(shellMocks.state.shellValue?.createProject?.({ path: "/unknown", workerAgent: "codex", orchestratorAgent: "codex" })).rejects.toMatchObject({ code: "PATH_ALREADY_REGISTERED", message: "Already registered" });
+		await expect(shellMocks.state.shellValue?.createProject?.({ path: "/unknown" })).rejects.toMatchObject({ code: "PATH_ALREADY_REGISTERED", message: "Already registered" });
 		expect(shellMocks.navigate).not.toHaveBeenCalled();
 	});
 
@@ -683,8 +688,6 @@ describe("shell workspace startup", () => {
 		await shellMocks.state.shellValue?.createProject?.({
 			path: "/repo/project",
 			defaultBranch: "main",
-			workerAgent: "codex",
-			orchestratorAgent: "codex",
 		});
 
 		expect(apiClient.POST).toHaveBeenCalledWith("/api/v1/projects", {
@@ -693,8 +696,6 @@ describe("shell workspace startup", () => {
 				asWorkspace: undefined,
 				config: {
 					defaultBranch: "main",
-					worker: { agent: "codex" },
-					orchestrator: { agent: "codex" },
 				},
 			},
 		});
@@ -731,47 +732,51 @@ describe("shell workspace startup", () => {
 		expect(screen.queryByText("Getting your project ready")).not.toBeInTheDocument();
 	});
 
-	const spawnNewProject = () => {
+	const prepareNewProject = () => {
 		shellMocks.state.daemonStatus = { state: "ready", port: 3001 };
-		vi.mocked(apiClient.POST)
-			.mockResolvedValueOnce({ data: { project: { id: "proj-new", name: "New", kind: "single_repo", path: "/repo/new" } } })
-			.mockResolvedValueOnce({ data: { session: { id: "orch-new", projectId: "proj-new", kind: "orchestrator", mode: "chat", provisionState: "provisioning" } } });
+		vi.mocked(apiClient.POST).mockResolvedValueOnce({
+			data: { project: { id: "proj-new", name: "New", kind: "single_repo", path: "/repo/new" } },
+		});
 	};
 
 	it.each([
 		{ savedOrder: ["proj-2", "proj-1"] },
 		{ savedOrder: ["proj-2", "proj-1", "proj-new"] },
 	])("saves a newly created project first ahead of saved order $savedOrder", async ({ savedOrder }) => {
-		spawnNewProject();
+		prepareNewProject();
 		useSidebarOrderStore.getState().setProjectOrder(savedOrder);
 		await renderShell();
-		await shellMocks.state.shellValue?.createProject?.({ path: "/repo/new", workerAgent: "codex", orchestratorAgent: "codex" });
+		await shellMocks.state.shellValue?.createProject?.({ path: "/repo/new" });
 
 		expect(useSidebarOrderStore.getState().projectOrder).toEqual(["proj-new", "proj-2", "proj-1"]);
 		expect(JSON.parse(window.localStorage.getItem("ao.sidebar.project-order") ?? "null")).toEqual(["proj-new", "proj-2", "proj-1"]);
 	});
 
-	it("opens the returned orchestrator without waiting for a workspace refetch", async () => {
-		spawnNewProject();
-		shellMocks.state.routeParams = { projectId: "proj-new" };
+	it("opens the new local project's group chat without waiting for a workspace refetch", async () => {
+		prepareNewProject();
 		await renderShell();
-		await shellMocks.state.shellValue?.createProject?.({ path: "/repo/new", workerAgent: "codex", orchestratorAgent: "codex" });
-		await waitFor(() => expect(shellMocks.navigate).toHaveBeenCalledWith({
-			to: "/projects/$projectId/sessions/$sessionId",
-			params: { projectId: "proj-new", sessionId: "orch-new" },
-		}));
+		shellMocks.queryClient.fetchQuery.mockClear();
+		await shellMocks.state.shellValue?.createProject?.({ path: "/repo/new" });
+		expect(shellMocks.queryClient.fetchQuery).not.toHaveBeenCalled();
+		expect(shellMocks.navigate).toHaveBeenCalledExactlyOnceWith({
+			to: "/projects/$projectId", params: { projectId: "proj-new" },
+		});
 		const publish = shellMocks.queryClient.setQueryData.mock.calls.at(-1)?.[1] as (current: WorkspaceSummary[]) => WorkspaceSummary[];
-		expect(publish([{ ...workspaces[0], id: "proj-new", name: "New", sessions: [] }])[0].sessions[0]).toMatchObject({ id: "orch-new", mode: "chat", provisionState: "provisioning" });
+		expect(publish(workspaces)[0]).toMatchObject({ id: "proj-new", path: "/repo/new", sessions: [] });
 		expect(useUiStore.getState().provisioningProjectIds.has("proj-new")).toBe(false);
 	});
 
-	it("does not pull the user back to a new orchestrator after they left the project", async () => {
-		spawnNewProject();
+	it("registers an empty project from another project without starting a model", async () => {
+		prepareNewProject();
 		shellMocks.state.routeParams = { projectId: "other" };
 		await renderShell();
-		await shellMocks.state.shellValue?.createProject?.({ path: "/repo/new", workerAgent: "codex", orchestratorAgent: "codex" });
-		await waitFor(() => expect(useUiStore.getState().provisioningProjectIds.has("proj-new")).toBe(false));
-		expect(shellMocks.navigate).not.toHaveBeenCalledWith(expect.objectContaining({ to: "/projects/$projectId/sessions/$sessionId" }));
+		await shellMocks.state.shellValue?.createProject?.({ path: "/repo/new" });
+		expect(apiClient.POST).toHaveBeenCalledExactlyOnceWith("/api/v1/projects", {
+			body: { path: "/repo/new", asWorkspace: undefined, clonePreparationId: undefined, config: {} },
+		});
+		expect(shellMocks.navigate).toHaveBeenCalledExactlyOnceWith({
+			to: "/projects/$projectId", params: { projectId: "proj-new" },
+		});
 	});
 
 	it("leaves the session topbar row to the session split instead of reserving a full-width shell row", async () => {

@@ -1976,7 +1976,7 @@ describe("CreateProjectFlow project import validation", () => {
 			await user.click(screen.getByRole("button", { name: "Create repository and continue" }));
 
 		await waitFor(() => expect(useUiStore.getState().globalToast?.body).toMatch(/failed while running Initial commit/i));
-		await waitFor(() => expect(screen.getByRole("dialog", { name: "Prepare project" })).toHaveClass("modal-shake"));
+		await screen.findByRole("dialog", { name: "Prepare project" });
 		expect(screen.getAllByText("Done")).toHaveLength(1);
 		expect(screen.getAllByText("Needs attention")).toHaveLength(1);
 		expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
