@@ -1,0 +1,331 @@
+package notification
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
+)
+
+type fakeStore struct {
+	rows            []domain.NotificationRecord
+	listStatus      ListStatus
+	listBeforeAt    time.Time
+	listBeforeID    string
+	listLimit       int
+	unreadCount     int64
+	unresolvedCount int64
+
+	markRow       domain.NotificationRecord
+	markOK        bool
+	markAllCount  int64
+	markedAll     bool
+	markedIDs     []string
+	deleteRow     domain.NotificationRecord
+	deleteOK      bool
+	deletedID     string
+	deleteSawLock bool
+	deleteLock    *recordingLocker
+	clearAllCount int64
+	clearedAll    bool
+	clearSawLock  bool
+	clearLock     *recordingLocker
+	err           error
+}
+
+type recordingLocker struct{ held bool }
+
+func (l *recordingLocker) Lock()   { l.held = true }
+func (l *recordingLocker) Unlock() { l.held = false }
+
+type capturePublisher struct {
+	events  []domain.NotificationEvent
+	barrier *recordingLocker
+	t       *testing.T
+	err     error
+}
+
+func (p *capturePublisher) Publish(_ context.Context, event domain.NotificationEvent) error {
+	if p.barrier != nil && !p.barrier.held {
+		p.t.Fatal("notification event published outside clear barrier")
+	}
+	p.events = append(p.events, event)
+	return p.err
+}
+
+func (f *fakeStore) CreateNotification(context.Context, domain.NotificationRecord) (domain.NotificationRecord, bool, error) {
+	return domain.NotificationRecord{}, false, nil
+}
+
+func (f *fakeStore) ListNotifications(
+	_ context.Context,
+	status ListStatus,
+	beforeCreatedAt time.Time,
+	beforeID string,
+	limit int,
+) ([]domain.NotificationRecord, error) {
+	f.listStatus = status
+	f.listBeforeAt = beforeCreatedAt
+	f.listBeforeID = beforeID
+	f.listLimit = limit
+	return f.rows, f.err
+}
+
+func (f *fakeStore) CountUnreadNotifications(context.Context) (int64, error) {
+	return f.unreadCount, f.err
+}
+
+func (f *fakeStore) CountUnresolvedNotifications(context.Context) (int64, error) {
+	return f.unresolvedCount, f.err
+}
+
+func (f *fakeStore) MarkNotificationRead(_ context.Context, _ string) (domain.NotificationRecord, bool, error) {
+	return f.markRow, f.markOK, f.err
+}
+
+func (f *fakeStore) MarkAllNotificationsRead(context.Context) (int64, error) {
+	f.markedAll = true
+	return f.markAllCount, f.err
+}
+
+func (f *fakeStore) MarkNotificationsRead(_ context.Context, ids []string) (int64, error) {
+	f.markedIDs = ids
+	return int64(len(ids)), f.err
+}
+
+func (f *fakeStore) DeleteNotification(_ context.Context, id string) (domain.NotificationRecord, bool, error) {
+	f.deletedID = id
+	f.deleteSawLock = f.deleteLock == nil || f.deleteLock.held
+	return f.deleteRow, f.deleteOK, f.err
+}
+
+func (f *fakeStore) ClearAllNotifications(context.Context) (int64, error) {
+	f.clearedAll = true
+	f.clearSawLock = f.clearLock == nil || f.clearLock.held
+	return f.clearAllCount, f.err
+}
+
+func TestListAddsTargetsAndReturnsNextCursor(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	st := &fakeStore{rows: []domain.NotificationRecord{
+		{ID: "n3", SessionID: "mer-1", ProjectID: "mer", Type: domain.NotificationNeedsInput, Title: "needs", Status: domain.NotificationUnread, CreatedAt: now},
+		{ID: "n2", SessionID: "mer-1", ProjectID: "mer", PRURL: "https://github.com/o/r/pull/1", Type: domain.NotificationReadyToMerge, Title: "ready", Status: domain.NotificationUnread, CreatedAt: now.Add(-time.Minute)},
+		{ID: "n1", SessionID: "mer-1", ProjectID: "mer", Type: domain.NotificationNeedsInput, Title: "older", Status: domain.NotificationRead, CreatedAt: now.Add(-2 * time.Minute)},
+	}, unreadCount: 2}
+	mgr := New(Deps{Store: st})
+	got, err := mgr.List(context.Background(), ListFilter{Status: ListAll, Limit: 2})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got.Notifications) != 2 || got.Notifications[0].Target.Kind != TargetSession ||
+		got.Notifications[1].Target.Kind != TargetPR || got.Notifications[1].Target.PRURL == "" {
+		t.Fatalf("targets = %+v", got)
+	}
+	if got.UnreadCount != 2 || got.NextCursor == "" {
+		t.Fatalf("page = %+v", got)
+	}
+	cursorAt, cursorID, err := decodeCursor(got.NextCursor)
+	if err != nil || !cursorAt.Equal(now.Add(-time.Minute)) || cursorID != "n2" {
+		t.Fatalf("cursor at=%s id=%q err=%v", cursorAt, cursorID, err)
+	}
+	if st.listStatus != ListAll || st.listLimit != 3 || !st.listBeforeAt.IsZero() || st.listBeforeID != "" {
+		t.Fatalf("list filter status=%q before=%s/%q limit=%d", st.listStatus, st.listBeforeAt, st.listBeforeID, st.listLimit)
+	}
+}
+
+func TestListDefaultsToUnreadAndOneHundred(t *testing.T) {
+	st := &fakeStore{}
+	mgr := New(Deps{Store: st})
+	if _, err := mgr.List(context.Background(), ListFilter{}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if st.listStatus != ListUnread || st.listLimit != DefaultListLimit+1 {
+		t.Fatalf("list status=%q limit=%d", st.listStatus, st.listLimit)
+	}
+}
+
+func TestListRejectsInvalidCursor(t *testing.T) {
+	_, err := New(Deps{Store: &fakeStore{}}).List(context.Background(), ListFilter{Cursor: "not-a-cursor"})
+	var apiErr *apierr.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "INVALID_NOTIFICATION_CURSOR" {
+		t.Fatalf("err = %v, want invalid cursor", err)
+	}
+}
+
+func TestMarkReadAddsTarget(t *testing.T) {
+	st := &fakeStore{
+		markRow: domain.NotificationRecord{
+			ID: "n2", SessionID: "mer-1", ProjectID: "mer", PRURL: "https://github.com/o/r/pull/1",
+			Type: domain.NotificationReadyToMerge, Title: "ready", Status: domain.NotificationRead, CreatedAt: time.Now(),
+		},
+		markOK: true,
+	}
+	mgr := New(Deps{Store: st})
+	got, ok, err := mgr.MarkRead(context.Background(), "n2")
+	if err != nil || !ok {
+		t.Fatalf("MarkRead ok=%v err=%v", ok, err)
+	}
+	if got.Status != domain.NotificationRead || got.Target.Kind != TargetPR || got.Target.PRURL == "" {
+		t.Fatalf("notification = %+v", got)
+	}
+}
+
+func TestMarkReadMissingReturnsNotFound(t *testing.T) {
+	mgr := New(Deps{Store: &fakeStore{}})
+	_, _, err := mgr.MarkRead(context.Background(), "missing")
+	var apiErr *apierr.Error
+	if !errors.As(err, &apiErr) || apiErr.Kind != apierr.KindNotFound || apiErr.Code != "NOTIFICATION_NOT_FOUND" {
+		t.Fatalf("err = %v, want notification not found", err)
+	}
+}
+
+func TestMarkAllReadReturnsUpdatedCount(t *testing.T) {
+	st := &fakeStore{markAllCount: 42}
+	mgr := New(Deps{Store: st})
+	got, err := mgr.MarkAllRead(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("MarkAllRead: %v", err)
+	}
+	if got != 42 || !st.markedAll {
+		t.Fatalf("updated count = %d markedAll=%v, want 42 true", got, st.markedAll)
+	}
+}
+
+// Acknowledging every unread row would strand anything past the client's last
+// loaded page, so an explicit id list must scope the write to those rows.
+func TestMarkAllReadWithIDsScopesToThoseNotifications(t *testing.T) {
+	st := &fakeStore{markAllCount: 99}
+	mgr := New(Deps{Store: st})
+	got, err := mgr.MarkAllRead(context.Background(), []string{"n1", "n2"})
+	if err != nil {
+		t.Fatalf("MarkAllRead: %v", err)
+	}
+	if got != 2 || st.markedAll {
+		t.Fatalf("updated count = %d markedAll=%v, want 2 false", got, st.markedAll)
+	}
+	if len(st.markedIDs) != 2 || st.markedIDs[0] != "n1" {
+		t.Fatalf("marked ids = %v", st.markedIDs)
+	}
+}
+
+func TestDeletePublishesRemovedNotificationInsideBarrier(t *testing.T) {
+	barrier := &recordingLocker{}
+	row := domain.NotificationRecord{
+		ID: "n1", SessionID: "mer-1", ProjectID: "mer", Type: domain.NotificationNeedsInput,
+		Title: "needs input", Status: domain.NotificationUnread, CreatedAt: time.Now(),
+	}
+	st := &fakeStore{deleteRow: row, deleteOK: true, deleteLock: barrier}
+	publisher := &capturePublisher{barrier: barrier, t: t}
+	mgr := New(Deps{Store: st, Publisher: publisher, Barrier: barrier})
+
+	got, err := mgr.Delete(context.Background(), "n1")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if st.deletedID != "n1" || !st.deleteSawLock || got.ID != "n1" || got.Target.Kind != TargetSession {
+		t.Fatalf("deleted=%q locked=%v notification=%+v", st.deletedID, st.deleteSawLock, got)
+	}
+	if len(publisher.events) != 1 || publisher.events[0].Kind != domain.NotificationDeleted || publisher.events[0].Record.ID != "n1" {
+		t.Fatalf("events = %+v", publisher.events)
+	}
+}
+
+func TestDeleteMissingReturnsNotFound(t *testing.T) {
+	mgr := New(Deps{Store: &fakeStore{}})
+	_, err := mgr.Delete(context.Background(), "missing")
+	var apiErr *apierr.Error
+	if !errors.As(err, &apiErr) || apiErr.Kind != apierr.KindNotFound || apiErr.Code != "NOTIFICATION_NOT_FOUND" {
+		t.Fatalf("err = %v, want notification not found", err)
+	}
+}
+
+func TestDeleteReturnsCommittedNotificationWhenPublishFails(t *testing.T) {
+	var logs bytes.Buffer
+	row := domain.NotificationRecord{
+		ID: "n1", SessionID: "mer-1", ProjectID: "mer", Type: domain.NotificationNeedsInput,
+		Title: "needs input", Status: domain.NotificationUnread, CreatedAt: time.Now(),
+	}
+	st := &fakeStore{deleteRow: row, deleteOK: true}
+	publisher := &capturePublisher{err: errors.New("subscriber failed")}
+	mgr := New(Deps{Store: st, Publisher: publisher, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+
+	got, err := mgr.Delete(context.Background(), "n1")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got.ID != "n1" || st.deletedID != "n1" {
+		t.Fatalf("notification=%+v deleted=%q", got, st.deletedID)
+	}
+	if !strings.Contains(logs.String(), "notification delete event publish failed") {
+		t.Fatalf("logs = %q", logs.String())
+	}
+}
+
+func TestListUnreadRequiresStore(t *testing.T) {
+	_, err := New(Deps{}).List(context.Background(), ListFilter{})
+	if err == nil {
+		t.Fatal("want missing store error")
+	}
+}
+
+func TestClearAllPublishesMatchingOrderedGenerationInsideBarrier(t *testing.T) {
+	barrier := &recordingLocker{}
+	st := &fakeStore{clearAllCount: 4, clearLock: barrier}
+	publisher := &capturePublisher{barrier: barrier, t: t}
+	clearID := 0
+	mgr := New(Deps{
+		Store: st, Publisher: publisher, Barrier: barrier, ClearEpoch: "epoch-1",
+		NewClearID: func() string {
+			clearID++
+			return fmt.Sprintf("clear-%d", clearID)
+		},
+	})
+
+	first, err := mgr.ClearAll(context.Background())
+	if err != nil {
+		t.Fatalf("ClearAll: %v", err)
+	}
+	second, err := mgr.ClearAll(context.Background())
+	if err != nil {
+		t.Fatalf("second ClearAll: %v", err)
+	}
+	if first.ClearedCount != 4 || first.ClearID != "clear-1" || first.ClearEpoch != "epoch-1" || first.ClearSequence != 1 ||
+		second.ClearID != "clear-2" || second.ClearEpoch != "epoch-1" || second.ClearSequence != 2 ||
+		!st.clearedAll || !st.clearSawLock {
+		t.Fatalf("first=%+v second=%+v cleared=%v locked=%v", first, second, st.clearedAll, st.clearSawLock)
+	}
+	if len(publisher.events) != 2 || publisher.events[0].Kind != domain.NotificationCleared ||
+		publisher.events[0].ClearID != first.ClearID || publisher.events[0].ClearEpoch != first.ClearEpoch ||
+		publisher.events[0].ClearSequence != first.ClearSequence || publisher.events[1].ClearID != second.ClearID ||
+		publisher.events[1].ClearEpoch != second.ClearEpoch || publisher.events[1].ClearSequence != second.ClearSequence {
+		t.Fatalf("events = %+v", publisher.events)
+	}
+}
+
+func TestClearAllReturnsCommittedResultWhenPublishFails(t *testing.T) {
+	var logs bytes.Buffer
+	st := &fakeStore{clearAllCount: 4}
+	publisher := &capturePublisher{err: errors.New("subscriber failed")}
+	mgr := New(Deps{
+		Store: st, Publisher: publisher, Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		ClearEpoch: "epoch-1", NewClearID: func() string { return "clear-1" },
+	})
+
+	got, err := mgr.ClearAll(context.Background())
+	if err != nil {
+		t.Fatalf("ClearAll: %v", err)
+	}
+	if got.ClearedCount != 4 || got.ClearID != "clear-1" || !st.clearedAll {
+		t.Fatalf("result=%+v cleared=%v", got, st.clearedAll)
+	}
+	if !strings.Contains(logs.String(), "notification clear event publish failed") {
+		t.Fatalf("logs = %q", logs.String())
+	}
+}

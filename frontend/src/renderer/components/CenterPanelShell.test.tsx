@@ -1,0 +1,97 @@
+import { render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mockIsMac = vi.hoisted(() => vi.fn(() => false));
+const mockIsLinux = vi.hoisted(() => vi.fn(() => false));
+const mockIsFullScreen = vi.hoisted(() => vi.fn(() => false));
+const uiState = vi.hoisted(() => ({ isSidebarOpen: true, developerMode: true }));
+vi.mock("../lib/platform", () => ({
+	isMacPlatform: mockIsMac,
+	isLinuxPlatform: mockIsLinux,
+}));
+
+vi.mock("../hooks/useWindowFullScreen", () => ({ useWindowFullScreen: mockIsFullScreen }));
+vi.mock("./NotificationCenter", () => ({ NotificationCenter: () => <button type="button">Notifications</button> }));
+vi.mock("../stores/ui-store", () => ({
+	sidebarOccupiesLayout: (state: { isSidebarOpen: boolean }) => state.isSidebarOpen,
+	useUiStore: (sel: (s: { isSidebarOpen: boolean; developerMode: boolean }) => unknown) => sel(uiState),
+}));
+
+const { CenterPanelShell } = await import("./CenterPanelShell");
+
+describe("CenterPanelShell platform classes", () => {
+	beforeEach(() => {
+		mockIsMac.mockReturnValue(false);
+		mockIsLinux.mockReturnValue(false);
+		mockIsFullScreen.mockReturnValue(false);
+		uiState.isSidebarOpen = true;
+		uiState.developerMode = true;
+	});
+
+	it("applies center-panel-shell--mac on macOS", () => {
+		mockIsMac.mockReturnValue(true);
+		const { container } = render(<CenterPanelShell>x</CenterPanelShell>);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--mac")).toBe(true);
+	});
+
+	it("does not apply center-panel-shell--mac on Linux", () => {
+		mockIsLinux.mockReturnValue(true);
+		const { container } = render(<CenterPanelShell>x</CenterPanelShell>);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--mac")).toBe(false);
+	});
+
+	it("does not apply center-panel-shell--mac on Windows", () => {
+		const { container } = render(<CenterPanelShell>x</CenterPanelShell>);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--mac")).toBe(false);
+	});
+
+	it("keeps notifications off utility panels", () => {
+		render(<CenterPanelShell>x</CenterPanelShell>);
+		expect(screen.queryByRole("button", { name: "Notifications" })).not.toBeInTheDocument();
+	});
+
+	it("includes notifications when a workspace panel opts in", () => {
+		render(<CenterPanelShell notifications>x</CenterPanelShell>);
+		expect(screen.getByRole("button", { name: "Notifications" })).toBeVisible();
+	});
+
+	it("floats the top bar band above the panel on macOS by default", () => {
+		mockIsMac.mockReturnValue(true);
+		const { container } = render(<CenterPanelShell>x</CenterPanelShell>);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--floating-topbar")).toBe(true);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--bare")).toBe(false);
+	});
+
+	it("keeps the previous top bar layout without Developer Mode", () => {
+		mockIsMac.mockReturnValue(true);
+		uiState.developerMode = false;
+		const { container } = render(<CenterPanelShell topbar={false}>x</CenterPanelShell>);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--floating-topbar")).toBe(false);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--bare")).toBe(false);
+	});
+
+	it("lets a page without a top bar take the band back", () => {
+		mockIsMac.mockReturnValue(true);
+		const { container } = render(<CenterPanelShell topbar={false}>x</CenterPanelShell>);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--floating-topbar")).toBe(false);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--bare")).toBe(true);
+	});
+
+	it("keeps the band for a page without a top bar while the sidebar is closed", () => {
+		mockIsMac.mockReturnValue(true);
+		uiState.isSidebarOpen = false;
+		const { container } = render(<CenterPanelShell topbar={false}>x</CenterPanelShell>);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--floating-topbar")).toBe(true);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--bare")).toBe(false);
+	});
+
+	it("pads the framed titlebar past the Linux nav cluster when the sidebar is collapsed", () => {
+		mockIsLinux.mockReturnValue(true);
+		uiState.isSidebarOpen = false;
+		const { container } = render(<CenterPanelShell>x</CenterPanelShell>);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--titlebar-clearance-linux")).toBe(
+			true,
+		);
+		expect(container.firstElementChild!.classList.contains("center-panel-shell--titlebar-clearance")).toBe(false);
+	});
+});

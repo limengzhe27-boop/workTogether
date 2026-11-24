@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Discord community
+    url: https://discord.com/invite/UZv7JjxbwG
+    about: Questions, mentoring, and the weekly contributor call.
+  - name: Contributing guide
+    url: https://github.com/OrchestratorInc/agent-orchestrator/blob/main/CONTRIBUTING.md
+    about: How to claim issues, open PRs, and work with maintainers.

@@ -1,0 +1,375 @@
+import React from "react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import CloneRepositoryDialog, { joinCloneDestination, repositoryNameFromGitUrl, sameProjectPath } from "./CloneRepositoryDialog";
+
+// The first run prompt reads the GitHub CLI state from the daemon; drive it directly.
+const gitHub = vi.hoisted(() => ({
+	requirements: [{ id: "gh", label: "gh", required: false, satisfied: true }] as Array<{ id: string; label: string; required: boolean; satisfied: boolean }>,
+	auth: { isSuccess: true, isError: false, data: { satisfied: true }, refetch: vi.fn() } as { isSuccess: boolean; isError: boolean; data?: { satisfied: boolean }; refetch: () => unknown },
+}));
+vi.mock("../hooks/useSystemRequirementsGate", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../hooks/useSystemRequirementsGate")>()),
+	useSystemRequirementsGate: () => ({ query: { isSuccess: true, isError: false, refetch: vi.fn() }, requirements: gitHub.requirements }),
+	useGitHubAuthRequirement: () => gitHub.auth,
+}));
+
+function cloneDialogProps(
+	overrides: Partial<React.ComponentProps<typeof CloneRepositoryDialog>> = {},
+): React.ComponentProps<typeof CloneRepositoryDialog> {
+	return {
+		disabled: false,
+		error: null,
+		onBack: vi.fn(),
+		onChange: vi.fn(),
+		onClose: vi.fn(),
+		onContinue: vi.fn(),
+		onError: vi.fn(),
+		onCheckDestination: vi.fn(async (input) => ({ remoteUrl: input.remoteUrl, path: joinCloneDestination(input.destinationParent, repositoryNameFromGitUrl(input.remoteUrl) ?? ""), exists: false, canUseExisting: false })),
+		onUseExisting: vi.fn(),
+		onCancel: vi.fn(),
+		open: true,
+		value: { remoteUrl: "https://github.com/acme/web-app.git", destinationParent: "/code" },
+		...overrides,
+	};
+}
+
+function renderCloneDialog(
+	overrides: Partial<React.ComponentProps<typeof CloneRepositoryDialog>> = {},
+	withQueryClient = false,
+) {
+	const props = cloneDialogProps(overrides);
+	const dialog = React.createElement(CloneRepositoryDialog, props);
+	const tree = withQueryClient
+		? React.createElement(QueryClientProvider, { client: new QueryClient({ defaultOptions: { queries: { retry: false } } }) }, dialog)
+		: dialog;
+	return { props, view: render(tree) };
+}
+
+afterEach(() => {
+	gitHub.auth = { isSuccess: true, isError: false, data: { satisfied: true }, refetch: vi.fn() };
+	window.localStorage.removeItem("ao.clone.lastDestinationParent");
+	vi.restoreAllMocks();
+});
+
+describe("clone repository input", () => {
+	it("walks the first run prompt from welcome to the clone form with the repo picker", async () => {
+		const onOpenLocalFolder = vi.fn();
+		const onStartStandaloneAgent = vi.fn();
+		window.ao!.app.listGitHubRepos = vi.fn().mockResolvedValue([
+			{ fullName: "acme/web-app", description: "", isPrivate: false, url: "https://github.com/acme/web-app", avatarUrl: "https://github.com/acme.png?size=40" },
+		]);
+		const { props, view } = renderCloneDialog({
+			firstRun: true,
+			value: { remoteUrl: "", destinationParent: "/code" },
+			onOpenLocalFolder,
+			onStartStandaloneAgent,
+		});
+		expect(screen.getByRole("dialog", { name: "Welcome to Agent Orchestrator" })).toBeInTheDocument();
+		fireEvent.click(screen.getByRole("button", { name: "Get started" }));
+
+		expect(screen.getByRole("dialog", { name: "Let's set up your first project" })).toBeInTheDocument();
+		fireEvent.click(screen.getByRole("button", { name: "Start a standalone agent" }));
+		fireEvent.click(screen.getByRole("button", { name: "Open a local folder" }));
+		expect(onStartStandaloneAgent).toHaveBeenCalledOnce();
+		expect(onOpenLocalFolder).toHaveBeenCalledOnce();
+
+		fireEvent.click(screen.getByRole("combobox"));
+		fireEvent.click(await screen.findByText("acme/web-app"));
+		expect(props.onChange).toHaveBeenCalledWith({ remoteUrl: "https://github.com/acme/web-app", destinationParent: "/code" });
+
+		view.rerender(React.createElement(CloneRepositoryDialog, { ...props, value: { remoteUrl: "https://github.com/acme/web-app", destinationParent: "/code" } }));
+		await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
+		fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+		expect(props.onContinue).toHaveBeenCalledWith(expect.objectContaining({ destinationParent: "/code", targetPath: "/code/web-app" }));
+	});
+
+	it("cannot dismiss the first run welcome step, but the close button works afterwards", () => {
+		const { props } = renderCloneDialog({ firstRun: true, value: { remoteUrl: "", destinationParent: "/code" } });
+		fireEvent.keyDown(document, { key: "Escape" });
+		expect(props.onClose).not.toHaveBeenCalled();
+		expect(screen.queryByRole("button", { name: "Close clone repository dialog" })).not.toBeInTheDocument();
+
+		fireEvent.click(screen.getByRole("button", { name: "Get started" }));
+		fireEvent.keyDown(document, { key: "Escape" });
+		expect(props.onClose).not.toHaveBeenCalled();
+		fireEvent.click(screen.getByRole("button", { name: "Close clone repository dialog" }));
+		expect(props.onClose).toHaveBeenCalledOnce();
+	});
+
+	it("does not block a pasted URL when the GitHub check itself failed", () => {
+		gitHub.auth = { isSuccess: false, isError: true, data: undefined, refetch: vi.fn() };
+		renderCloneDialog({ firstRun: true, value: { remoteUrl: "", destinationParent: "/code" } }, true);
+		fireEvent.click(screen.getByRole("button", { name: "Get started" }));
+		fireEvent.change(screen.getByPlaceholderText("https://github.com/org/repository.git"), { target: { value: "https://github.com/acme/web-app" } });
+		fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+		expect(screen.queryByText("Sign in to GitHub")).not.toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Back to code source" })).toBeInTheDocument();
+	});
+
+	it("offers GitHub sign-in only once a pasted URL is submitted, and can continue without it", () => {
+		gitHub.auth = { isSuccess: true, isError: false, data: { satisfied: false }, refetch: vi.fn() };
+		const { props } = renderCloneDialog({ firstRun: true, value: { remoteUrl: "", destinationParent: "/code" } }, true);
+		fireEvent.click(screen.getByRole("button", { name: "Get started" }));
+		expect(screen.queryByText("Sign in to GitHub")).not.toBeInTheDocument();
+
+		fireEvent.change(screen.getByPlaceholderText("https://github.com/org/repository.git"), { target: { value: "https://github.com/acme/web-app" } });
+		fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+		expect(props.onChange).toHaveBeenCalledWith({ remoteUrl: "https://github.com/acme/web-app", destinationParent: "/code" });
+		expect(screen.getByText("Sign in to GitHub")).toBeInTheDocument();
+
+		fireEvent.click(screen.getByRole("button", { name: "Continue without it" }));
+		expect(screen.getByRole("button", { name: "Back to code source" })).toBeInTheDocument();
+	});
+
+	it("edits the destination without opening the picker and submits the updated path", async () => {
+		window.ao!.app.checkGitRepository = vi.fn().mockResolvedValue(true);
+		window.ao!.app.chooseDirectory = vi.fn();
+		const { props, view } = renderCloneDialog();
+		const input = screen.getByRole("textbox", { name: "Clone into" });
+		fireEvent.click(input);
+		fireEvent.change(input, { target: { value: "/Projects/new folder" } });
+		expect(window.ao!.app.chooseDirectory).not.toHaveBeenCalled();
+		expect(props.onChange).toHaveBeenCalledWith({ ...props.value, destinationParent: "/Projects/new folder" });
+		view.rerender(React.createElement(CloneRepositoryDialog, { ...props, value: { ...props.value, destinationParent: "/Projects/new folder" } }));
+		expect(screen.getByText("Repository will be created at /Projects/new folder/web-app.")).toBeInTheDocument();
+		await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
+		fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+		expect(props.onContinue).toHaveBeenCalledWith({ ...props.value, destinationParent: "/Projects/new folder", targetPath: "/Projects/new folder/web-app" });
+		expect(window.localStorage.getItem("ao.clone.lastDestinationParent")).toBe("/Projects/new folder");
+	});
+
+	it("opens the destination picker at the default folder and submits its selection", async () => {
+		window.ao!.app.checkGitRepository = vi.fn().mockResolvedValue(true);
+		window.ao!.app.chooseDirectory = vi.fn().mockResolvedValue("/Projects/new folder");
+		const { props, view } = renderCloneDialog();
+		fireEvent.click(screen.getByRole("button", { name: "Choose where to clone the repository" }));
+		expect(window.ao!.app.chooseDirectory).toHaveBeenCalledWith({
+			title: "Choose where to clone the repository", defaultPath: "/code",
+		});
+		await waitFor(() => expect(props.onChange).toHaveBeenCalledWith({ ...props.value, destinationParent: "/Projects/new folder" }));
+		view.rerender(React.createElement(CloneRepositoryDialog, { ...props, value: { ...props.value, destinationParent: "/Projects/new folder" } }));
+		expect(screen.getByText("Repository will be created at /Projects/new folder/web-app.")).toBeInTheDocument();
+		await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
+		fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+		expect(props.onContinue).toHaveBeenCalledWith({ ...props.value, destinationParent: "/Projects/new folder", targetPath: "/Projects/new folder/web-app" });
+		expect(window.localStorage.getItem("ao.clone.lastDestinationParent")).toBe("/Projects/new folder");
+	});
+
+	it("shows that the clone is running and where it is going", () => {
+		renderCloneDialog({ cloning: true, disabled: true });
+
+		expect(screen.getByRole("button", { name: "Cloning..." })).toBeDisabled();
+		expect(screen.getByText("Cloning into /code/web-app. Large repositories can take a few minutes.")).toBeInTheDocument();
+	});
+
+	it("describes the destination consistently and shows the exact checkout path", () => {
+		renderCloneDialog();
+
+		expect(screen.getByText("Clone into")).toBeInTheDocument();
+		expect(screen.getByText("Repository will be created at /code/web-app.")).toBeInTheDocument();
+		expect(screen.queryByText(/parent folder/i)).not.toBeInTheDocument();
+	});
+
+	it.each([
+		["https://github.com/acme/web-app.git", "web-app"],
+		["https://git.example.com/web-app.git", "web-app"],
+		["ssh://git@github.com/acme/web-app.git", "web-app"],
+		["git@github.com:acme/web-app.git", "web-app"],
+		["file:///tmp/web-app", "web-app"],
+		["file:///tmp/my%20repo.git", "my repo"],
+		["https://github.com/acme/nested%2Frepo.git", "repo"],
+		["file:///tmp/literal%252Frepo.git", "literal%2Frepo"],
+	])("derives the checkout name from %s", (remoteUrl, expected) => {
+		expect(repositoryNameFromGitUrl(remoteUrl)).toBe(expected);
+	});
+
+	it.each([
+		"repository-without-a-scheme",
+		"--upload-pack=malicious",
+		"https://user:secret@example.com/acme/repo.git",
+		"https://example.com/acme/repo.git?access_token=secret",
+		"ssh://git:secret@example.com/acme/repo.git",
+		"https://github.com/acme/two words.git",
+		"https://github.com/acme/web-app/pull/123",
+		"https://github.com/acme/web-app/issues/12",
+		"https://gitlab.com/acme/web-app/-/merge_requests/12",
+		"file:///tmp/bad%ZZ.git",
+	])("rejects unsafe or incomplete URL %s", (remoteUrl) => {
+		expect(repositoryNameFromGitUrl(remoteUrl)).toBeNull();
+	});
+
+	it("joins POSIX and Windows destinations", () => {
+		expect(joinCloneDestination("/Users/me/Code/", "web-app")).toBe("/Users/me/Code/web-app");
+		expect(joinCloneDestination("C:\\Code\\", "web-app")).toBe("C:\\Code\\web-app");
+	});
+
+	it("compares paths with the platform's case rules", () => {
+		expect(sameProjectPath("/code/Web-App", "/code/web-app", false)).toBe(false);
+		expect(sameProjectPath("C:\\Code\\Web-App", "C:\\Code\\web-app\\", true)).toBe(true);
+	});
+
+	it("compares paths case-insensitively by default on macOS", () => {
+		vi.spyOn(window.navigator, "platform", "get").mockReturnValue("MacIntel");
+		expect(sameProjectPath("/Users/me/Code/Web-App", "/Users/me/Code/web-app")).toBe(true);
+	});
+
+	it("allows the same project name at a different target path", async () => {
+		window.ao!.app.checkGitRepository = vi.fn().mockResolvedValue(true);
+		renderCloneDialog({
+			existingProjectNames: ["web-app"],
+			existingProjectPaths: ["/other/web-app"],
+		});
+
+		await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
+		expect(screen.queryByText("A project with this name already exists.")).not.toBeInTheDocument();
+	});
+
+	it("reports a duplicate target once and does not repeat it as a parent alert", async () => {
+		window.ao!.app.checkGitRepository = vi.fn().mockResolvedValue(true);
+		const onError = vi.fn();
+		const { props, view } = renderCloneDialog({
+			existingProjectPaths: ["/code/web-app/"],
+			onError,
+		});
+
+		const duplicateMessage = "A repository already exists at this location";
+		expect(onError).not.toHaveBeenCalled();
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+		fireEvent.blur(screen.getByRole("textbox", { name: "Repository URL" }));
+		await waitFor(() => expect(onError).toHaveBeenCalledWith(duplicateMessage));
+		expect(onError).toHaveBeenCalledTimes(1);
+		expect(screen.getAllByRole("alert")).toHaveLength(1);
+		await waitFor(() => expect(screen.getByRole("dialog", { name: "Clone a Git repository" })).toHaveClass("modal-shake"));
+
+		view.rerender(React.createElement(CloneRepositoryDialog, { ...props, error: duplicateMessage }));
+		expect(screen.getAllByRole("alert")).toHaveLength(1);
+		expect(onError).toHaveBeenCalledTimes(1);
+	});
+
+	it("waits until blur to report a malformed URL, then reports it once", async () => {
+		const onError = vi.fn();
+		const { props, view } = renderCloneDialog({
+			onError,
+			value: { remoteUrl: "", destinationParent: "/code" },
+		});
+		view.rerender(React.createElement(CloneRepositoryDialog, {
+			...props,
+			value: { remoteUrl: "n", destinationParent: "/code" },
+		}));
+
+		expect(onError).not.toHaveBeenCalled();
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+		fireEvent.blur(screen.getByRole("textbox", { name: "Repository URL" }));
+		await waitFor(() => expect(onError).toHaveBeenCalledWith("Enter a valid HTTPS, SSH, Git, or file URL."));
+		expect(onError).toHaveBeenCalledTimes(1);
+		expect(screen.getAllByRole("alert")).toHaveLength(1);
+		await waitFor(() => expect(screen.getByRole("dialog", { name: "Clone a Git repository" })).toHaveClass("modal-shake"));
+	});
+
+	it("reports a malformed URL when the form is submitted before blur", async () => {
+		const onError = vi.fn();
+		renderCloneDialog({
+			onError,
+			value: { remoteUrl: "not-a-repository", destinationParent: "/code" },
+		});
+
+		const input = screen.getByRole("textbox", { name: "Repository URL" });
+		fireEvent.submit(input.closest("form")!);
+		await waitFor(() => expect(onError).toHaveBeenCalledWith("Enter a valid HTTPS, SSH, Git, or file URL."));
+	});
+
+	it("keeps Continue disabled until a destination is selected", async () => {
+		window.ao!.app.checkGitRepository = vi.fn().mockResolvedValue(true);
+		const onContinue = vi.fn();
+		const onError = vi.fn();
+		renderCloneDialog({
+			onContinue,
+			onError,
+			value: { remoteUrl: "https://github.com/acme/web-app.git", destinationParent: "" },
+		});
+
+		expect(window.ao!.app.checkGitRepository).not.toHaveBeenCalled();
+		const continueButton = screen.getByRole("button", { name: "Continue" });
+		expect(continueButton).toBeDisabled();
+		fireEvent.submit(continueButton.closest("form")!);
+		expect(onContinue).not.toHaveBeenCalled();
+		expect(onError).toHaveBeenCalledWith("Choose a destination folder.");
+	});
+
+	it("ignores an older destination check after the URL changes", async () => {
+		let resolveFirst: ((value: Awaited<ReturnType<React.ComponentProps<typeof CloneRepositoryDialog>["onCheckDestination"]>>) => void) | undefined;
+		const check = vi.fn<React.ComponentProps<typeof CloneRepositoryDialog>["onCheckDestination"]>()
+			.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+			.mockResolvedValue({ remoteUrl: "https://git.example.com/second.git", path: "/code/second", exists: false, canUseExisting: false });
+		const { props, view } = renderCloneDialog({ onCheckDestination: check });
+		await waitFor(() => expect(check).toHaveBeenCalledOnce());
+		view.rerender(React.createElement(CloneRepositoryDialog, { ...props, value: { ...props.value, remoteUrl: "https://git.example.com/second.git" } }));
+		await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
+		await act(async () => resolveFirst?.({ remoteUrl: props.value.remoteUrl, path: "/code/web-app", exists: true, canUseExisting: false }));
+		expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+	});
+
+	it("checks the destination again when the dialog reopens", async () => {
+		const { props, view } = renderCloneDialog();
+		await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
+		view.rerender(React.createElement(CloneRepositoryDialog, { ...props, open: false }));
+		view.rerender(React.createElement(CloneRepositoryDialog, { ...props, open: true }));
+		expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+		await waitFor(() => expect(props.onCheckDestination).toHaveBeenCalledTimes(2));
+	});
+
+	it("lets users retry a failed destination check without editing their inputs", async () => {
+		const check = vi.fn<React.ComponentProps<typeof CloneRepositoryDialog>["onCheckDestination"]>()
+			.mockRejectedValueOnce(new Error("Destination check unavailable"))
+			.mockResolvedValue({ remoteUrl: "https://github.com/acme/web-app.git", path: "/code/web-app", exists: false, canUseExisting: false });
+		renderCloneDialog({ onCheckDestination: check });
+		expect(await screen.findByRole("alert")).toHaveTextContent("Destination check unavailable");
+		expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+		fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+		await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
+	});
+
+	it.each([false, true])("blocks an existing destination and offers reuse only for the same repository, matching=%s", async (matching) => {
+		const { props } = renderCloneDialog({ onCheckDestination: vi.fn().mockResolvedValue({ remoteUrl: "https://github.com/acme/web-app.git", path: "/code/web-app", exists: true, canUseExisting: matching }) });
+		expect(await screen.findByRole("status")).toHaveTextContent("A folder already exists at /code/web-app");
+		expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+		if (matching) {
+			fireEvent.click(screen.getByRole("button", { name: "Use existing checkout" }));
+			expect(props.onUseExisting).toHaveBeenCalledWith("/code/web-app");
+		} else expect(screen.queryByRole("button", { name: "Use existing checkout" })).not.toBeInTheDocument();
+	});
+
+	it("submits the normalized URL returned by the daemon without asking the user to edit it", async () => {
+		const { props } = renderCloneDialog({ value: { remoteUrl: "https://github.com/acme/web-app", destinationParent: "/code" }, onCheckDestination: vi.fn().mockResolvedValue({ remoteUrl: "https://github.com/acme/web-app.git", path: "/code/web-app", exists: false, canUseExisting: false }) });
+		await waitFor(() => expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled());
+		fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+		expect(props.onContinue).toHaveBeenCalledWith(expect.objectContaining({ remoteUrl: "https://github.com/acme/web-app.git" }));
+	});
+
+	it("shows clone status and provides Cancel while other controls are disabled", () => {
+		const { props } = renderCloneDialog({ disabled: true, cloning: true, activity: "cloning" });
+		expect(screen.getByRole("status")).toHaveTextContent("Cloning repository · 0s");
+		expect(screen.getByText("Cloning into /code/web-app. Large repositories can take a few minutes.")).toBeInTheDocument();
+		fireEvent.click(screen.getByRole("button", { name: "Cancel clone" }));
+		expect(props.onCancel).toHaveBeenCalledOnce();
+		expect(screen.getByRole("button", { name: "Close clone repository dialog" })).toBeDisabled();
+	});
+
+	it("discards a destination picker result after the dialog closes", async () => {
+		let resolvePicker: ((path: string) => void) | undefined;
+		window.ao!.app.chooseDirectory = vi.fn(() => new Promise<string>((resolve) => {
+			resolvePicker = resolve;
+		}));
+		const onChange = vi.fn();
+		const { props, view } = renderCloneDialog({ onChange });
+
+		fireEvent.click(screen.getByRole("button", { name: "Choose where to clone the repository" }));
+		await waitFor(() => expect(window.ao!.app.chooseDirectory).toHaveBeenCalledOnce());
+		view.rerender(React.createElement(CloneRepositoryDialog, { ...props, open: false }));
+		await act(async () => resolvePicker?.("/stale/path"));
+
+		expect(onChange).not.toHaveBeenCalled();
+	});
+});

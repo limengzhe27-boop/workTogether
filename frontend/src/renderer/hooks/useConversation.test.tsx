@@ -1,0 +1,1439 @@
+import { render, renderHook, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
+
+const { getMock, patchMock, postMock, apiErrorCodeMock, apiErrorMessageMock } = vi.hoisted(() => ({
+	getMock: vi.fn(),
+	patchMock: vi.fn(),
+	postMock: vi.fn(),
+	apiErrorCodeMock: vi.fn(),
+	apiErrorMessageMock: vi.fn(),
+}));
+
+vi.mock("../lib/api-client", async (importOriginal) => ({
+	...await importOriginal<typeof import("../lib/api-client")>(),
+	apiClient: { GET: getMock, POST: postMock, PATCH: patchMock },
+	apiErrorCode: apiErrorCodeMock,
+	apiErrorMessage: apiErrorMessageMock,
+}));
+
+import {
+	clearConversationProviderCatalogs,
+	conversationConfigOptionsQueryKey,
+	useConversation,
+	ProviderSwitchFailed,
+	useConversationCommands,
+	useConversationConfigOptions,
+	useConversationSkills,
+	toSnapshot,
+} from "./useConversation";
+import { workspaceQueryKey } from "./useWorkspaceQuery";
+import { ChatWorkspace } from "../components/chat/ChatWorkspace";
+import { TooltipProvider } from "../components/ui/tooltip";
+
+function wrapper({ children }: { children: ReactNode }) {
+	const queryClient = new QueryClient({
+		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+	});
+	return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+}
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
+it("preserves queued-edit API error codes for delivery recovery", async () => {
+	const refusal = { code: "CHAT_QUEUED_EDIT_CONFLICT", message: "Queued message changed" };
+	postMock.mockResolvedValue({ data: undefined, error: refusal });
+	const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+	await expect(result.current.editQueuedTurn("queued-1", "edited")).rejects.toBe(refusal);
+});
+
+it("persists and cancels auto-resume for the selected failed turn", async () => {
+	patchMock.mockResolvedValue({ error: undefined });
+	const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+	await act(async () => { await result.current.retryControl.setAutoResume("limited-1", true); });
+	expect(patchMock).toHaveBeenLastCalledWith(
+		"/api/v1/sessions/{sessionId}/conversation/turns/{turnId}/auto-resume",
+		{ params: { path: { sessionId: "ao-1", turnId: "limited-1" } }, body: { enabled: true } },
+	);
+	await act(async () => { await result.current.retryControl.setAutoResume("limited-1", false); });
+	expect(patchMock).toHaveBeenLastCalledWith(
+		"/api/v1/sessions/{sessionId}/conversation/turns/{turnId}/auto-resume",
+		{ params: { path: { sessionId: "ao-1", turnId: "limited-1" } }, body: { enabled: false } },
+	);
+	expect(postMock).not.toHaveBeenCalled();
+});
+
+it("shows scheduling errors only for the session that requested auto-resume", async () => {
+	const refusal = { message: "Reset time is unavailable" };
+	patchMock.mockResolvedValue({ error: refusal });
+	apiErrorMessageMock.mockReturnValue("Reset time is unavailable");
+	const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+	const stableWrapper = ({ children }: { children: ReactNode }) =>
+		<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+	const { result, rerender } = renderHook(({ sessionId }) => useConversationCommands(sessionId), {
+		wrapper: stableWrapper, initialProps: { sessionId: "ao-1" },
+	});
+	await act(async () => {
+		await expect(result.current.retryControl.setAutoResume("limited-1", true)).rejects.toBe(refusal);
+	});
+	await waitFor(() => expect(result.current.retryControl.autoResumeError).toBe("Reset time is unavailable"));
+	expect(result.current.retryControl.autoResumeTurnId).toBe("limited-1");
+	rerender({ sessionId: "ao-2" });
+	expect(result.current.retryControl.autoResumeError).toBeUndefined();
+	expect(result.current.retryControl.autoResumeTurnId).toBeUndefined();
+});
+
+/** The provider state the daemon now serves, in wire shape. */
+const WIRE = {
+	conversationId: "conv-1",
+	sessionId: "ao-1",
+	harness: "codex",
+	mode: "chat",
+	controller: "ready",
+	latestSequence: 3,
+	settings: { model: "gpt-5.6-terra" },
+	turns: [
+		{
+			id: "turn-1",
+			state: "running",
+			requestedAt: "2026-08-03T00:00:00Z",
+			plan: {
+				explanation: "why",
+				steps: [
+					{ text: "one", status: "completed" },
+					{ text: "two", status: "in_progress" },
+				],
+				spansTurns: true,
+			},
+		},
+	],
+	messages: [],
+	activities: [],
+	modelReroute: {
+		fromModel: "gpt-5.6-terra",
+		toModel: "gpt-5.6-terra-mini",
+		reason: "at capacity",
+		providerTurnId: "prov-1",
+		at: "2026-08-03T00:00:01Z",
+	},
+	account: {
+		authenticationState: "required",
+		authFailureId: "auth-failure-1",
+		lastAuthFailureReason: "expired",
+		authMode: "chatgpt",
+		planLabel: "Pro",
+		reauthRequiredAt: "2026-08-03T00:00:02Z",
+		reauthReason: "expired",
+	},
+	threadState: { status: "system_error", waitingOn: ["user_input"] },
+	mcpServers: [
+		{ name: "github", status: "ready" },
+		{ name: "playwright", status: "failed", error: "boom", failureReason: "startup_timeout" },
+	],
+};
+
+beforeEach(() => {
+	getMock.mockReset();
+	patchMock.mockReset();
+	postMock.mockReset();
+	apiErrorCodeMock.mockReset().mockReturnValue(undefined);
+	apiErrorMessageMock.mockReset().mockReturnValue("failed");
+});
+
+it("renders a retained-history boundary between exchanges from the daemon snapshot", async () => {
+	getMock.mockResolvedValue({ data: {
+		...WIRE, controller: "ready", turns: [], modelReroute: undefined, account: undefined,
+		latestSequence: 3,
+		messages: [
+			{ id: "old", sequence: 1, revision: 1, role: "assistant", origin: "provider", text: "Earlier context answer", streaming: false, createdAt: "2026-09-13T00:00:00Z" },
+			{ id: "new", sequence: 3, revision: 1, role: "assistant", origin: "provider", text: "Independent context answer", streaming: false, createdAt: "2026-09-13T00:02:00Z" },
+		],
+		activities: [{ id: "boundary", sequence: 2, revision: 1, kind: "system", status: "completed",
+			summary: "Native conversation changed. Earlier messages are retained; continuity with this agent's context is not verified.",
+			detail: { event: "context.boundary", reason: "native_terminal_handoff" }, createdAt: "2026-09-13T00:01:00Z" }],
+	}, error: undefined });
+	function LiveConversation() {
+		const { snapshot } = useConversation("ao-1");
+		return snapshot ? <TooltipProvider><ChatWorkspace snapshot={snapshot} /></TooltipProvider> : null;
+	}
+	render(<LiveConversation />, { wrapper });
+	const boundary = await screen.findByText(/continuity with this agent's context is not verified/);
+	const old = screen.getByText("Earlier context answer");
+	const current = screen.getByText("Independent context answer");
+	expect(old.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+	expect(boundary.compareDocumentPosition(current) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+	expect(screen.getAllByText(/Native conversation changed/)).toHaveLength(1);
+});
+
+describe("accepted conversation sends", () => {
+	it("keeps a local echo through acceptance until its durable turn is observed", async () => {
+		const response = deferred<{ data: { turnId: string }; error: undefined }>();
+		postMock.mockReturnValue(response.promise);
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result } = renderHook(() => useConversationCommands("ao-local-echo"), {
+			wrapper: HookWrapper,
+		});
+
+		let sending!: Promise<unknown>;
+		act(() => {
+			sending = result.current.send("show my message first");
+		});
+		await waitFor(() => {
+			expect(result.current.localEchos).toHaveLength(1);
+		});
+		expect(result.current.localEchos[0]).toMatchObject({ text: "show my message first" });
+		expect(result.current.localEchos[0]?.turnId).toBeUndefined();
+
+		response.resolve({ data: { turnId: "turn-local-echo" }, error: undefined });
+		await act(async () => {
+			await sending;
+		});
+		await waitFor(() =>
+			expect(result.current.localEchos).toMatchObject([
+				{ text: "show my message first", turnId: "turn-local-echo" },
+			]),
+		);
+
+		act(() => result.current.acknowledgeLocalEcho("turn-local-echo"));
+		await waitFor(() => expect(result.current.localEchos).toEqual([]));
+	});
+
+	it("keeps each accepted turn attached to the session that initiated it", async () => {
+		const firstResponse = deferred<{
+			data: { turnId: string };
+			error: undefined;
+		}>();
+		postMock.mockImplementation(
+			(_path: string, request: { params: { path: { sessionId: string } } }) =>
+				request.params.path.sessionId === "ao-1"
+					? firstResponse.promise
+					: Promise.resolve({ data: { turnId: "turn-2" }, error: undefined }),
+		);
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result, rerender } = renderHook(
+			({ sessionId }) => useConversationCommands(sessionId),
+			{ initialProps: { sessionId: "ao-1" }, wrapper: HookWrapper },
+		);
+
+		let firstSend!: Promise<unknown>;
+		act(() => {
+			firstSend = result.current.send("first session work");
+		});
+		rerender({ sessionId: "ao-2" });
+		await act(async () => {
+			await result.current.send("second session work");
+		});
+		firstResponse.resolve({ data: { turnId: "turn-1" }, error: undefined });
+		await act(async () => {
+			await firstSend;
+		});
+
+		await waitFor(() => expect(result.current.pendingAcceptedTurnId).toBe("turn-2"));
+		rerender({ sessionId: "ao-1" });
+		expect(result.current.pendingAcceptedTurnId).toBe("turn-1");
+	});
+
+	it("retains an in-flight send when Chat unmounts before the response", async () => {
+		const response = deferred<{
+			data: { turnId: string };
+			error: undefined;
+		}>();
+		postMock.mockReturnValue(response.promise);
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const firstMount = renderHook(() => useConversationCommands("ao-in-flight-remount"), {
+			wrapper: HookWrapper,
+		});
+
+		let sendRequest!: Promise<unknown>;
+		act(() => {
+			sendRequest = firstMount.result.current.send("still posting");
+		});
+		await waitFor(() => {
+			expect(firstMount.result.current.busy).toBe(true);
+		});
+		firstMount.unmount();
+
+		const secondMount = renderHook(() => useConversationCommands("ao-in-flight-remount"), {
+			wrapper: HookWrapper,
+		});
+		expect(secondMount.result.current.busy).toBe(true);
+		expect(secondMount.result.current.pendingAcceptedTurnId).toBeUndefined();
+
+		response.resolve({ data: { turnId: "turn-after-deferred-response" }, error: undefined });
+		await act(async () => {
+			await sendRequest;
+		});
+		await waitFor(() => {
+			expect(secondMount.result.current.pendingAcceptedTurnId).toBe(
+				"turn-after-deferred-response",
+			);
+		});
+	});
+
+	it("clears an in-flight send sentinel when the request fails", async () => {
+		postMock.mockResolvedValue({
+			data: undefined,
+			error: { code: "CHAT_SEND_FAILED" },
+		});
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result } = renderHook(() => useConversationCommands("ao-send-failure"), {
+			wrapper: HookWrapper,
+		});
+
+		await act(async () => {
+			await result.current.send("this will fail").catch(() => {});
+		});
+
+		await waitFor(() => {
+			expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+			expect(result.current.busy).toBe(false);
+		});
+	});
+
+	it("clears an in-flight sentinel when the daemon confirms a duplicate without a turn id", async () => {
+		postMock.mockResolvedValue({
+			data: { duplicate: true },
+			error: undefined,
+		});
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const firstMount = renderHook(() => useConversationCommands("ao-duplicate-send"), {
+			wrapper: HookWrapper,
+		});
+
+		await act(async () => {
+			await firstMount.result.current.send("idempotent retry");
+		});
+		firstMount.unmount();
+		const secondMount = renderHook(() => useConversationCommands("ao-duplicate-send"), {
+			wrapper: HookWrapper,
+		});
+
+		expect(secondMount.result.current.pendingAcceptedTurnId).toBeUndefined();
+		expect(secondMount.result.current.busy).toBe(false);
+	});
+
+	it("retains an accepted turn when its follow-up conversation refresh fails", async () => {
+		postMock.mockResolvedValue({
+			data: { duplicate: false, turnId: "turn-refresh-failed" },
+			error: undefined,
+		});
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		vi.spyOn(queryClient, "invalidateQueries").mockRejectedValue(new Error("refresh failed"));
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const firstMount = renderHook(() => useConversationCommands("ao-refresh-failure"), {
+			wrapper: HookWrapper,
+		});
+
+		let sendError: unknown;
+		await act(async () => {
+			try {
+				await firstMount.result.current.send("accepted before refresh failed");
+			} catch (error) {
+				sendError = error;
+			}
+		});
+		expect(sendError).toBeUndefined();
+
+		firstMount.unmount();
+		const secondMount = renderHook(() => useConversationCommands("ao-refresh-failure"), {
+			wrapper: HookWrapper,
+		});
+		expect(secondMount.result.current.pendingAcceptedTurnId).toBe("turn-refresh-failed");
+		expect(secondMount.result.current.busy).toBe(false);
+	});
+
+	it("releases the dispatch sentinel immediately when the daemon queues mid-turn", async () => {
+		postMock
+			.mockResolvedValueOnce({
+				data: { duplicate: false, turnId: "turn-queued-1", state: "queued" as const },
+				error: undefined,
+			})
+			.mockResolvedValueOnce({
+				data: { duplicate: false, turnId: "turn-queued-2", state: "queued" as const },
+				error: undefined,
+			});
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result } = renderHook(() => useConversationCommands("ao-queue-chain"), {
+			wrapper: HookWrapper,
+		});
+
+		await act(async () => {
+			await result.current.send("first queued");
+		});
+		await waitFor(() => expect(result.current.busy).toBe(false));
+		expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+
+		await act(async () => {
+			await result.current.send("second queued");
+		});
+
+		expect(postMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("admits only one same-session send before React can publish busy state", async () => {
+		const firstResponse = deferred<{
+			data: { duplicate: false; turnId: string };
+			error: undefined;
+		}>();
+		postMock
+			.mockImplementationOnce(() => firstResponse.promise)
+			.mockResolvedValueOnce({
+				data: { duplicate: false, turnId: "turn-overlap-second" },
+				error: undefined,
+			});
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result } = renderHook(() => useConversationCommands("ao-overlap"), {
+			wrapper: HookWrapper,
+		});
+
+		let firstSend!: Promise<unknown>;
+		let secondSend!: Promise<unknown>;
+		act(() => {
+			firstSend = result.current.send("first");
+			secondSend = result.current.send("second").catch((error) => error);
+		});
+		await waitFor(() => expect(postMock).toHaveBeenCalled());
+		firstResponse.resolve({
+			data: { duplicate: false, turnId: "turn-overlap-first" },
+			error: undefined,
+		});
+		let secondOutcome: unknown;
+		await act(async () => {
+			await firstSend;
+			secondOutcome = await secondSend;
+		});
+
+		expect(postMock).toHaveBeenCalledTimes(1);
+		expect(secondOutcome).toBeInstanceOf(Error);
+		await waitFor(() => {
+			expect(result.current.pendingAcceptedTurnId).toBe("turn-overlap-first");
+		});
+	});
+
+	it("retains accepted work across a full chat surface unmount and remount", async () => {
+		postMock.mockResolvedValue({
+			data: { turnId: "turn-after-remount" },
+			error: undefined,
+		});
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const firstMount = renderHook(() => useConversationCommands("ao-remount"), {
+			wrapper: HookWrapper,
+		});
+
+		await act(async () => {
+			await firstMount.result.current.send("keep this work visible");
+		});
+		await waitFor(() => {
+			expect(firstMount.result.current.pendingAcceptedTurnId).toBe("turn-after-remount");
+		});
+		firstMount.unmount();
+
+		const secondMount = renderHook(() => useConversationCommands("ao-remount"), {
+			wrapper: HookWrapper,
+		});
+		expect(secondMount.result.current.pendingAcceptedTurnId).toBe("turn-after-remount");
+
+		act(() => {
+			secondMount.result.current.acknowledgeAcceptedTurn("turn-after-remount");
+		});
+		await waitFor(() => {
+			expect(secondMount.result.current.pendingAcceptedTurnId).toBeUndefined();
+		});
+	});
+
+});
+
+describe("session-scoped conversation commands", () => {
+	it("keeps send mutation state and completion scoped to its initiating session", async () => {
+		const response = deferred<{
+			data: { turnId: string };
+			error: undefined;
+		}>();
+		postMock.mockReturnValue(response.promise);
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue(undefined);
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result, rerender } = renderHook(
+			({ sessionId }) => useConversationCommands(sessionId),
+			{ initialProps: { sessionId: "ao-send-a" }, wrapper: HookWrapper },
+		);
+
+		let request!: Promise<unknown>;
+		act(() => {
+			request = result.current.send("work for A");
+		});
+		await waitFor(() => expect(result.current.busy).toBe(true));
+
+		rerender({ sessionId: "ao-send-b" });
+		expect(result.current.busy).toBe(false);
+		expect(result.current.error).toBeUndefined();
+
+		response.resolve({ data: { turnId: "turn-send-a" }, error: undefined });
+		await act(async () => {
+			await request;
+		});
+		expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversation", "ao-send-a"] });
+		expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["conversation", "ao-send-b"] });
+		expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+	});
+
+	it("does not publish an initiating session's pending state, error, or refresh after navigation", async () => {
+		const response = deferred<{
+			data: undefined;
+			error: { code: string };
+		}>();
+		postMock.mockReturnValue(response.promise);
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue(undefined);
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result, rerender } = renderHook(
+			({ sessionId }) => useConversationCommands(sessionId),
+			{ initialProps: { sessionId: "ao-command-a" }, wrapper: HookWrapper },
+		);
+
+		act(() => {
+			result.current.interrupt();
+		});
+		await waitFor(() => expect(result.current.busy).toBe(true));
+
+		rerender({ sessionId: "ao-command-b" });
+		expect(result.current.busy).toBe(false);
+		expect(result.current.error).toBeUndefined();
+
+		response.resolve({ data: undefined, error: { code: "CHAT_NO_ACTIVE_TURN" } });
+		await waitFor(() => {
+			expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversation", "ao-command-a"] });
+		});
+		expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["conversation", "ao-command-b"] });
+		expect(result.current.busy).toBe(false);
+		expect(result.current.error).toBeUndefined();
+	});
+
+	it.each(["retry", "edit"] as const)(
+		"keeps pending and accepted %s work attached to its initiating session",
+		async (operation) => {
+			const response = deferred<{
+				data: {
+					activeBranchId?: string;
+					sourceBranchId?: string;
+					turnId: string;
+				};
+				error: undefined;
+			}>();
+			postMock.mockReturnValue(response.promise);
+			const queryClient = new QueryClient({
+				defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+			});
+			const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue(undefined);
+			const HookWrapper = ({ children }: { children: ReactNode }) => (
+				<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+			);
+			const { result, rerender } = renderHook(
+				({ sessionId }) => useConversationCommands(sessionId),
+				{ initialProps: { sessionId: "ao-turn-a" }, wrapper: HookWrapper },
+			);
+
+			let request!: Promise<unknown>;
+			act(() => {
+				request =
+					operation === "retry"
+						? result.current.retryControl.retry("turn-source")
+						: result.current.editMessage("turn-source", "edited prompt");
+			});
+			await waitFor(() => {
+				expect(result.current.busy).toBe(true);
+				expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+			});
+
+			rerender({ sessionId: "ao-turn-b" });
+			expect(result.current.busy).toBe(false);
+			expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+
+			const acceptedTurnId = `turn-${operation}-accepted`;
+			response.resolve({
+				data: {
+					...(operation === "edit"
+						? { activeBranchId: "branch-edit", sourceBranchId: "branch-root" }
+						: {}),
+					turnId: acceptedTurnId,
+				},
+				error: undefined,
+			});
+			await act(async () => {
+				await request;
+			});
+
+			expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversation", "ao-turn-a"] });
+			expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["conversation", "ao-turn-b"] });
+			expect(result.current.busy).toBe(false);
+			expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+
+			act(() => result.current.acknowledgeAcceptedTurn(acceptedTurnId));
+			expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+
+			rerender({ sessionId: "ao-turn-a" });
+			expect(result.current.busy).toBe(false);
+			expect(result.current.pendingAcceptedTurnId).toBe(acceptedTurnId);
+
+			act(() => result.current.acknowledgeAcceptedTurn("turn-from-another-session"));
+			expect(result.current.busy).toBe(false);
+			expect(result.current.pendingAcceptedTurnId).toBe(acceptedTurnId);
+
+			act(() => result.current.acknowledgeAcceptedTurn(acceptedTurnId));
+			await waitFor(() => {
+				expect(result.current.busy).toBe(false);
+				expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+			});
+		},
+	);
+
+	it.each(["retry", "edit"] as const)(
+		"clears pending %s work after the initiating request fails",
+		async (operation) => {
+			const response = deferred<{
+				data: undefined;
+				error: { code: string };
+			}>();
+			postMock.mockReturnValue(response.promise);
+			const queryClient = new QueryClient({
+				defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+			});
+			const HookWrapper = ({ children }: { children: ReactNode }) => (
+				<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+			);
+			const { result } = renderHook(() => useConversationCommands("ao-turn-failure"), {
+				wrapper: HookWrapper,
+			});
+
+			let request!: Promise<unknown>;
+			act(() => {
+				request = (
+					operation === "retry"
+						? result.current.retryControl.retry("turn-source")
+						: result.current.editMessage("turn-source", "edited prompt")
+				).catch(() => {});
+			});
+			await waitFor(() => expect(result.current.busy).toBe(true));
+
+			response.resolve({ data: undefined, error: { code: "CHAT_TURN_FAILED" } });
+			await act(async () => {
+				await request;
+			});
+			await waitFor(() => {
+				expect(result.current.busy).toBe(false);
+				expect(result.current.pendingAcceptedTurnId).toBeUndefined();
+			});
+		},
+	);
+});
+
+describe("provider catalog controller epochs", () => {
+	it("discards a config mutation response from before switch admission", async () => {
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		const queryKey = conversationConfigOptionsQueryKey("ao-1");
+		queryClient.setQueryData(queryKey, [{ id: "model", currentValue: "source" }]);
+		let resolvePatch!: (value: {
+			data: { options: Array<{ id: string; currentValue: string }> };
+			error: undefined;
+		}) => void;
+		patchMock.mockReturnValue(
+			new Promise((resolve) => {
+				resolvePatch = resolve;
+			}),
+		);
+		const Wrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result } = renderHook(() => useConversationConfigOptions("ao-1", false), {
+			wrapper: Wrapper,
+		});
+
+		let mutation!: Promise<unknown>;
+		act(() => {
+			mutation = result.current.setOption("model", { value: "source-next" });
+		});
+		await waitFor(() => expect(patchMock).toHaveBeenCalledOnce());
+		act(() => clearConversationProviderCatalogs(queryClient, "ao-1"));
+		expect(queryClient.getQueryData(queryKey)).toBeUndefined();
+
+		resolvePatch({
+			data: { options: [{ id: "model", currentValue: "source-next" }] },
+			error: undefined,
+		});
+		await act(async () => mutation);
+
+		expect(queryClient.getQueryData(queryKey)).toBeUndefined();
+	});
+});
+
+describe("useConversation snapshot mapping", () => {
+	it("passes a typed DeepSeek key failure from the API to the timeline snapshot", async () => {
+		getMock.mockResolvedValue({
+			data: {
+				...WIRE,
+				turns: [{
+					...WIRE.turns[0],
+					state: "failed",
+					errorMessage: "ACP internal detail",
+					failureCode: "provider_key_missing",
+				}],
+			},
+			error: undefined,
+		});
+
+		const { result } = renderHook(() => useConversation("ao-1"), { wrapper });
+		await waitFor(() => expect(result.current.snapshot?.turns[0]?.failureCode).toBe("provider_key_missing"));
+		expect(result.current.snapshot?.turns[0]?.errorMessage).toBe("ACP internal detail");
+	});
+
+	it("maps branch metadata and lightweight prompt content", async () => {
+		getMock.mockResolvedValue({
+			data: {
+				...WIRE,
+				activeBranchId: "branch-child",
+				branchedFromEarlierMessage: true,
+				branchMaterialization: {
+					strategy: "approximate_context",
+					replayTruncated: true,
+				},
+				branchPoints: [
+					{
+						turnId: "turn-1",
+						position: 2,
+						total: 3,
+						previousBranchId: "branch-previous",
+						nextBranchId: "branch-next",
+					},
+				],
+				messages: [
+					{
+						id: "message-1",
+						turnId: "turn-1",
+						sequence: 1,
+						revision: 1,
+						role: "user",
+						origin: "human",
+						text: "inspect this",
+						streaming: false,
+						createdAt: "2026-08-03T00:00:00Z",
+						editAvailable: true,
+						content: [
+							{ type: "image", mimeType: "image/png" },
+							{ type: "resource", name: "notes.md", uri: "file:///notes.md" },
+						],
+					},
+				],
+			},
+			error: undefined,
+		});
+
+		const { result } = renderHook(() => useConversation("ao-1"), { wrapper });
+		await waitFor(() => expect(result.current.snapshot).toBeDefined());
+
+		expect(result.current.snapshot).toMatchObject({
+			activeBranchId: "branch-child",
+			branchedFromEarlierMessage: true,
+			branchMaterialization: {
+				strategy: "approximate_context",
+				replayTruncated: true,
+			},
+			branchPoints: [{ turnId: "turn-1", position: 2, total: 3 }],
+		});
+		expect(result.current.snapshot!.items[0]).toMatchObject({
+			editAvailable: true,
+			content: [
+				{ type: "image", mimeType: "image/png" },
+				{ type: "resource", name: "notes.md", uri: "file:///notes.md" },
+			],
+		});
+	});
+
+	it("maps the provider state the timeline cannot express", async () => {
+		getMock.mockResolvedValue({ data: WIRE, error: undefined });
+
+		const { result } = renderHook(() => useConversation("ao-1"), { wrapper });
+		await waitFor(() => expect(result.current.snapshot).toBeDefined());
+		const snapshot = result.current.snapshot!;
+
+		expect(snapshot.modelReroute).toEqual({
+			fromModel: "gpt-5.6-terra",
+			toModel: "gpt-5.6-terra-mini",
+			reason: "at capacity",
+			providerTurnId: "prov-1",
+			at: "2026-08-03T00:00:01Z",
+		});
+		expect(snapshot.account?.reauthRequiredAt).toBe("2026-08-03T00:00:02Z");
+		expect(snapshot.account?.authenticationState).toBe("required");
+		expect(snapshot.account?.authFailureId).toBe("auth-failure-1");
+		expect(snapshot.account?.lastAuthFailureReason).toBe("expired");
+		expect(snapshot.threadState).toEqual({
+			status: "system_error",
+			waitingOn: ["user_input"],
+			archivedAt: undefined,
+			closedAt: undefined,
+		});
+		expect(snapshot.mcpServers).toHaveLength(2);
+		expect(snapshot.turns[0]!.plan?.steps).toEqual([
+			{ text: "one", status: "completed" },
+			{ text: "two", status: "in_progress" },
+		]);
+		expect(snapshot.turns[0]!.plan?.spansTurns).toBe(true);
+	});
+
+	it("maps retry lineage and durable prompt facts from the daemon", async () => {
+		getMock.mockResolvedValue({
+			data: {
+				...WIRE,
+				turns: [
+					{
+						...WIRE.turns[0],
+						retryOfTurnId: "turn-source",
+						hasRetryAttempt: true,
+						hasHumanPrompt: true,
+					},
+				],
+			},
+			error: undefined,
+		});
+
+		const { result } = renderHook(() => useConversation("ao-1"), { wrapper });
+		await waitFor(() => expect(result.current.snapshot).toBeDefined());
+
+		expect(result.current.snapshot!.turns[0]).toMatchObject({
+			retryOfTurnId: "turn-source",
+			hasRetryAttempt: true,
+			hasHumanPrompt: true,
+		});
+	});
+
+	it("maps absolute reset and durable auto-resume state from the daemon", () => {
+		const usageLimit = { resetsAt: "2026-10-14T16:50:00Z", autoResume: true, resumeError: "Could not wake the agent" };
+		const snapshot = toSnapshot({
+			conversationId: "conv-1", sessionId: "ao-1", mode: "chat", controller: "ready", latestSequence: 1,
+			continueTurnId: "",
+			branchedFromEarlierMessage: false, hasMoreBefore: false, nativeForkAvailableAfterSequence: 0,
+			settings: {}, messages: [], activities: [],
+			turns: [{ id: "limited", requestedAt: "2026-10-14T16:00:00Z", state: "failed", usageLimit }],
+		});
+		expect(snapshot.turns[0]?.usageLimit).toEqual(usageLimit);
+	});
+
+	// Absent must stay absent: a client has to tell "the provider said nothing" from
+	// "the provider said everything is fine".
+	it("leaves the new fields undefined when the daemon omits them", async () => {
+		getMock.mockResolvedValue({
+			data: { ...WIRE, modelReroute: undefined, account: undefined, threadState: undefined, mcpServers: [] },
+			error: undefined,
+		});
+
+		const { result } = renderHook(() => useConversation("ao-1"), { wrapper });
+		await waitFor(() => expect(result.current.snapshot).toBeDefined());
+
+		expect(result.current.snapshot!.modelReroute).toBeUndefined();
+		expect(result.current.snapshot!.account).toBeUndefined();
+		expect(result.current.snapshot!.threadState).toBeUndefined();
+		expect(result.current.snapshot!.mcpServers).toBeUndefined();
+	});
+});
+
+describe("conversation branching commands", () => {
+	it("marks only attachment-bearing conversation writes as uploads", async () => {
+		postMock.mockResolvedValue({ data: {}, error: undefined });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		const image = { mimeType: "image/png", data: "YQ==" };
+
+		await act(async () => {
+			await result.current.send({ text: "plain" });
+			await result.current.send({ text: "image", attachments: [image] });
+			await result.current.steer("image", [image]);
+			await result.current.editQueuedTurn("turn-1", "image", { attachments: [image] });
+		});
+
+		expect(postMock.mock.calls[0][1].headers).toBeUndefined();
+		for (const [, options] of postMock.mock.calls.slice(1)) {
+			expect(options.headers).toEqual({ "X-AO-Attachment-Upload": "1" });
+		}
+	});
+
+	it("sends a message with its agent switch in one request", async () => {
+		const switched = new Headers({ "X-AO-Provider-Switched": "1" });
+		postMock
+			.mockResolvedValueOnce({ data: { status: "ok", message: { turnId: "turn-9", state: "running", duplicate: false } }, error: undefined, response: new Response() })
+			.mockResolvedValueOnce({ data: undefined, error: { code: "PROVIDER_SWITCH_busy" }, response: new Response(null, { status: 409 }) })
+			.mockResolvedValueOnce({ data: undefined, error: { code: "SESSION_NOT_FOUND" }, response: new Response(null, { status: 404, headers: switched }) });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		const providerSwitch = { targetHarness: "codex", model: "gpt-6" };
+
+		await act(async () => {
+			await expect(result.current.send({ text: "first turn", clientMessageId: "m1", providerSwitch })).resolves
+				.toMatchObject({ turnId: "turn-9" });
+		});
+		expect(postMock).toHaveBeenCalledWith("/api/v1/sessions/{sessionId}/provider-switch", expect.objectContaining({
+			body: expect.objectContaining({ ...providerSwitch, message: { text: "first turn", clientMessageId: "m1" } }),
+		}));
+
+		// Refused: the message never left.
+		await act(async () => {
+			await expect(result.current.send({ text: "again", clientMessageId: "m2", providerSwitch })).rejects
+				.toBeInstanceOf(ProviderSwitchFailed);
+		});
+		// The switch notice reports it; the composer does not show it twice.
+		expect(result.current.error).toBeUndefined();
+		// Switched, then the send failed: an ordinary send failure.
+		await act(async () => {
+			const failure = await result.current.send({ text: "later", clientMessageId: "m3", providerSwitch }).catch((error) => error);
+			expect(failure).not.toBeInstanceOf(ProviderSwitchFailed);
+			expect(failure).toMatchObject({ code: "SESSION_NOT_FOUND" });
+		});
+	});
+
+	it("does not call a switch refused when no clear answer came back", async () => {
+		postMock
+			.mockResolvedValueOnce({ data: undefined, error: { code: "UPSTREAM_UNAVAILABLE" }, response: new Response(null, { status: 502 }) })
+			.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		const providerSwitch = { targetHarness: "codex" };
+		// A remote daemon's gateway gave up, but the daemon may still switch and send.
+		await act(async () => {
+			const failure = await result.current.send({ text: "a", clientMessageId: "m1", providerSwitch }).catch((error) => error);
+			expect(failure).not.toBeInstanceOf(ProviderSwitchFailed);
+		});
+		// The request never got an answer.
+		await act(async () => {
+			const failure = await result.current.send({ text: "b", clientMessageId: "m2", providerSwitch }).catch((error) => error);
+			expect(failure).toBeInstanceOf(TypeError);
+		});
+	});
+
+	it("threads caller-owned idempotency ids through send, steer, and inline edit", async () => {
+		postMock.mockResolvedValue({ data: {}, error: undefined });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await act(async () => {
+			await result.current.send({ text: "send once", clientMessageId: "send-stable-1" });
+			await result.current.steer("steer once", undefined, "steer-stable-1");
+			await result.current.editMessage("turn-2", "edit once", "edit-stable-1");
+		});
+
+		expect(postMock).toHaveBeenCalledWith(
+			"/api/v1/sessions/{sessionId}/conversation/messages",
+			expect.objectContaining({ body: expect.objectContaining({ clientMessageId: "send-stable-1" }) }),
+		);
+		expect(postMock).toHaveBeenCalledWith(
+			"/api/v1/sessions/{sessionId}/conversation/steer",
+			expect.objectContaining({ body: { text: "steer once", clientMessageId: "steer-stable-1" } }),
+		);
+		expect(postMock).toHaveBeenCalledWith(
+			"/api/v1/sessions/{sessionId}/conversation/turns/{turnId}/edit",
+			expect.objectContaining({ body: { text: "edit once", clientMessageId: "edit-stable-1" } }),
+		);
+	});
+
+	it("edits through the dedicated endpoint without rolling back", async () => {
+		postMock.mockResolvedValue({ data: {}, error: undefined });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await act(async () => {
+			await result.current.editMessage("turn-2", "edited prompt");
+		});
+
+		expect(postMock).toHaveBeenCalledWith(
+			"/api/v1/sessions/{sessionId}/conversation/turns/{turnId}/edit",
+			expect.objectContaining({
+				params: { path: { sessionId: "ao-1", turnId: "turn-2" } },
+				body: expect.objectContaining({ text: "edited prompt" }),
+			}),
+		);
+		expect(
+			postMock.mock.calls.some(([path]) => String(path).endsWith("/rollback")),
+		).toBe(false);
+	});
+
+	it("returns a typed non-acceptance for a durably rejected inline edit", async () => {
+		apiErrorCodeMock.mockReturnValue("CHAT_EDIT_REJECTED");
+		apiErrorMessageMock.mockReturnValue("provider rejected edited prompt");
+		postMock.mockResolvedValue({ data: undefined, error: { code: "CHAT_EDIT_REJECTED" } });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await expect(
+			result.current.editMessage("turn-2", "keep this edit", "edit-rejected-1"),
+		).resolves.toEqual({
+			status: "not-accepted",
+			reason: "provider rejected edited prompt",
+		});
+	});
+
+	it("keeps an uncertain inline edit rejected for same-id recovery", async () => {
+		apiErrorCodeMock.mockReturnValue("CHAT_EDIT_UNCERTAIN");
+		const failure = { code: "CHAT_EDIT_UNCERTAIN" };
+		postMock.mockResolvedValue({ data: undefined, error: failure });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await expect(
+			result.current.editMessage("turn-2", "do not redispatch", "edit-uncertain-1"),
+		).rejects.toBe(failure);
+	});
+
+	it("keeps an idempotency-conflicted inline edit locked for same-id recovery", async () => {
+		apiErrorCodeMock.mockReturnValue("CHAT_EDIT_IDEMPOTENCY_CONFLICT");
+		const failure = { code: "CHAT_EDIT_IDEMPOTENCY_CONFLICT" };
+		postMock.mockResolvedValue({ data: undefined, error: failure });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await expect(
+			result.current.editMessage("turn-2", "do not unlock this edit", "edit-conflict-1"),
+		).rejects.toBe(failure);
+	});
+
+	it("activates an existing branch", async () => {
+		postMock.mockResolvedValue({ data: {}, error: undefined });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await act(async () => {
+			await result.current.activateBranch("branch-previous");
+		});
+
+		expect(postMock).toHaveBeenCalledWith(
+			"/api/v1/sessions/{sessionId}/conversation/branches/{branchId}/activate",
+			{ params: { path: { sessionId: "ao-1", branchId: "branch-previous" } } },
+		);
+	});
+});
+
+describe("steering refusals", () => {
+	it("posts native image attachments with steer guidance", async () => {
+		postMock.mockResolvedValue({
+			data: { providerTurnId: "provider-1", activityId: "activity-1" },
+			error: undefined,
+		});
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await act(async () => {
+			await result.current.steer("inspect this", [
+				{ mimeType: "image/png", data: "aW1hZ2U=" },
+			]);
+		});
+
+		expect(postMock).toHaveBeenCalledWith(
+			"/api/v1/sessions/{sessionId}/conversation/steer",
+			{
+				params: { path: { sessionId: "ao-1" } },
+				headers: { "X-AO-Attachment-Upload": "1" },
+				body: {
+					text: "inspect this",
+					attachments: [{ mimeType: "image/png", data: "aW1hZ2U=" }],
+					clientMessageId: expect.any(String),
+				},
+			},
+		);
+	});
+
+	it("clears steer pending before a slow conversation refresh finishes", async () => {
+		const refresh = deferred<void>();
+		const steerResponse = deferred<{
+			data: { sourceTurnId: string; providerTurnId: string; activityId: string };
+			error: undefined;
+		}>();
+		postMock.mockImplementationOnce(() => steerResponse.promise);
+		const queryClient = new QueryClient({
+			defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+		});
+		vi.spyOn(queryClient, "invalidateQueries").mockImplementation(() => refresh.promise);
+		const HookWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper: HookWrapper });
+
+		let steerDone!: Promise<unknown>;
+		act(() => {
+			steerDone = result.current.steer("go left");
+		});
+		await waitFor(() => expect(result.current.steerPending).toBe(true));
+
+		steerResponse.resolve({
+			data: { sourceTurnId: "turn-1", providerTurnId: "provider-1", activityId: "activity-1" },
+			error: undefined,
+		});
+		await act(async () => {
+			await steerDone;
+		});
+
+		await waitFor(() => expect(result.current.steerPending).toBe(false));
+		refresh.resolve();
+	});
+
+	it("promotes the selected durable queued turn through the turn-scoped route", async () => {
+		postMock.mockResolvedValue({
+			data: { sourceTurnId: "queued-2", providerTurnId: "provider-1", activityId: "activity-1" },
+			error: undefined,
+		});
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		await act(async () => {
+			await result.current.promoteQueuedTurn("queued-2");
+		});
+		expect(postMock).toHaveBeenCalledWith(
+			"/api/v1/sessions/{sessionId}/conversation/turns/{turnId}/steer",
+			{ params: { path: { sessionId: "ao-1", turnId: "queued-2" } } },
+		);
+	});
+
+	async function steerFailingWith(code: string) {
+		apiErrorCodeMock.mockReturnValue(code);
+		apiErrorMessageMock.mockReturnValue("a compaction turn is running.");
+		postMock.mockResolvedValue({ data: undefined, error: { code } });
+
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		await act(async () => {
+			await result.current.steer("go left").catch(() => {});
+		});
+		return result;
+	}
+
+	it("tells the user to send it as a message when nothing is in flight", async () => {
+		const result = await steerFailingWith("CHAT_NO_ACTIVE_TURN");
+		await waitFor(() =>
+			expect(result.current.steerRefusal).toMatch(/Send it as a message instead/),
+		);
+	});
+
+	it("returns a typed non-acceptance for a steer the daemon definitively refused", async () => {
+		apiErrorCodeMock.mockReturnValue("CHAT_NO_ACTIVE_TURN");
+		apiErrorMessageMock.mockReturnValue("there is no turn in flight");
+		postMock.mockResolvedValue({
+			data: undefined,
+			error: { code: "CHAT_NO_ACTIVE_TURN" },
+		});
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		let outcome: Awaited<ReturnType<typeof result.current.steer>> | undefined;
+
+		await act(async () => {
+			outcome = await result.current.steer("send this normally", undefined, "steer-refused-1");
+		});
+
+		expect(outcome).toEqual({
+			status: "not-accepted",
+			reason: "The turn finished before this landed. Send it as a message instead.",
+		});
+	});
+
+	it("treats a durable interface-transition refusal as definitive non-acceptance", async () => {
+		apiErrorCodeMock.mockReturnValue("CHAT_INTERFACE_TRANSITION");
+		apiErrorMessageMock.mockReturnValue("the session is switching interfaces");
+		const failure = { code: "CHAT_INTERFACE_TRANSITION" };
+		postMock.mockResolvedValue({ data: undefined, error: failure });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await expect(result.current.steer("wait for the switch", undefined, "transition-steer-1")).resolves.toEqual({
+			status: "not-accepted",
+			reason: "The session is switching interfaces. This guidance was not delivered; send it after the switch finishes.",
+		});
+	});
+
+	it("keeps an uncertain steer rejected so the composer remains fail-closed", async () => {
+		apiErrorCodeMock.mockReturnValue("CHAT_STEER_UNCERTAIN");
+		apiErrorMessageMock.mockReturnValue("the provider may have received this guidance");
+		const failure = { code: "CHAT_STEER_UNCERTAIN" };
+		postMock.mockResolvedValue({ data: undefined, error: failure });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+
+		await expect(
+			act(async () => result.current.steer("do not redispatch", undefined, "steer-unknown-1")),
+		).rejects.toBe(failure);
+	});
+
+	// The daemon's own message names which kind of turn refused, which is the part the
+	// user needs; "cannot be steered" alone leaves them nothing to do.
+	it("keeps the daemon's wording for a turn that cannot absorb guidance", async () => {
+		const result = await steerFailingWith("CHAT_TURN_NOT_STEERABLE");
+		await waitFor(() => {
+			expect(result.current.steerRefusal).toMatch(/a compaction turn is running/);
+			expect(result.current.steerRefusal).toMatch(/Try again once it finishes/);
+		});
+	});
+
+	// The control is withdrawn instead, so there is nothing to say.
+	it("says nothing when the harness cannot steer at all", async () => {
+		const result = await steerFailingWith("CHAT_STEER_UNSUPPORTED");
+		await waitFor(() => {
+			expect(result.current.steerUnsupported).toBe(true);
+			expect(result.current.steerRefusal).toBeUndefined();
+		});
+	});
+});
+
+describe("controller recovery", () => {
+	it("shares an automatic resume's pending state only with the same session", async () => {
+		const queryClient = new QueryClient();
+		const completion = deferred<void>();
+		const mutation = queryClient.getMutationCache().build(queryClient, {
+			mutationKey: ["resume-agent", "local", "ao-1"],
+			mutationFn: () => completion.promise,
+		});
+		const pending = mutation.execute(undefined);
+		const { result } = renderHook(() => ({
+			opened: useConversationCommands("ao-1"),
+			other: useConversationCommands("ao-2"),
+		}), { wrapper: ({ children }) => <QueryClientProvider client={queryClient}>{children}</QueryClientProvider> });
+		await waitFor(() => expect(result.current.opened.resumingAgent).toBe(true));
+		expect(result.current.other.resumingAgent).toBe(false);
+		await act(async () => {
+			completion.resolve();
+			await pending;
+		});
+		await waitFor(() => expect(result.current.opened.resumingAgent).toBe(false));
+	});
+
+	it("refreshes the conversation after Stop reports stale turn state", async () => {
+		postMock.mockResolvedValue({
+			data: undefined,
+			error: { code: "CHAT_NO_ACTIVE_TURN" },
+			response: { status: 409 },
+		});
+		const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		act(() => {
+			result.current.interrupt();
+		});
+
+		await waitFor(() => {
+			expect(postMock).toHaveBeenCalledWith(
+				"/api/v1/sessions/{sessionId}/conversation/interrupt",
+				{ params: { path: { sessionId: "ao-1" } } },
+			);
+			expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversation", "ao-1"] });
+		});
+		invalidateSpy.mockRestore();
+	});
+
+	it("resumes the agent and refreshes both chat and task state", async () => {
+		postMock.mockResolvedValue({ data: {}, error: undefined, response: { status: 200 } });
+		const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		await act(async () => {
+			await result.current.resumeAgent();
+		});
+
+		expect(postMock).toHaveBeenCalledWith("/api/v1/sessions/{sessionId}/resume-agent", {
+			params: { path: { sessionId: "ao-1" } },
+		});
+		expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversation", "ao-1"] });
+		expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: workspaceQueryKey });
+		invalidateSpy.mockRestore();
+	});
+});
+
+describe("useConversationSkills polling", () => {
+	function skillsWrapper(queryClient: QueryClient) {
+		return function Wrapper({ children }: { children: ReactNode }) {
+			return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+		};
+	}
+
+	it("stops polling while the controller is not ready", async () => {
+		vi.useFakeTimers();
+		try {
+			// The daemon answers 409 CHAT_CONTROLLER_NOT_READY while no live controller
+			// owns the session. A fixed-interval poll would re-request the catalog every
+			// minute for as long as the surface stayed mounted, turning one readiness
+			// conflict into a steady stream of 409s.
+			apiErrorCodeMock.mockReturnValue("CHAT_CONTROLLER_NOT_READY");
+			getMock.mockResolvedValue({ error: { code: "CHAT_CONTROLLER_NOT_READY" } });
+			const queryClient = new QueryClient({
+				defaultOptions: { queries: { retry: false } },
+			});
+
+			renderHook(() => useConversationSkills("ao-skills", true), {
+				wrapper: skillsWrapper(queryClient),
+			});
+
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(0);
+			});
+			expect(getMock).toHaveBeenCalledTimes(1);
+
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(5 * 60_000);
+			});
+			// No further requests: the readiness conflict backs the poll off entirely.
+			expect(getMock).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps polling once the catalog loads", async () => {
+		vi.useFakeTimers();
+		try {
+			// An empty catalog is a real answer, not a failure: polling continues so a
+			// skill published later becomes visible without a second event channel.
+			getMock.mockResolvedValue({ data: { skills: [] } });
+			const queryClient = new QueryClient({
+				defaultOptions: { queries: { retry: false } },
+			});
+
+			renderHook(() => useConversationSkills("ao-skills-ok", true), {
+				wrapper: skillsWrapper(queryClient),
+			});
+
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(0);
+			});
+			expect(getMock).toHaveBeenCalledTimes(1);
+
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(60_000);
+			});
+			expect(getMock).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
+
+describe("toSnapshot", () => {
+	it.each([
+		{ action: "accept", content: { question_0: "keep", question_0_custom: "Tell me the names first" }, expectedAction: "accept" },
+		{ action: "decline", content: undefined, expectedAction: "decline" },
+		{ action: "cancel", content: undefined, expectedAction: "cancel" },
+		{ action: "unknown", content: {}, expectedAction: undefined },
+	])("decodes structured input resolution $action from persisted activity details", ({ action, content, expectedAction }) => {
+		const snapshot = toSnapshot({
+			conversationId: "c1", sessionId: "s1", harness: "claude-code", mode: "chat", controller: "ready",
+			latestSequence: 1, oldestSequence: 1, hasMoreBefore: false, turns: [], messages: [], settings: {},
+			branchedFromEarlierMessage: false, continueTurnId: "", nativeForkAvailableAfterSequence: 0,
+			activities: [{
+				kind: "activity", id: "input-1", sequence: 1, revision: 1, activityKind: "user_input",
+				status: "resolved", summary: "Choose worktrees", createdAt: "2026-10-19T00:00:00Z",
+				detail: { action, content },
+			}],
+		});
+		const item = snapshot.items[0];
+		if (item?.kind !== "activity") throw new Error("missing input activity");
+		expect(item.inputResponse?.action).toBe(expectedAction);
+		if (expectedAction) expect(item.inputResponse?.content).toEqual(content);
+	});
+
+	it("keeps the sender's clientMessageId on a user message so its echo can be matched", () => {
+		const snapshot = toSnapshot({
+			conversationId: "c1",
+			sessionId: "s1",
+			harness: "claude-code",
+			mode: "chat",
+			controller: "ready",
+			latestSequence: 1,
+			turns: [],
+			messages: [
+				{
+					kind: "message",
+					id: "m1",
+					turnId: "t1",
+					sequence: 1,
+					revision: 0,
+					role: "user",
+					origin: "human",
+					text: "hi",
+					clientMessageId: "client-1",
+					editAvailable: true,
+					streaming: false,
+					createdAt: "2026-10-08T00:00:00Z",
+				},
+			],
+			activities: [],
+		} as unknown as Parameters<typeof toSnapshot>[0]);
+
+		const message = snapshot.items.find((item) => item.kind === "message");
+		expect(message).toMatchObject({ id: "m1", clientMessageId: "client-1" });
+	});
+});
+
+it("keeps a live refresh that is in flight when older history starts loading", async () => {
+	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	const local = ({ children }: { children: ReactNode }) => <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+	const page = (latestSequence: number, older = false) => ({
+		data: {
+			conversationId: "conv-1", sessionId: "ao-1", harness: "codex", mode: "chat", controller: "ready", settings: {},
+			latestSequence, oldestSequence: older ? 1 : 20, hasMoreBefore: !older, turns: [], messages: [], activities: [],
+		},
+		error: undefined,
+	});
+	const refresh = deferred<ReturnType<typeof page>>();
+	getMock.mockReset()
+		.mockResolvedValueOnce(page(20))
+		.mockReturnValueOnce(refresh.promise)
+		.mockResolvedValue(page(20, true));
+	const { result } = renderHook(() => useConversation("ao-1"), { wrapper: local });
+	await waitFor(() => expect(result.current.snapshot?.latestSequence).toBe(20));
+
+	// A conversation event starts a refresh; the reader scrolls to the top before it lands.
+	void queryClient.invalidateQueries({ queryKey: ["conversation", "ao-1"] }, { cancelRefetch: false });
+	await waitFor(() => expect(getMock).toHaveBeenCalledTimes(2));
+	act(() => result.current.loadOlder());
+	await act(async () => { refresh.resolve(page(21)); });
+
+	await waitFor(() => expect(result.current.snapshot?.latestSequence).toBe(21));
+});

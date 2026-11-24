@@ -1,0 +1,57 @@
+import { UITextView as Text } from "@bsky.app/react-native-uitextview";
+import { memo, useMemo } from "react";
+import type { StyleProp, TextStyle } from "react-native";
+import { useTheme } from "../ThemeProvider";
+import { textSelectionColors } from "../textSelection";
+import { useAndroidResponseSelection } from "./useAndroidResponseSelection";
+import { highlightCode, type SyntaxTokenKind } from "./syntaxHighlight";
+
+/**
+ * Native, selectable syntax highlighting without a WebView or provider SDK.
+ * Streaming code remains plain text so rapidly arriving deltas do not cause a
+ * full grammar pass on every character; it is highlighted once settled.
+ */
+export const HighlightedCodeText = memo(function HighlightedCodeText({
+	code,
+	language,
+	streaming = false,
+	style,
+	onAddSelection,
+}: {
+	code: string;
+	language?: string;
+	streaming?: boolean;
+	style?: StyleProp<TextStyle>;
+	/** Offers the text-selection menu's "Add to chat", handing it the selected text. */
+	onAddSelection?: (text: string) => void;
+}) {
+	const t = useTheme();
+	const onLayout = useAndroidResponseSelection(onAddSelection ?? null);
+	const tokens = useMemo(
+		() => streaming ? undefined : highlightCode(code, language),
+		[code, language, streaming],
+	);
+	return (
+		<Text selectable uiTextView selectionColor={textSelectionColors(t).selectionColor} style={style} onLayout={onAddSelection ? onLayout : undefined} addToChatEnabled={Boolean(onAddSelection)} onAddToChat={(event) => onAddSelection?.(event.nativeEvent.text)}>
+			{tokens?.map((token, index) => (
+				<Text key={`${index}:${token.text.length}`} style={{ color: tokenColor(token.kind, t) }}>
+					{token.text}
+				</Text>
+			)) ?? code}
+		</Text>
+	);
+});
+
+function tokenColor(kind: SyntaxTokenKind, t: ReturnType<typeof useTheme>): string {
+	switch (kind) {
+		case "comment": return t.textFaint;
+		case "string":
+		case "addition": return t.green;
+		case "number": return t.orange;
+		case "keyword": return t.amber;
+		case "type":
+		case "meta": return t.textSecondary;
+		case "deletion": return t.red;
+		default: return t.textPrimary;
+	}
+}

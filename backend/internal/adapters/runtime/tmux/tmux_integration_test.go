@@ -1,0 +1,619 @@
+package tmux
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+)
+
+func TestRuntimeIntegration(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+
+	ctx := context.Background()
+	id := strings.ReplaceAll(t.Name(), "/", "_")
+	r := New(Options{Timeout: 5 * time.Second})
+
+	// Ensure clean slate: ignore errors (session may not exist).
+	_ = r.Destroy(ctx, ports.RuntimeHandle{ID: id})
+
+	t.Cleanup(func() {
+		// Always destroy so a test failure never leaks a tmux session.
+		_ = r.Destroy(context.Background(), ports.RuntimeHandle{ID: id})
+	})
+
+	h, err := r.Create(ctx, ports.RuntimeConfig{
+		SessionID:     domain.SessionID(id),
+		WorkspacePath: t.TempDir(),
+		// Run a trivial command then drop into an interactive shell (the keep-alive
+		// exec is added by buildLaunchCommand, but we also verify here that output
+		// appears).
+		Argv: []string{"sh", "-c", "echo hello-from-tmux"},
+		Env:  map[string]string{"AO_SESSION_ID": id},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	alive, err := r.IsAlive(ctx, h)
+	if err != nil {
+		t.Fatalf("IsAlive: %v", err)
+	}
+	if !alive {
+		t.Fatal("alive = false, want true after create")
+	}
+
+	// Wait for the echo output to appear (the session may take a moment to
+	// write it to the pane history).
+	out := waitForOutput(t, r, h, "hello-from-tmux", 5*time.Second)
+	if !strings.Contains(out, "hello-from-tmux") {
+		t.Fatalf("output = %q, want hello-from-tmux", out)
+	}
+
+	// Send a command and verify it echoes back.
+	if err := r.SendMessage(ctx, h, "echo hello-send"); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	out = waitForOutput(t, r, h, "hello-send", 5*time.Second)
+	if !strings.Contains(out, "hello-send") {
+		t.Fatalf("output after SendMessage = %q, want hello-send", out)
+	}
+
+	// Destroy and verify liveness goes false. When this was the server's last
+	// session the server itself exits with it, and the probe reports the
+	// server-level outage as ErrRuntimeUnavailable rather than a per-session
+	// false result (issue #3475); both outcomes mean the tmux handle is gone.
+	if err := r.Destroy(ctx, h); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	alive, err = r.IsAlive(ctx, h)
+	if err != nil && !errors.Is(err, ports.ErrRuntimeUnavailable) {
+		t.Fatalf("IsAlive after destroy: %v", err)
+	}
+	if alive {
+		t.Fatal("alive after destroy = true, want false")
+	}
+}
+
+// TestRuntimeIntegrationExactSessionParsing verifies that IsAlive uses exact
+// session matching and does not treat a prefix as a live session.
+func TestRuntimeIntegrationExactSessionParsing(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+
+	ctx := context.Background()
+	base := strings.ReplaceAll(t.Name(), "/", "_")
+	longID := base + "_long"
+	prefixID := base
+
+	r := New(Options{Timeout: 5 * time.Second})
+	_ = r.Destroy(ctx, ports.RuntimeHandle{ID: longID})
+	_ = r.Destroy(ctx, ports.RuntimeHandle{ID: prefixID})
+
+	t.Cleanup(func() {
+		_ = r.Destroy(context.Background(), ports.RuntimeHandle{ID: longID})
+		_ = r.Destroy(context.Background(), ports.RuntimeHandle{ID: prefixID})
+	})
+
+	h, err := r.Create(ctx, ports.RuntimeConfig{
+		SessionID:     domain.SessionID(longID),
+		WorkspacePath: t.TempDir(),
+		Argv:          []string{"sh", "-c", "echo ready"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// tmux has-session -t <prefix> should NOT match <longID> because tmux
+	// requires the exact session name when using -t with a plain string (not a
+	// glob). Verify by probing the prefix handle directly.
+	prefixAlive, err := r.IsAlive(ctx, ports.RuntimeHandle{ID: prefixID})
+	if err != nil {
+		// tmux may return an error (session not found) rather than exit 0.
+		// That is acceptable here: the point is the prefix must not be alive.
+		t.Logf("IsAlive prefix returned error (acceptable): %v", err)
+	}
+	if prefixAlive {
+		_ = r.Destroy(ctx, h)
+		t.Fatal("prefix handle reported alive; tmux session matching is not exact")
+	}
+}
+
+func TestRuntimeIntegrationLegacyDefaultSocketIgnoresInheritedTMUX(t *testing.T) {
+	systemTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux unavailable")
+	}
+
+	// tmux's Unix socket path has a small platform limit; Go's ordinary test
+	// temp root is long enough to exceed it on macOS.
+	tmuxTmpDir, err := os.MkdirTemp("/tmp", "ao-tmux-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmuxTmpDir) })
+	t.Setenv("TMUX_TMPDIR", tmuxTmpDir)
+	legacyID := strings.ReplaceAll(t.Name(), "/", "_") + "_legacy"
+	spoofID := strings.ReplaceAll(t.Name(), "/", "_") + "_spoof"
+	privateID := strings.ReplaceAll(t.Name(), "/", "_") + "_private"
+	for _, socketName := range []string{"default", "spoof", "ao"} {
+		t.Cleanup(func() {
+			_ = exec.Command(systemTmux, "-L", socketName, "kill-server").Run()
+		})
+	}
+	start := func(socketName, sessionID string) {
+		t.Helper()
+		if out, startErr := exec.Command(
+			systemTmux,
+			"-L", socketName,
+			"new-session", "-d", "-s", sessionID,
+			"sleep 30",
+		).CombinedOutput(); startErr != nil {
+			t.Fatalf("start tmux -L %s: %v: %s", socketName, startErr, out)
+		}
+	}
+	start("default", legacyID)
+	start("spoof", spoofID)
+	start("ao", privateID)
+
+	spoofIdentity, err := exec.Command(
+		systemTmux,
+		"-L", "spoof",
+		"display-message", "-p", "#{socket_path},#{pid},0",
+	).Output()
+	if err != nil {
+		t.Fatalf("read spoof socket identity: %v", err)
+	}
+	t.Setenv("TMUX", strings.TrimSpace(string(spoofIdentity)))
+	if out, err := exec.Command(systemTmux, "has-session", "-t", spoofID).CombinedOutput(); err != nil {
+		t.Fatalf("test setup did not redirect plain tmux through inherited TMUX: %v: %s", err, out)
+	}
+
+	r := New(Options{
+		Binary:       systemTmux,
+		LegacyBinary: systemTmux,
+		SocketName:   "ao",
+		Timeout:      5 * time.Second,
+	})
+	alive, err := r.IsAlive(context.Background(), ports.RuntimeHandle{ID: legacyID})
+	if err != nil || !alive {
+		t.Fatalf("legacy default-socket session = (%v, %v), want (true, nil)", alive, err)
+	}
+	alive, err = r.IsAlive(context.Background(), ports.RuntimeHandle{ID: spoofID})
+	if err != nil {
+		t.Fatalf("spoof-only session probe: %v", err)
+	}
+	if alive {
+		t.Fatal("spoof-only session was misclassified as AO's legacy session")
+	}
+}
+
+func TestRuntimeIntegrationAdoptsLegacyDefaultWhenNamedSocketDoesNotExist(t *testing.T) {
+	systemTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux unavailable")
+	}
+
+	// Isolate both socket names so the test starts with a live legacy default
+	// server and no named AO server, matching an untouched pre-cutover install.
+	tmuxTmpDir, err := os.MkdirTemp("/tmp", "ao-tmux-migration-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmuxTmpDir) })
+	t.Setenv("TMUX_TMPDIR", tmuxTmpDir)
+	legacyID := strings.ReplaceAll(t.Name(), "/", "_") + "_legacy"
+	for _, socketName := range []string{"default", "ao"} {
+		t.Cleanup(func() {
+			_ = exec.Command(systemTmux, "-L", socketName, "kill-server").Run()
+		})
+	}
+	if out, startErr := exec.Command(
+		systemTmux,
+		"-L", "default",
+		"new-session", "-d", "-s", legacyID,
+		"sh",
+	).CombinedOutput(); startErr != nil {
+		t.Fatalf("start legacy tmux session: %v: %s", startErr, out)
+	}
+	missingOut, missingErr := exec.Command(systemTmux, "-L", "ao", "has-session", "-t", legacyID).CombinedOutput()
+	if missingErr == nil {
+		t.Fatal("test setup unexpectedly found a named AO server")
+	}
+	if !serverSocketAbsentOutput(string(missingOut)) {
+		t.Fatalf("named AO probe = %q, want missing-socket diagnostic", missingOut)
+	}
+
+	r := New(Options{
+		Binary:       systemTmux,
+		LegacyBinary: systemTmux,
+		SocketName:   "ao",
+		Timeout:      5 * time.Second,
+	})
+	r.enterDelay = 0
+	handle := ports.RuntimeHandle{ID: legacyID}
+	alive, err := r.IsAlive(context.Background(), handle)
+	if err != nil || !alive {
+		t.Fatalf("legacy default-socket session = (%v, %v), want (true, nil)", alive, err)
+	}
+	if err := r.SendMessage(context.Background(), handle, "echo legacy-send-ok"); err != nil {
+		t.Fatalf("SendMessage to adopted legacy session: %v", err)
+	}
+	out := waitForOutput(t, r, handle, "legacy-send-ok", 5*time.Second)
+	if !strings.Contains(out, "legacy-send-ok") {
+		t.Fatalf("legacy output = %q, want legacy-send-ok", out)
+	}
+	if out, probeErr := exec.Command(systemTmux, "-L", "ao", "list-sessions").CombinedOutput(); probeErr == nil {
+		t.Fatalf("legacy discovery unexpectedly created named AO server: %s", out)
+	}
+}
+
+// TestRuntimeIntegrationLegacyDefaultSocketDestroyEnforcesDetachOnDestroy is
+// the regression for the gap in #4223's first fix: Create sets
+// detach-on-destroy per session (see setDetachOnDestroyOnArgs), but a handle
+// adopted from tmux's legacy default socket (a session that predates AO's
+// private socket, see socketForSession) never went through this daemon's
+// Create. Destroy must still re-assert the option immediately before
+// kill-session so closing such a session cannot hand its attach client to one
+// of the user's own sessions when the user's tmux.conf sets `detach-on-destroy
+// off` globally.
+func TestRuntimeIntegrationLegacyDefaultSocketDestroyEnforcesDetachOnDestroy(t *testing.T) {
+	systemTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux unavailable")
+	}
+	// See TestAttachmentReattachAdoptsNewSize (terminal package): tmux needs a
+	// usable TERM to attach.
+	t.Setenv("TERM", "xterm-256color")
+
+	tmuxTmpDir, err := os.MkdirTemp("/tmp", "ao-tmux-legacy-dod-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmuxTmpDir) })
+	t.Setenv("TMUX_TMPDIR", tmuxTmpDir)
+
+	legacyID := strings.ReplaceAll(t.Name(), "/", "_") + "_legacy"
+	decoyID := strings.ReplaceAll(t.Name(), "/", "_") + "_decoy"
+	for _, socketName := range []string{"default", "ao"} {
+		t.Cleanup(func() {
+			_ = exec.Command(systemTmux, "-L", socketName, "kill-server").Run()
+		})
+	}
+
+	// Simulate the pre-cutover install this bug report came from: the global
+	// tmux.conf (here, the server-wide default option) disables
+	// detach-on-destroy, and the AO session was created directly on the legacy
+	// default socket, bypassing Create entirely. The decoy stands in for one of
+	// the user's own unrelated tmux sessions; it also starts the default-socket
+	// server so the set-option below has a server to talk to.
+	if out, startErr := exec.Command(systemTmux, "-L", "default", "new-session", "-d", "-s", decoyID, "sh", "-c", "sleep 300").CombinedOutput(); startErr != nil {
+		t.Fatalf("create decoy session: %v: %s", startErr, out)
+	}
+	if out, startErr := exec.Command(systemTmux, "-L", "default", "set-option", "-g", "detach-on-destroy", "off").CombinedOutput(); startErr != nil {
+		t.Fatalf("set global detach-on-destroy off: %v: %s", startErr, out)
+	}
+	if out, startErr := exec.Command(
+		systemTmux, "-L", "default",
+		"new-session", "-d", "-s", legacyID,
+		"sh", "-lc", "printf AO_READY\\n; exec sh -i",
+	).CombinedOutput(); startErr != nil {
+		t.Fatalf("create legacy session: %v: %s", startErr, out)
+	}
+
+	r := New(Options{
+		Binary:       systemTmux,
+		LegacyBinary: systemTmux,
+		SocketName:   "ao",
+		Timeout:      5 * time.Second,
+	})
+	r.enterDelay = 0
+	handle := ports.RuntimeHandle{ID: legacyID}
+
+	alive, err := r.IsAlive(context.Background(), handle)
+	if err != nil || !alive {
+		t.Fatalf("legacy session = (%v, %v), want (true, nil)", alive, err)
+	}
+
+	stream, err := r.Attach(context.Background(), handle, 24, 80)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer stream.Close()
+
+	var mu sync.Mutex
+	var got strings.Builder
+	readErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := stream.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				got.Write(buf[:n])
+				mu.Unlock()
+			}
+			if readErr != nil {
+				readErrCh <- readErr
+				return
+			}
+		}
+	}()
+	snapshot := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return got.String()
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(snapshot(), "AO_READY") {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(snapshot(), "AO_READY") {
+		t.Fatalf("attach stream never showed AO_READY, got %q", snapshot())
+	}
+
+	if err := r.Destroy(context.Background(), handle); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	// A fixed daemon ends the attach client, so the stream's read loop observes
+	// an error (EOF or a closed-pty error) instead of continuing to receive
+	// the decoy session's output.
+	select {
+	case <-readErrCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("attach stream still open after Destroy, want it closed; got %q (want it to not contain the decoy's shell)", snapshot())
+	}
+}
+
+// TestRuntimeIntegrationLegacyDefaultSocketExternalKillEnforcesDetachOnDestroy
+// is the regression for the gap the second fix left open: Destroy's pre-kill
+// reassertion only protects a session that dies through Runtime.Destroy. A
+// legacy-socket session can also die from something Destroy never sees — the
+// user typing `exit` in the retained shell, or (as reproduced here) something
+// external running `kill-session` directly against the default socket. This
+// test never calls Runtime.Destroy at all: it only Attaches, which must
+// itself set and confirm detach-on-destroy the moment the daemon adopts the
+// session (see enforceDetachOnDestroy in socketForSession), before the
+// external kill below can reach it.
+func TestRuntimeIntegrationLegacyDefaultSocketExternalKillEnforcesDetachOnDestroy(t *testing.T) {
+	systemTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux unavailable")
+	}
+	t.Setenv("TERM", "xterm-256color")
+
+	tmuxTmpDir, err := os.MkdirTemp("/tmp", "ao-tmux-legacy-extkill-dod-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmuxTmpDir) })
+	t.Setenv("TMUX_TMPDIR", tmuxTmpDir)
+
+	legacyID := strings.ReplaceAll(t.Name(), "/", "_") + "_legacy"
+	decoyID := strings.ReplaceAll(t.Name(), "/", "_") + "_decoy"
+	for _, socketName := range []string{"default", "ao"} {
+		t.Cleanup(func() {
+			_ = exec.Command(systemTmux, "-L", socketName, "kill-server").Run()
+		})
+	}
+
+	// Same pre-cutover setup as the Destroy-path regression: decoy first (also
+	// starts the default-socket server), then the global option, then the
+	// legacy session, all bypassing Create.
+	if out, startErr := exec.Command(systemTmux, "-L", "default", "new-session", "-d", "-s", decoyID, "sh", "-c", "sleep 300").CombinedOutput(); startErr != nil {
+		t.Fatalf("create decoy session: %v: %s", startErr, out)
+	}
+	if out, startErr := exec.Command(systemTmux, "-L", "default", "set-option", "-g", "detach-on-destroy", "off").CombinedOutput(); startErr != nil {
+		t.Fatalf("set global detach-on-destroy off: %v: %s", startErr, out)
+	}
+	if out, startErr := exec.Command(
+		systemTmux, "-L", "default",
+		"new-session", "-d", "-s", legacyID,
+		"sh", "-lc", "printf AO_READY\\n; exec sh -i",
+	).CombinedOutput(); startErr != nil {
+		t.Fatalf("create legacy session: %v: %s", startErr, out)
+	}
+
+	r := New(Options{
+		Binary:       systemTmux,
+		LegacyBinary: systemTmux,
+		SocketName:   "ao",
+		Timeout:      5 * time.Second,
+	})
+	r.enterDelay = 0
+	handle := ports.RuntimeHandle{ID: legacyID}
+
+	// Attach alone must trigger adoption and its enforcement; Destroy is
+	// deliberately never called in this test.
+	stream, err := r.Attach(context.Background(), handle, 24, 80)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer stream.Close()
+
+	// The enforcement is confirmable independent of the attach stream: read it
+	// straight back from tmux to prove Attach actually set it, not merely that
+	// the client happens to behave correctly below.
+	verifyOut, verifyErr := exec.Command(systemTmux, "-L", "default", "show-options", "-t", "="+legacyID+":", "-v", "detach-on-destroy").CombinedOutput()
+	if verifyErr != nil {
+		t.Fatalf("show-options detach-on-destroy after Attach: %v: %s", verifyErr, verifyOut)
+	}
+	if got := strings.TrimSpace(string(verifyOut)); got != "on" {
+		t.Fatalf("detach-on-destroy after Attach = %q, want \"on\" (Attach must enforce it at adoption time)", got)
+	}
+
+	var mu sync.Mutex
+	var got strings.Builder
+	readErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := stream.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				got.Write(buf[:n])
+				mu.Unlock()
+			}
+			if readErr != nil {
+				readErrCh <- readErr
+				return
+			}
+		}
+	}()
+	snapshot := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return got.String()
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(snapshot(), "AO_READY") {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(snapshot(), "AO_READY") {
+		t.Fatalf("attach stream never showed AO_READY, got %q", snapshot())
+	}
+
+	// Kill the session directly against the default socket, entirely outside
+	// Runtime.Destroy — the scenario Destroy's own pre-kill guard cannot see.
+	if out, killErr := exec.Command(systemTmux, "-L", "default", "kill-session", "-t", "="+legacyID).CombinedOutput(); killErr != nil {
+		t.Fatalf("external kill-session: %v: %s", killErr, out)
+	}
+
+	select {
+	case <-readErrCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("attach stream still open after an external kill-session, want it closed; got %q (want it to not contain the decoy's shell)", snapshot())
+	}
+}
+
+func TestRuntimeIntegrationSupervisedExitKeepsInteractiveShell(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux unavailable")
+	}
+
+	ctx := context.Background()
+	id := strings.ReplaceAll(t.Name(), "/", "_")
+	const launchID = "launch-1"
+	r := New(Options{Timeout: 5 * time.Second})
+	tmuxID := SessionName(id)
+	workspace := t.TempDir()
+	_ = r.Destroy(ctx, ports.RuntimeHandle{ID: tmuxID})
+	t.Cleanup(func() { _ = r.Destroy(context.Background(), ports.RuntimeHandle{ID: tmuxID}) })
+
+	// Re-run this test binary as a long-lived helper with the same controlled
+	// command-line identity as AO's supervisor. The CLI package separately tests
+	// that the real supervisor waits for and reports its child.
+	h, err := r.Create(ctx, ports.RuntimeConfig{
+		SessionID:     domain.SessionID(id),
+		WorkspacePath: workspace,
+		Argv:          []string{os.Args[0], "-test.run=TestSupervisorProcessHelper", "--", "agent-process", "supervise", "--session", id, "--launch", launchID, "--"},
+		Env:           map[string]string{"AO_TMUX_SUPERVISOR_HELPER": "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := ports.SupervisedProcessRef{SessionID: domain.SessionID(id), LaunchID: launchID}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		alive, probeErr := r.IsSupervisedProcessAlive(ctx, h, ref)
+		if probeErr != nil {
+			t.Fatal(probeErr)
+		}
+		if alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("supervised workload did not appear in the tmux process tree")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// The helper exits normally, matching Codex /exit or EOF. The launch shell
+	// must then execute AO's keep-alive interactive shell.
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		alive, probeErr := r.IsSupervisedProcessAlive(ctx, h, ref)
+		if probeErr != nil {
+			t.Fatal(probeErr)
+		}
+		if !alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("supervised workload remained alive after normal exit")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if alive, err := r.IsAlive(ctx, h); err != nil || !alive {
+		t.Fatalf("tmux after workload exit = (%v, %v), want (true, nil)", alive, err)
+	}
+	if err := r.SendMessage(ctx, h, "echo shell-after-agent-exit"); err != nil {
+		t.Fatal(err)
+	}
+	out := waitForOutput(t, r, h, "shell-after-agent-exit", 5*time.Second)
+	if !strings.Contains(out, "shell-after-agent-exit") {
+		t.Fatalf("post-exit shell output = %q", out)
+	}
+
+	restarted, err := r.Restart(ctx, h, ports.RuntimeConfig{
+		SessionID:     domain.SessionID(id),
+		WorkspacePath: workspace,
+		Argv:          []string{"sh", "-c", "echo managed-agent-resumed"},
+	})
+	if err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if restarted != h {
+		t.Fatalf("restart handle = %+v, want existing handle %+v", restarted, h)
+	}
+	out = waitForOutput(t, r, restarted, "managed-agent-resumed", 5*time.Second)
+	if !strings.Contains(out, "managed-agent-resumed") {
+		t.Fatalf("restart output = %q, want managed-agent-resumed", out)
+	}
+	if err := r.SendMessage(ctx, restarted, "echo shell-after-managed-resume"); err != nil {
+		t.Fatal(err)
+	}
+	out = waitForOutput(t, r, restarted, "shell-after-managed-resume", 5*time.Second)
+	if !strings.Contains(out, "shell-after-managed-resume") {
+		t.Fatalf("post-resume shell output = %q", out)
+	}
+}
+
+func TestSupervisorProcessHelper(t *testing.T) {
+	if os.Getenv("AO_TMUX_SUPERVISOR_HELPER") != "1" {
+		return
+	}
+	time.Sleep(2 * time.Second)
+}
+
+// waitForOutput polls GetOutput until out contains want or the deadline passes.
+func waitForOutput(t *testing.T, r *Runtime, h ports.RuntimeHandle, want string, deadline time.Duration) string {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	var out string
+	for time.Now().Before(end) {
+		var err error
+		out, err = r.GetOutput(context.Background(), h, 50)
+		if err != nil {
+			t.Fatalf("GetOutput: %v", err)
+		}
+		if strings.Contains(out, want) {
+			return out
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return out
+}

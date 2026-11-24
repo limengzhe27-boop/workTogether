@@ -1,0 +1,1647 @@
+import { useQueryClient } from "@tanstack/react-query";
+import { RotateCcw } from "lucide-react";
+import {
+	createContext,
+	lazy,
+	Suspense,
+	useCallback,
+	useContext,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+	type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
+import { terminalTargetBelongsToSession, type TerminalTarget } from "../types/terminal";
+import { sessionAgentExited, sessionIsActive, type WorkspaceSession } from "../types/workspace";
+import { ResumeAgentControl } from "./ResumeAgentControl";
+import type { Theme } from "../stores/ui-store";
+import {
+	useTerminalSession,
+	type AttachableTerminal,
+	type TerminalSessionState,
+} from "../hooks/useTerminalSession";
+import { useSessionBrowserLink } from "../hooks/useSessionBrowserLink";
+import { useSessionLinkNavigation } from "../lib/use-session-link-navigation";
+import { getApiBaseUrl } from "../lib/api-client";
+import {
+	createTerminalMux,
+	createTerminalMuxPool,
+	muxUrlFromApiBase,
+	type TerminalMux,
+	type TerminalMuxPool,
+} from "../lib/terminal-mux";
+import { cn } from "../lib/utils";
+import { useWorkspaceQuery, workspaceQueryKeyForHost } from "../hooks/useWorkspaceQuery";
+import { useRestoreSession } from "../hooks/useRestoreSession";
+import { useShellTerminals } from "../hooks/useShellTerminals";
+import { placeCloudAttachment, uploadCloudAttachment } from "../lib/cloud-attachments";
+import { useCloudCp } from "../hooks/useCloudCp";
+import { useCloudOffering } from "../hooks/useCloudOffering";
+import { MAX_CLOUD_CP_BINARY_BYTES } from "../../shared/cloud-binary";
+import { terminalResetNonce, useTerminalResetStore } from "../stores/terminal-reset-store";
+import { createCloudTerminalMux } from "../lib/cloud-terminal-mux";
+import { takeCloudShellInput } from "../lib/cloud-shell-input";
+import { LazyChunkBoundary } from "./LazyChunkBoundary";
+
+// xterm and its WebGL addon (~700 KB) load on first terminal render instead of
+// with the shell: the shell imports TerminalCacheProvider from this module, so a
+// static import here put xterm on every route. preloadXtermTerminal() warms the
+// chunk in idle time once the daemon is up.
+const loadXtermTerminal = () => import("./XtermTerminal");
+const XtermTerminal = lazy(() => loadXtermTerminal().then((module) => ({ default: module.XtermTerminal })));
+
+export function preloadXtermTerminal(): void {
+	void loadXtermTerminal().catch(() => undefined);
+}
+import { RestoreUnavailableDialog } from "./RestoreUnavailableDialog";
+import { rememberPaneTerminalGrid } from "../lib/terminal-grid-hint";
+import { Button } from "./ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { captureRendererException } from "../lib/telemetry";
+
+type TerminalPaneProps = {
+	session?: WorkspaceSession;
+	terminalGeneration?: string;
+	theme: Theme;
+	daemonReady: boolean;
+	terminalTarget?: TerminalTarget;
+	fontSize: number;
+	/** Resize this terminal without changing application zoom. */
+	onChangeFontSize?: (delta: number) => void;
+	isFullscreen?: boolean;
+	/** Enter or exit fullscreen for the terminal pane that owns this xterm. */
+	onToggleFullscreen?: () => void | Promise<void>;
+	/** Refuse agent PTY input while a controller transition owns the source. */
+	inputDisabled?: boolean;
+	/** The agent terminal is coming up after an interface switch; show the boot spinner instead of ended/empty chrome. */
+	booting?: boolean;
+	/** An account move is restarting this agent in a new terminal. The label covers
+	 * the pane while nothing is drawn there, instead of boot text and an empty
+	 * terminal; the old screen stays until its terminal is gone. */
+	switchingLabel?: string;
+	/** Focus the terminal when an in-flight controller asks for human input. */
+	focusRequested?: boolean;
+	/** Observe attachment state without taking ownership of the terminal lifecycle. */
+	onTerminalStateChange?: (state: TerminalSessionState) => void;
+	/** Cloud agent screen has painted nonblank terminal content. */
+	onTerminalContentReadyChange?: (ready: boolean) => void;
+	/** One-shot input initiated by an explicit UI action. */
+	inputRequest?: { id: number; data: string };
+	/** Reports whether the active attachment accepted a one-shot input request. */
+	onInputRequestResult?: (id: number, accepted: boolean) => void;
+	/** Provider-owned shared transport lease factory. */
+	createMux?: () => TerminalMux;
+};
+
+type TerminalCacheDescriptor = {
+	cacheKey: string;
+	generation?: string;
+	handleId: string;
+	kind: "shell" | "worker";
+	ownerKey: string;
+	sessionId?: string;
+};
+
+type CachedTerminalEntry = TerminalCacheDescriptor & {
+	activationId: number;
+	activationPhase: "parked" | "visible";
+	container: HTMLDivElement;
+	discardOnDeactivate?: boolean;
+	props: TerminalPaneProps;
+	terminal?: AttachableTerminal;
+};
+
+// isUnlisted reports whether the last workspace snapshot (listed; null before
+// one arrived) does not list an entry's session. Such an entry is kept only
+// while it is on screen (see the snapshot reconcile).
+function isUnlisted(entry: CachedTerminalEntry, listed: Set<string> | null): boolean {
+	return Boolean(entry.sessionId) && listed !== null && !listed.has(entry.sessionId ?? "");
+}
+
+type ActiveTerminalEntry = {
+	key: string;
+	slot: HTMLDivElement;
+};
+
+type TerminalCacheController = {
+	activate: (descriptor: TerminalCacheDescriptor, props: TerminalPaneProps, slot: HTMLDivElement) => void;
+	deactivate: (cacheKey: string, slot: HTMLDivElement) => void;
+	update: (cacheKey: string, props: TerminalPaneProps) => void;
+	/** The stable transport factory for a pane: the control plane for Cloud, else the local daemon pool. */
+	resolveCreateMux: (session?: WorkspaceSession, terminalTarget?: TerminalTarget) => () => TerminalMux;
+};
+
+const TerminalCacheContext = createContext<TerminalCacheController | null>(null);
+
+function terminalTargetMatches(left?: TerminalTarget, right?: TerminalTarget): boolean {
+	if (left === right) return true;
+	if (!left || !right || left.kind !== right.kind) return false;
+	if (left.kind === "worker" && right.kind === "worker") return true;
+	if (left.kind === "reviewer" && right.kind === "reviewer") {
+		return left.handleId === right.handleId && left.harness === right.harness;
+	}
+	if (left.kind === "shell" && right.kind === "shell") {
+		return (
+			left.handleId === right.handleId &&
+			left.generation === right.generation &&
+			left.title === right.title
+		);
+	}
+	return false;
+}
+
+function terminalPropsMatch(left: TerminalPaneProps, right: TerminalPaneProps): boolean {
+	return (
+		left.session === right.session &&
+		left.theme === right.theme &&
+		left.daemonReady === right.daemonReady &&
+		left.fontSize === right.fontSize &&
+		left.onChangeFontSize === right.onChangeFontSize &&
+		left.isFullscreen === right.isFullscreen &&
+		left.onToggleFullscreen === right.onToggleFullscreen &&
+		left.inputDisabled === right.inputDisabled &&
+		left.booting === right.booting &&
+		left.switchingLabel === right.switchingLabel &&
+		left.focusRequested === right.focusRequested &&
+		left.onTerminalStateChange === right.onTerminalStateChange &&
+		left.onTerminalContentReadyChange === right.onTerminalContentReadyChange &&
+		left.inputRequest === right.inputRequest &&
+		left.onInputRequestResult === right.onInputRequestResult &&
+		left.createMux === right.createMux &&
+		terminalTargetMatches(left.terminalTarget, right.terminalTarget)
+	);
+}
+
+function cacheDescriptor(
+	session: WorkspaceSession | undefined,
+	terminalTarget: TerminalTarget | undefined,
+	terminalGeneration?: string,
+): TerminalCacheDescriptor | null {
+	if (terminalTarget?.kind === "shell") {
+		if (!terminalTargetBelongsToSession(terminalTarget, session?.id)) return null;
+		const ownerKey = `shell:${session?.id ?? "standalone"}:${terminalTarget.handleId}`;
+		return {
+			cacheKey: `${ownerKey}|handle:${terminalTarget.handleId}|generation:${terminalTarget.generation}`,
+			generation: terminalTarget.generation,
+			handleId: terminalTarget.handleId,
+			kind: "shell",
+			ownerKey,
+			sessionId: session?.id,
+		};
+	}
+
+	// Reviewer terminals stream directly into a fresh mount and are intentionally
+	// outside the retained worker/shell cache.
+	if (terminalTarget?.kind === "reviewer") return null;
+	const handleId = session?.terminalHandleId;
+	if (!session?.id || !handleId) return null;
+	const ownerKey = `session:${session.id}:worker`;
+	const generation = terminalGeneration ?? session.terminalGeneration ?? "";
+	// The reset nonce discriminates a restored session (same id, new worker epoch,
+	// dead old terminal) from the live one: folding it into the cache key alone
+	// makes restore mount a brand-new entry (which re-mints against the new epoch)
+	// while `generation` stays the raw value the workspace reconcile loop compares
+	// against session.terminalGeneration — so a restore does not look like a
+	// generation change that would dispose the fresh terminal on the next render.
+	const nonce = terminalResetNonce(session.id);
+	// The worker epoch is deliberately NOT in the cache key. A fresh cloud session
+	// attaches optimistically before its worker is up, when the epoch is still
+	// unknown; the moment the worker comes online the polled epoch flips from
+	// undefined to its first value, and folding that into the key would evict the
+	// just-attached terminal and remount it (connected -> blank -> terminal). The
+	// reconcile loop instead disposes a worker terminal when its epoch moves
+	// BETWEEN two known values (a genuine re-provision), and a restore rebuilds via
+	// the nonce, so the key only needs the restore nonce to force a clean re-mint.
+	return {
+		cacheKey: `${ownerKey}|handle:${handleId}|reset:${nonce}`,
+		generation,
+		handleId,
+		kind: "worker",
+		ownerKey,
+		sessionId: session.id,
+	};
+}
+
+export function cloudTerminalKind(terminalTarget?: TerminalTarget): "agent" | "workspace" {
+	return terminalTarget?.kind === "shell" ? "workspace" : "agent";
+}
+
+function blurTerminal(container: HTMLElement): void {
+	const active = document.activeElement;
+	if (active instanceof HTMLElement && container.contains(active)) {
+		active.blur();
+	}
+}
+
+function setTerminalPhase(
+	entry: CachedTerminalEntry,
+	phase: CachedTerminalEntry["activationPhase"],
+): void {
+	entry.activationPhase = phase;
+	entry.container.dataset.terminalActivationPhase = phase;
+	const interactive = phase === "visible";
+	entry.container.inert = !interactive;
+	if (interactive) {
+		entry.container.removeAttribute("aria-hidden");
+		entry.container.style.pointerEvents = "";
+	} else {
+		entry.container.setAttribute("aria-hidden", "true");
+		entry.container.style.pointerEvents = "none";
+	}
+	if (interactive) {
+		entry.container.style.visibility = "";
+		entry.container.style.contentVisibility = "";
+	} else {
+		entry.container.style.visibility = "hidden";
+		// `visibility: hidden` still lays out the complete xterm subtree. Parked
+		// terminals retain their buffer and keep accepting output, but are never
+		// fitted while hidden, so Chromium can skip their expensive DOM layout
+		// until the container returns to the active pane.
+		entry.container.style.contentVisibility = "hidden";
+	}
+}
+
+function parkTerminal(entry: CachedTerminalEntry, parking: HTMLDivElement): void {
+	entry.activationId += 1;
+	blurTerminal(entry.container);
+	setTerminalPhase(entry, "parked");
+	parking.appendChild(entry.container);
+}
+
+function showTerminal(entry: CachedTerminalEntry, slot: HTMLDivElement): void {
+	entry.activationId += 1;
+	// Do not hide a retained terminal while it crosses xterm's two paint-frame
+	// preparation cycle: that made every return to a tab flash blank.
+	entry.container.style.width = "100%";
+	entry.container.style.height = "100%";
+	slot.appendChild(entry.container);
+	setTerminalPhase(entry, "visible");
+}
+
+function CachedTerminalPortal({
+	active,
+	entry,
+	onFatal,
+	onTerminalReady,
+}: {
+	active: boolean;
+	entry: CachedTerminalEntry;
+	onFatal: (cacheKey: string, message: string) => void;
+	onTerminalReady: (cacheKey: string, terminal: AttachableTerminal) => void;
+}) {
+	const handleFatal = useCallback(
+		(message: string) => onFatal(entry.cacheKey, message),
+		[entry.cacheKey, onFatal],
+	);
+	const handleTerminalReady = useCallback(
+		(terminal: AttachableTerminal) => {
+			onTerminalReady(entry.cacheKey, terminal);
+		},
+		[entry.cacheKey, onTerminalReady],
+	);
+	useLayoutEffect(() => {
+		const terminal = entry.terminal;
+		if (!active || entry.activationPhase !== "visible" || !terminal) return;
+		// Fit and scroll after the host is visible. This retains the cache's
+		// settled viewport behavior without putting a blank frame in front of it.
+		void terminal.prepareForActivation();
+		// Returning to a tab is a focus handoff: the terminal was blurred when it
+		// was parked, so ask it to take the caret back (issue #6140). The guard
+		// inside keeps this from stealing focus from dialogs or other controls.
+		terminal.requestActivationFocus();
+	}, [
+		active,
+		entry,
+		entry.activationId,
+		entry.activationPhase,
+		entry.terminal,
+	]);
+	return createPortal(
+		<AttachedTerminal
+			{...entry.props}
+			isVisible={active && entry.activationPhase === "visible"}
+			onFatal={handleFatal}
+			onTerminalReady={handleTerminalReady}
+		/>,
+		entry.container,
+		entry.cacheKey,
+	);
+}
+
+/**
+ * Owns retained terminal renderers above the routed SessionView. Portal
+ * containers never change; only the containers themselves move between the
+ * active pane slot and an off-screen parking lot, so React, xterm, and the
+ * terminal attachment all keep the same lifetime.
+ */
+export function TerminalCacheProvider({
+	children,
+	daemonReady,
+	theme,
+}: {
+	children: ReactNode;
+	daemonReady: boolean;
+	theme: Theme;
+}) {
+	const workspaceQuery = useWorkspaceQuery();
+	const shellTerminalsQuery = useShellTerminals();
+	const entriesRef = useRef(new Map<string, CachedTerminalEntry>());
+	const activeRef = useRef<ActiveTerminalEntry | null>(null);
+	const parkingRef = useRef<HTMLDivElement | null>(null);
+	// The sessions the last workspace snapshot listed (null before one
+	// arrived). A terminal kept on screen while its session was not listed is
+	// disposed once it is parked (disposeIfUnlistedOnceParked), since a later
+	// snapshot (which would dispose it then) may never come.
+	const listedSessionsRef = useRef<Set<string> | null>(null);
+	const muxPoolRef = useRef<TerminalMuxPool | null>(null);
+	if (!muxPoolRef.current) {
+		muxPoolRef.current = createTerminalMuxPool(() =>
+			createTerminalMux(muxUrlFromApiBase(getApiBaseUrl())),
+		);
+	}
+	const muxPool = muxPoolRef.current;
+	// Cloud sessions do not share the pooled local-daemon socket: each runs in its
+	// own control-plane sandbox reached over its own ticketed WebSocket. Resolve a
+	// stable, per-session cloud mux factory so terminal props stay referentially
+	// equal across renders; local sessions keep the pooled daemon mux untouched.
+	const { client: cloudClient, baseUrl: cloudBaseUrl } = useCloudCp();
+	// A cloud pane must never fall back to the local daemon mux, even during the
+	// startup window before settings resolve the control-plane URL: the local
+	// daemon does not know a cloud session's handle and would report it as exited.
+	// Read the control-plane client/URL through a ref so the factory (cached once
+	// per session for referential stability) always uses the current values at
+	// connect time rather than whatever was resolved on first render.
+	const cloudCpRef = useRef({ client: cloudClient, baseUrl: cloudBaseUrl });
+	cloudCpRef.current = { client: cloudClient, baseUrl: cloudBaseUrl };
+	const cloudMuxFactoriesRef = useRef(new Map<string, () => TerminalMux>());
+	const resolveCreateMux = useCallback(
+		(paneSession?: WorkspaceSession, terminalTarget?: TerminalTarget): (() => TerminalMux) => {
+			const cloud = paneSession?.cloud;
+			if (!cloud) return muxPool.acquire;
+			const kind = cloudTerminalKind(terminalTarget);
+			// A reviewer shares the agent mux kind but is its own terminal: key it by
+			// handle so it never reuses the agent's or an earlier review's factory.
+			const identity = terminalTarget?.kind === "shell"
+				? terminalTarget.handleId
+				: terminalTarget?.kind === "reviewer" ? `reviewer:${terminalTarget.handleId}` : "agent";
+			// Include the reset nonce so a restored session (new worker epoch) gets a
+			// brand-new factory closure — and therefore a fresh cursor at 0 — instead
+			// of the cached one whose cursor still points at the dead epoch's replay
+			// position. Without this the rebuilt mux dials `after=<stale>` and the new
+			// epoch (which replays from 0) never sends output, so the pane never opens.
+			const factoryKey = `${paneSession.id}:${kind}:${identity}:${terminalResetNonce(paneSession.id)}`;
+			const cached = cloudMuxFactoriesRef.current.get(factoryKey);
+			if (cached) return cached;
+			const sessionId = paneSession.id;
+			const orgId = cloud.orgId;
+			const reviewerTerminalID = terminalTarget?.kind === "reviewer" ? terminalTarget.handleId : undefined;
+			// One replay cursor per pane, shared across every mux the hook rebuilds
+			// on reconnect (the factory closure captures it and is itself cached
+			// per factoryKey). A rebuilt mux resumes from the last sequence it
+			// received instead of replaying the whole scrollback from 0, so the
+			// terminal settles instead of flickering. A different pane gets a
+			// different factory and therefore its own cursor starting at 0.
+			const cursor = { value: 0 };
+			const shellHandle = terminalTarget?.kind === "shell" ? terminalTarget.handleId : undefined;
+			const factory = () => {
+				// A shell a command cue opened types the cue's command once it is
+				// up. It is taken when the connection is made, not when this
+				// factory is, so a command queued after the tab rendered still goes.
+				const input = shellHandle ? takeCloudShellInput(shellHandle) : undefined;
+				return createCloudTerminalMux({
+					wsBaseUrl: `${cloudCpRef.current.baseUrl.replace(/^http/i, "ws").replace(/\/+$/, "")}/api/cloud/v1`,
+					kind,
+					terminalId: reviewerTerminalID,
+					cursor,
+					initialInput: input,
+					// Both kinds open their socket directly; the CP's find-or-create
+					// OpenTerminal + starting/ready messages drive readiness. There is
+					// no agent-ready SSE wait (#4960 flashed the workspace shell only
+					// because it opened that shell first — we now open the agent
+					// terminal itself, so there is nothing to flash), and no client
+					// open timeout (readiness is server-driven).
+					mintTicket: async (ticketKind) => {
+						const response = await cloudCpRef.current.client.createTerminalTicket(orgId, sessionId, {
+							kind: ticketKind,
+							...(reviewerTerminalID ? { terminalId: reviewerTerminalID } : {}),
+						});
+						return response.ticket;
+					},
+				});
+			};
+			cloudMuxFactoriesRef.current.set(factoryKey, factory);
+			return factory;
+		},
+		[muxPool],
+	);
+	const [, setRevision] = useState(0);
+	const rerender = useCallback(() => setRevision((current) => current + 1), []);
+
+	const removeEntry = useCallback(
+		(cacheKey: string) => {
+			const entry = entriesRef.current.get(cacheKey);
+			if (!entry) return;
+			const active = activeRef.current;
+			if (active?.key === cacheKey) {
+				blurTerminal(entry.container);
+				setTerminalPhase(entry, "parked");
+				activeRef.current = null;
+			}
+			entriesRef.current.delete(cacheKey);
+			entry.container.remove();
+			rerender();
+		},
+		[rerender],
+	);
+
+	// A terminal that left the screen while the snapshot does not list its
+	// session is disposed, as the snapshot reconcile disposes a parked one: it
+	// was kept only while on screen, and no later snapshot may come. The check
+	// waits for the commit to finish, so a slot that re-activates the same
+	// entry in it (its effect re-running) keeps it on screen without a remount.
+	const disposeIfUnlistedOnceParked = useCallback(
+		(cacheKey: string) => {
+			queueMicrotask(() => {
+				const entry = entriesRef.current.get(cacheKey);
+				if (!entry || activeRef.current?.key === cacheKey) return;
+				if (isUnlisted(entry, listedSessionsRef.current)) removeEntry(cacheKey);
+			});
+		},
+		[removeEntry],
+	);
+
+	const activate = useCallback(
+		(descriptor: TerminalCacheDescriptor, props: TerminalPaneProps, slot: HTMLDivElement) => {
+			const parking = parkingRef.current;
+			if (!parking) return;
+			const cachedProps = { ...props, createMux: resolveCreateMux(props.session, props.terminalTarget) };
+
+			const previous = activeRef.current;
+			if (previous && previous.key !== descriptor.cacheKey) {
+				const previousEntry = entriesRef.current.get(previous.key);
+				if (previousEntry) {
+					parkTerminal(previousEntry, parking);
+					if (previousEntry.discardOnDeactivate) {
+						entriesRef.current.delete(previous.key);
+						previousEntry.container.remove();
+					} else {
+						disposeIfUnlistedOnceParked(previous.key);
+					}
+				}
+			}
+
+			// A logical terminal can have only one generation. A replacement
+			// handle immediately disposes the retained renderer and writer for the
+			// old generation, even if an opaque handle is later reused elsewhere.
+			for (const entry of entriesRef.current.values()) {
+				if (entry.ownerKey === descriptor.ownerKey && entry.cacheKey !== descriptor.cacheKey) {
+					if (activeRef.current?.key === entry.cacheKey) parkTerminal(entry, parking);
+					entriesRef.current.delete(entry.cacheKey);
+					entry.container.remove();
+				}
+			}
+
+			let entry = entriesRef.current.get(descriptor.cacheKey);
+			if (!entry) {
+				const container = document.createElement("div");
+				// The normal terminal surface is intentionally translucent. A retained
+				// terminal host must be opaque, though: during route/cache hand-off an
+				// older frame can still be composited beneath it for a paint, which would
+				// otherwise produce a visible double terminal.
+				container.className = "h-full min-h-0 w-full overflow-hidden bg-terminal-opaque";
+				container.style.position = "relative";
+				container.dataset.terminalCacheKey = descriptor.cacheKey;
+				entry = {
+					...descriptor,
+					activationId: 0,
+					activationPhase: "parked",
+					container,
+					props: cachedProps,
+				};
+				entriesRef.current.set(entry.cacheKey, entry);
+			} else {
+				entry.props = cachedProps;
+			}
+			showTerminal(entry, slot);
+			activeRef.current = { key: entry.cacheKey, slot };
+			rerender();
+		},
+		[disposeIfUnlistedOnceParked, muxPool, rerender],
+	);
+
+	const deactivate = useCallback(
+		(cacheKey: string, slot: HTMLDivElement) => {
+			const active = activeRef.current;
+			if (active?.key !== cacheKey || active.slot !== slot) return;
+			const entry = entriesRef.current.get(cacheKey);
+			const parking = parkingRef.current;
+			activeRef.current = null;
+			if (!entry) return;
+			if (entry.discardOnDeactivate || !parking) {
+				entriesRef.current.delete(cacheKey);
+				entry.container.remove();
+				rerender();
+				return;
+			}
+			parkTerminal(entry, parking);
+			disposeIfUnlistedOnceParked(cacheKey);
+			rerender();
+		},
+		[disposeIfUnlistedOnceParked, rerender],
+	);
+
+	const update = useCallback(
+		(cacheKey: string, props: TerminalPaneProps) => {
+			const entry = entriesRef.current.get(cacheKey);
+			const cachedProps = { ...props, createMux: resolveCreateMux(props.session, props.terminalTarget) };
+			if (!entry || terminalPropsMatch(entry.props, cachedProps)) return;
+			entry.props = cachedProps;
+			rerender();
+		},
+		[muxPool, rerender],
+	);
+
+	const markFatal = useCallback(
+		(cacheKey: string, _message: string) => {
+			const entry = entriesRef.current.get(cacheKey);
+			if (!entry) return;
+			if (activeRef.current?.key !== cacheKey) {
+				removeEntry(cacheKey);
+				return;
+			}
+			// Renderer initialization failed. AttachedTerminal owns the visible
+			// error surface; mark the entry only so it is discarded when the user
+			// leaves instead of retaining an unusable renderer.
+			entry.discardOnDeactivate = true;
+		},
+		[removeEntry],
+	);
+
+	const markTerminalReady = useCallback(
+		(cacheKey: string, terminal: AttachableTerminal) => {
+			const entry = entriesRef.current.get(cacheKey);
+			if (!entry) return;
+			entry.terminal = terminal;
+			rerender();
+		},
+		[rerender],
+	);
+
+	// Daemon readiness and theme are shell-wide. Parked entries must observe
+	// them too so reconnect and rendering behavior never depends on the route
+	// that happened to be active when they were parked.
+	useEffect(() => {
+		let changed = false;
+		for (const entry of entriesRef.current.values()) {
+			if (entry.props.daemonReady === daemonReady && entry.props.theme === theme) continue;
+			entry.props = { ...entry.props, daemonReady, theme };
+			changed = true;
+		}
+		if (changed) rerender();
+	}, [daemonReady, rerender, theme]);
+
+	// Project/session teardown is an ownership boundary, not an LRU event.
+	// Dispose retained terminal clients as soon as the authoritative workspace
+	// snapshot no longer contains their logical session.
+	useEffect(() => {
+		if (!workspaceQuery.isSuccess) return;
+		const sessions = new Map(
+			(workspaceQuery.data ?? []).flatMap((workspace) =>
+				workspace.sessions.map((session) => [session.id, session] as const),
+			),
+		);
+		listedSessionsRef.current = new Set(sessions.keys());
+		for (const entry of entriesRef.current.values()) {
+			const session = entry.sessionId ? sessions.get(entry.sessionId) : undefined;
+			if (entry.sessionId && !session) {
+				// The terminal on screen is kept: its slot activates an entry only
+				// when it mounts, so disposing it would leave the pane empty for as
+				// long as the session stays open. A session can be on screen before
+				// the snapshot lists it (opened right after it was created, or in a
+				// project created elsewhere that the project list has not fetched
+				// yet). Once it leaves the screen it is disposed unless a snapshot
+				// lists it by then (disposeIfUnlistedOnceParked).
+				if (activeRef.current?.key === entry.cacheKey) continue;
+				removeEntry(entry.cacheKey);
+				continue;
+			}
+			if (entry.kind === "worker" && session?.cloud && session.mode === "chat") {
+				removeEntry(entry.cacheKey);
+				continue;
+			}
+			if (entry.kind === "worker" && session) {
+				const sessionGen = session.terminalGeneration ?? "";
+				const entryGen = entry.generation ?? "";
+				if (session.terminalHandleId !== entry.handleId) {
+					// A different handle is a different logical terminal: dispose. The
+					// handle is in the cache key, so the pane re-activates a fresh
+					// entry on its own.
+					removeEntry(entry.cacheKey);
+					continue;
+				}
+				const epochReprovisioned = entryGen !== "" && sessionGen !== "" && entryGen !== sessionGen;
+				if (epochReprovisioned) {
+					// The worker epoch moved BETWEEN two known values: a genuine
+					// re-provision (idle-resume or a silent restart). Bump the reset
+					// nonce so the pane rebuilds its cache entry and mux against the
+					// live box with a fresh cursor, exactly as a user restore does.
+					// Update the entry's recorded epoch first so this does not fire
+					// again on the next reconcile before the rebuild lands.
+					entry.generation = sessionGen;
+					useTerminalResetStore.getState().advanceEpoch(entry.sessionId ?? session.id);
+					continue;
+				}
+				if (entryGen === "" && sessionGen !== "") {
+					// Unknown -> first-known: the worker just came online for the SAME
+					// terminal. Adopt the epoch in place. The cache key does not carry
+					// the epoch, so this does NOT remount the just-attached pane (which
+					// would blank it: connected -> blank -> terminal).
+					entry.generation = sessionGen;
+				}
+			}
+			if (session && entry.props.session !== session) {
+				entry.props = { ...entry.props, session };
+				rerender();
+			}
+		}
+	}, [removeEntry, workspaceQuery.data, workspaceQuery.isSuccess]);
+
+	// Shell handles have their own lifecycle outside WorkspaceSession. Closing a
+	// shell must close its retained mux writer even if it was parked.
+	useEffect(() => {
+		if (!shellTerminalsQuery.isSuccess) return;
+		const shells = new Map(
+			(shellTerminalsQuery.data ?? []).map((terminal) => [terminal.handleId, terminal] as const),
+		);
+		for (const entry of entriesRef.current.values()) {
+			if (entry.kind !== "shell") continue;
+			const shell = shells.get(entry.handleId);
+			if (
+				!shell ||
+				shell.createdAt !== entry.generation ||
+				shell.sessionId !== entry.sessionId
+			) {
+				removeEntry(entry.cacheKey);
+				continue;
+			}
+			const target = entry.props.terminalTarget;
+			if (target?.kind === "shell" && target.title !== shell.title) {
+				entry.props = {
+					...entry.props,
+					terminalTarget: { ...target, title: shell.title },
+				};
+				rerender();
+			}
+		}
+	}, [removeEntry, shellTerminalsQuery.data, shellTerminalsQuery.isSuccess]);
+
+	// The provider is the final shell ownership boundary. React disposes the
+	// portals; remove their externally-created host nodes as well.
+	useEffect(
+		() => () => {
+			activeRef.current = null;
+			for (const entry of entriesRef.current.values()) entry.container.remove();
+			entriesRef.current.clear();
+			muxPool.dispose();
+		},
+		[muxPool],
+	);
+
+	const controller = useMemo<TerminalCacheController>(
+		() => ({ activate, deactivate, update, resolveCreateMux }),
+		[activate, deactivate, update, resolveCreateMux],
+	);
+
+	return (
+		<TerminalCacheContext.Provider value={controller}>
+			<div
+				ref={parkingRef}
+				aria-hidden="true"
+				className="pointer-events-none invisible fixed top-0 -left-[100000px]"
+				data-testid="terminal-cache-parking"
+			/>
+			{/* The parking ref must commit before routed children run their layout
+			    effects; those effects synchronously move the active container into
+			    the pane slot before the browser can paint. */}
+			{children}
+			{[...entriesRef.current.values()].map((entry) => (
+				<CachedTerminalPortal
+					active={activeRef.current?.key === entry.cacheKey}
+					entry={entry}
+					key={entry.cacheKey}
+					onFatal={markFatal}
+					onTerminalReady={markTerminalReady}
+				/>
+			))}
+		</TerminalCacheContext.Provider>
+	);
+}
+
+function CachedTerminalSlot({
+	descriptor,
+	props,
+}: {
+	descriptor: TerminalCacheDescriptor;
+	props: TerminalPaneProps;
+}) {
+	const cache = useContext(TerminalCacheContext);
+	const slotRef = useRef<HTMLDivElement | null>(null);
+
+	useLayoutEffect(() => {
+		const slot = slotRef.current;
+		if (!cache || !slot) return;
+		cache.activate(descriptor, props, slot);
+		return () => cache.deactivate(descriptor.cacheKey, slot);
+	}, [cache, descriptor.cacheKey, descriptor.handleId, descriptor.kind, descriptor.ownerKey, descriptor.sessionId]);
+
+	useLayoutEffect(() => {
+		cache?.update(descriptor.cacheKey, props);
+	}, [cache, descriptor.cacheKey, props]);
+
+	return <div className="h-full min-h-0 w-full" data-testid="session-terminal-slot" ref={slotRef} />;
+}
+
+const BOOT_SPINNER_FRAMES = ["|", "/", "-", "\\"];
+const BOOT_STATUS_STEPS = [
+	"Preparing the {subject}",
+	"Clearing a workspace",
+	"Warming up the agent",
+	"Untangling worktrees",
+	"Sharpening pencils",
+	"Waking the {subject}",
+	"Almost there",
+];
+
+function TerminalBootStatus({ subject, label }: { subject: string; label?: string }) {
+	const [tick, setTick] = useState(0);
+	useEffect(() => {
+		const id = window.setInterval(() => setTick((value) => value + 1), 120);
+		return () => window.clearInterval(id);
+	}, []);
+	const step = Math.min(Math.floor(tick / 15), BOOT_STATUS_STEPS.length - 1);
+	return (
+		<div className="flex items-center gap-2.5 text-terminal-dim" role="status" aria-live="polite">
+			<span aria-hidden="true" className="inline-block w-[1ch] shrink-0 text-center font-mono">{BOOT_SPINNER_FRAMES[tick % BOOT_SPINNER_FRAMES.length]}</span>
+			<span>{label ?? BOOT_STATUS_STEPS[step].replace("{subject}", subject)}</span>
+		</div>
+	);
+}
+
+export function TerminalPane({
+	session,
+	terminalGeneration,
+	theme,
+	daemonReady,
+	terminalTarget: requestedTerminalTarget,
+	fontSize,
+	onChangeFontSize,
+	isFullscreen,
+	onToggleFullscreen,
+	inputDisabled,
+	booting,
+	switchingLabel,
+	focusRequested,
+	onTerminalStateChange,
+	onTerminalContentReadyChange,
+	inputRequest,
+	onInputRequestResult,
+	createMux,
+}: TerminalPaneProps) {
+	const { t } = useTranslation();
+	const terminalTarget =
+		requestedTerminalTarget &&
+		terminalTargetBelongsToSession(requestedTerminalTarget, session?.id)
+			? requestedTerminalTarget
+			: ({ kind: "worker" } satisfies TerminalTarget);
+	const isOptimisticShell =
+		terminalTarget.kind === "shell" && terminalTarget.handleId.startsWith("pending-shell:");
+	const cache = useContext(TerminalCacheContext);
+	// Subscribe to this session's terminal-reset nonce so a restore (which bumps
+	// it) re-renders the pane and recomputes the descriptor/mux key below, forcing
+	// a fresh mount against the new worker epoch. Reading through the store hook is
+	// what makes the bump reactive; cacheDescriptor/resolveCreateMux read the same
+	// value non-reactively. Placed above the early returns so the hook order is
+	// stable regardless of the render path.
+	useTerminalResetStore((state) => (session?.id ? (state.nonces[session.id] ?? 0) : 0));
+	const terminalKey =
+		terminalTarget?.kind === "reviewer" || terminalTarget?.kind === "shell"
+			? terminalTarget.handleId
+			: `${session?.terminalHandleId ?? "empty"}:${session?.terminalGeneration ?? ""}`;
+
+	if (!window.ao) {
+		// A standalone shell has no agent and no branch, so it previews as a plain
+		// prompt rather than borrowing the session's agent transcript.
+		if (terminalTarget?.kind === "shell") {
+			return (
+				<pre
+					className="h-full overflow-auto bg-terminal p-4 font-mono leading-relaxed text-terminal"
+					style={{ fontSize }}
+				>
+					<span className="text-terminal-dim">{terminalTarget.title}</span> $ {"\n"}
+					<span className="text-terminal-dim">
+						{"(standalone shell — a live PTY here in the desktop app)"}
+						{"\n"}
+					</span>
+				</pre>
+			);
+		}
+		const provider = terminalTarget?.kind === "reviewer" ? terminalTarget.harness : (session?.provider ?? "claude");
+		const lines =
+			terminalTarget?.kind === "reviewer" ? reviewerPreviewLines(session) : workerPreviewLines(session, provider);
+		return (
+			<pre
+				className="h-full overflow-auto bg-terminal p-4 font-mono leading-relaxed text-terminal-foreground"
+				data-testid="session-terminal"
+				style={{ fontSize }}
+			>
+				<span className="text-terminal-dim">~/{session?.workspaceName ?? "reverbcode"}</span>{" "}
+				{session?.branch ? <span className="text-accent">{session.branch}</span> : null}
+				{session?.branch ? " " : ""}$ {provider}
+				{"\n"}
+				{lines.map((line, index) => (
+					<span
+						key={`${line}:${index}`}
+						className={
+							line.startsWith("PASS") || line.startsWith("DONE")
+								? "text-success"
+								: line.startsWith("WARN") || line.startsWith("TODO")
+									? "text-warning"
+									: line.startsWith("$") || line.startsWith("▲")
+										? "text-accent"
+										: "text-terminal-foreground"
+						}
+					>
+						{line}
+						{"\n"}
+					</span>
+				))}
+			</pre>
+		);
+	}
+	// The tab is intentionally selected before the daemon allocates its handle.
+	// Keep that short bridge visually indistinguishable from an empty terminal,
+	// rather than surfacing a separate loading state or attaching xterm to a
+	// handle that cannot exist yet.
+	if (isOptimisticShell) {
+		return (
+			<div
+				aria-label={t("terminal.shellAria")}
+				className="terminal-surface h-full"
+				data-testid="optimistic-terminal"
+			/>
+		);
+	}
+
+	const props = {
+		session,
+		theme,
+		daemonReady,
+		terminalTarget,
+		fontSize,
+		onChangeFontSize,
+		isFullscreen,
+		onToggleFullscreen,
+		inputDisabled,
+		booting,
+		switchingLabel,
+		focusRequested,
+		onTerminalStateChange,
+		onTerminalContentReadyChange,
+		inputRequest,
+		onInputRequestResult,
+		createMux,
+	};
+	const descriptor = cacheDescriptor(session, terminalTarget, terminalGeneration);
+	// The retained cache validates shells against the local daemon's shell list.
+	// A caller-owned transport may belong to another host.
+	if (cache && descriptor && !createMux) {
+		return <CachedTerminalSlot descriptor={descriptor} props={props} />;
+	}
+	// Reviewers mount fresh rather than through the cache, but a Cloud reviewer
+	// still runs in the sandbox: dial it through the control plane by its
+	// terminal ID. Without this it would reach the local daemon, which has no
+	// such terminal and reports it finished.
+	const attachedCreateMux = createMux ?? (cache && session?.cloud && terminalTarget.kind === "reviewer"
+		? cache.resolveCreateMux(session, terminalTarget)
+		: undefined);
+
+	return (
+		<AttachedTerminal
+			key={terminalKey}
+			session={session}
+			theme={theme}
+			daemonReady={daemonReady}
+			fontSize={fontSize}
+			isFullscreen={isFullscreen}
+			inputDisabled={inputDisabled}
+			booting={booting}
+			switchingLabel={switchingLabel}
+			onChangeFontSize={onChangeFontSize}
+			onToggleFullscreen={onToggleFullscreen}
+			focusRequested={focusRequested}
+			onTerminalStateChange={onTerminalStateChange}
+			onTerminalContentReadyChange={onTerminalContentReadyChange}
+			inputRequest={inputRequest}
+			onInputRequestResult={onInputRequestResult}
+			createMux={attachedCreateMux}
+			terminalTarget={terminalTarget}
+		/>
+	);
+}
+
+function workerPreviewLines(session: WorkspaceSession | undefined, provider: string): string[] {
+	if (session?.id === "ao-demo-orchestrator") {
+		return [
+			"> Go through my Linear backlog and let's plan which tasks to spawn off",
+			"",
+			"Ran 3 shell commands",
+			"",
+			"Here's the backlog triage. Half of it is already in flight — don't spawn those.",
+			"",
+			"Already covered — don't spawn (session → PR):",
+			"— terminal polish → PR #318, changes requested",
+			"— browser preview stack → PRs #319/#320, in review",
+			"— README screenshot assets → PR #323, approved and mergeable",
+			"",
+			"Plan: 3 sessions worth spawning",
+			"",
+			"┌───┬────────────────────┬──────────────────────────────────────────┬──────────────────────────────────┐",
+			"│ # │ Session            │ Scope                                    │ Why now                          │",
+			"├───┼────────────────────┼──────────────────────────────────────────┼──────────────────────────────────┤",
+			"│ 1 │ new-task-flake     │ NewTaskDialog smoke test flakes on Enter │ Failing PR #324's e2e; small fix │",
+			"│ 2 │ checkout-retries   │ e2e retries leak state between runs      │ Flakes 1-in-5 on CI; well scoped │",
+			"│ 3 │ session-pr-surface │ PR checks missing on board cards         │ Additive; touches board only     │",
+			"└───┴────────────────────┴──────────────────────────────────────────┴──────────────────────────────────┘",
+			"",
+			"Want me to spawn all three? I'd put #1–2 on codex and #3 on claude-code.",
+			"",
+			"> yes, spawn all three",
+			"",
+			"Running 3 shell commands…",
+			'└ $ ao spawn --project ao-demo --name "new-task-flake" --agent codex --prompt',
+			'  "Fix the flaky NewTaskDialog smoke test: submit is debounced 300ms while the',
+			'  e2e check asserts synchronously. Reproduce, fix, and push to update PR #324."',
+			"PASS 3 sessions spawned — board updated",
+		];
+	}
+	if (session?.id === "demo-review-stack") {
+		return [
+			'$ rg "previewUrl|Browser" frontend/src/renderer',
+			"frontend/src/renderer/components/SessionInspector.tsx: Browser tab selected after ao preview",
+			"frontend/src/renderer/hooks/useBrowserView.ts: preview revision re-navigates the view",
+			"$ ao preview http://localhost:5173",
+			"DONE preview target set for demo-review-stack",
+			"$ npm --prefix frontend run typecheck",
+			"PASS TypeScript project references are clean",
+			"TODO wait for reviewer on PR #320 before merging the stack",
+		];
+	}
+	if (session?.id === "demo-working") {
+		return [
+			`$ ${provider} --continue`,
+			"Reading renderer board and inspector components...",
+			"Updated demo workspace data for README screenshots",
+			"$ npm --prefix frontend test -- SessionsBoard SessionInspector",
+			"PASS 18 tests passed",
+			"DONE board has Working, Needs you, In review, and Ready to merge populated",
+		];
+	}
+	if (session?.id === "demo-needs-input") {
+		return [
+			"$ git diff --stat",
+			"frontend/src/renderer/components/TerminalPane.tsx | 41 +++++++++++++++++",
+			"frontend/src/renderer/styles.css                 | 27 +++++++++++",
+			"WARN reviewer requested a tighter terminal activity sample",
+			"TODO confirm whether to keep the toolbar density change",
+		];
+	}
+	if (session?.id === "demo-ci-failed") {
+		return [
+			"╭────────────────────────────────────────────╮",
+			"│ >_ OpenAI Codex (v0.133.0)                 │",
+			"│ model:        gpt-5.5 high  /model to change",
+			"│ directory:    ~/ao-demo/demo-new-task-flake",
+			"│ permissions:  YOLO mode                    │",
+			"╰────────────────────────────────────────────╯",
+			"",
+			"• I'll start from the failing check output, reproduce the Enter-submit",
+			"  path locally, then patch and push.",
+			"",
+			"• Ran npm test -- NewTaskDialog",
+			"└ PASS 12 tests passed",
+			"",
+			"▲ ao send · CI failed on PR #324. The failing checks are e2e (NewTaskDialog",
+			"  submits with Enter). Investigate and push a fix.",
+			"",
+			'• Ran rg -n "onKeyDown|Enter" src/components/NewTaskDialog.tsx',
+			'└ src/components/NewTaskDialog.tsx:88:  onKeyDown={(e) => e.key === "Enter" && scheduleSubmit()}',
+			"  src/components/NewTaskDialog.tsx:141: const scheduleSubmit = debounce(submit, 300)",
+			"  … +42 lines (ctrl + t to view transcript)",
+			"",
+			"Found it: submit is debounced 300ms, the check asserts immediately.",
+			"Patching the handler and re-running e2e…",
+		];
+	}
+	return [
+		`$ ${provider} --status`,
+		"Reading task context and local diff...",
+		"Running focused validation for the current session",
+		"PASS demo terminal is populated for screenshots",
+	];
+}
+
+function reviewerPreviewLines(session: WorkspaceSession | undefined): string[] {
+	return [
+		"$ ao review submit --session " + (session?.id ?? "demo-session"),
+		"Reviewing PR #319: browser preview rail renders inside AO",
+		"PASS implementation matches the requested README screenshot flow",
+		"Reviewing PR #320: stacked PR review rows",
+		"WARN keep multiple review rows visible before taking the screenshot",
+		"DONE submitted batched review results",
+	];
+}
+
+// Agents whose full-screen TUI keeps its own transcript and scrolls it only by
+// keyboard, ignoring SGR wheel reports. The terminal routes the wheel to
+// PageUp/PageDown for these (see XtermTerminal's paneScrollsByKeyboard).
+// kilocode and MiMo Code share opencode's TUI lineage; grok also uses a
+// full-screen keyboard-scroll TUI, so all scroll the same way. Muse Code uses
+// the normal terminal buffer instead and must keep the SGR -> tmux scroll path.
+const KEYBOARD_SCROLL_PROVIDERS = new Set(["opencode", "opencode-v2", "kilocode", "grok", "mimo-code"]);
+
+// Whether the given provider's TUI is one of the keyboard-scroll agents above.
+export function providerScrollsByKeyboard(provider?: string): boolean {
+	return provider ? KEYBOARD_SCROLL_PROVIDERS.has(provider) : false;
+}
+
+function bannerText(
+	state: TerminalSessionState,
+	t: TFunction,
+	hasAttached: boolean,
+	isCloud: boolean,
+	error?: string,
+): string | undefined {
+	// Cloud only: before the first successful open (the sandbox worker is still
+	// coming up), the centered connecting cover owns the "Connecting" message, so
+	// suppress the top-left banner entirely to avoid a second overlapping loader.
+	// A local terminal keeps its original "disconnected — reattaching" wording.
+	if (state === "reattaching") {
+		return isCloud && !hasAttached ? undefined : t("terminal.reattaching");
+	}
+	if (state === "error") return t("terminal.error", { error: error ?? t("terminal.connectionFailed") });
+	return undefined;
+}
+
+function AttachedTerminal({
+	session,
+	theme,
+	daemonReady,
+	terminalTarget,
+	fontSize,
+	onChangeFontSize,
+	isFullscreen,
+	onToggleFullscreen,
+	inputDisabled,
+	booting,
+	switchingLabel,
+	focusRequested,
+	onTerminalStateChange,
+	onTerminalContentReadyChange,
+	inputRequest,
+	onInputRequestResult,
+	createMux,
+	isVisible = true,
+	onFatal,
+	onTerminalReady,
+}: TerminalPaneProps & {
+	isVisible?: boolean;
+	onFatal?: (message: string) => void;
+	onTerminalReady?: (terminal: AttachableTerminal) => void;
+}) {
+	const { t } = useTranslation();
+	const { baseUrl: cloudBaseUrl } = useCloudCp();
+	const cloudBaseUrlRef = useRef(cloudBaseUrl);
+	cloudBaseUrlRef.current = cloudBaseUrl;
+	// A file dropped on a cloud terminal is uploaded to the session and placed
+	// in its sandbox, so the path typed at the prompt is one the agent can open.
+	// Only while the control plane takes files (attachments in the session
+	// organization's offering): otherwise a cloud terminal takes no drops, since
+	// a path on this machine means nothing in the sandbox.
+	const cloudSessionId = session?.cloud ? session.id : undefined;
+	const cloudOrgId = session?.cloud?.orgId;
+	const cloudAttachmentMaxBytes = useCloudOffering(Boolean(cloudSessionId), cloudOrgId).maxAttachmentBytes;
+	const cloudDropsAccepted = cloudAttachmentMaxBytes !== undefined;
+	const saveCloudDrop = useMemo(() => {
+		if (!cloudSessionId || !cloudOrgId) return undefined;
+		if (!cloudDropsAccepted) return null;
+		return async (file: { name: string; bytes: Uint8Array }) => {
+			const baseUrl = cloudBaseUrlRef.current;
+			const attachment = await uploadCloudAttachment(baseUrl, cloudOrgId, cloudSessionId, file);
+			return placeCloudAttachment(baseUrl, cloudOrgId, cloudSessionId, attachment.id);
+		};
+	}, [cloudDropsAccepted, cloudOrgId, cloudSessionId]);
+	const attachSession =
+		terminalTarget?.kind === "shell"
+			? undefined
+			: session && terminalTarget?.kind === "reviewer"
+			? { ...session, terminalHandleId: terminalTarget.handleId }
+			: session;
+	// One terminal instance per logical-terminal + handle generation. The shell
+	// cache retains this component across route switches; a replacement handle
+	// gets a new component rather than inheriting stale screen/input state.
+	const [terminal, setTerminal] = useState<AttachableTerminal | null>(null);
+	const [hasVisibleContent, setHasVisibleContent] = useState(false);
+	const lastInputRequestIdRef = useRef<number | null>(null);
+	const [initFailed, setInitFailed] = useState(false);
+	const [isRestoring, setIsRestoring] = useState(false);
+	const [restoreError, setRestoreError] = useState<string | undefined>();
+	const [restoreUnavailable, setRestoreUnavailable] = useState(false);
+	const queryClient = useQueryClient();
+	const restoreSessionById = useRestoreSession();
+	// A shell pane has no session, so it hands the hook its handle directly
+	// instead of reading one off `attachSession`.
+	const shellTerminalHandleId = terminalTarget?.kind === "shell" ? terminalTarget.handleId : undefined;
+	const { attach, state, error, replaySettled, hasAttached, syncVisibleSize } = useTerminalSession(attachSession, {
+		coverInitialReplay: terminalTarget?.kind !== "reviewer",
+		// Cloud workers can acknowledge a terminal before the coding agent emits
+		// its first screen. Keep the loading surface visible through that gap.
+		waitForInitialOutput: Boolean(attachSession?.cloud),
+		createMux,
+		daemonReady,
+		exitNotice:
+			terminalTarget?.kind === "reviewer"
+				? "\r\n\x1b[2m[reviewer terminal finished]\x1b[0m"
+				: terminalTarget?.kind === "shell"
+					? undefined
+					: "",
+		inputDisabled,
+		isVisible,
+		shellTerminalHandleId,
+	});
+	useEffect(() => {
+		onTerminalStateChange?.(state);
+	}, [onTerminalStateChange, state]);
+	const cloudReviewExitAwaitingStatus = Boolean(
+		state === "exited" &&
+			session?.cloud &&
+			terminalTarget?.kind === "reviewer" &&
+			(!terminalTarget.reviewStatus ||
+				terminalTarget.reviewStatus === "running" ||
+				terminalTarget.reviewStatus === "complete"),
+	);
+	useEffect(() => {
+		if (!cloudReviewExitAwaitingStatus) return;
+		// A successful Cloud reviewer submits its result immediately before the
+		// dedicated PTY closes. Refresh the durable run state now so the transport
+		// exit is not mistaken for a failed review while the normal poll catches up.
+		void queryClient.invalidateQueries({ queryKey: ["cloud-session-reviews"] });
+	}, [cloudReviewExitAwaitingStatus, queryClient]);
+	// The immediate reconnecting signal a restore/resume sets (terminal-reset
+	// store). Reactive so the "Connecting…" surface shows the instant restore is
+	// clicked, before the polled runtimeConnected catches up; cleared once the
+	// worker actually connects (not merely when the PTY attaches).
+	const isReconnecting = useTerminalResetStore((store) =>
+		session?.id ? Boolean(store.reconnecting[session.id]) : false,
+	);
+	// The fresh box is genuinely up only once a NEW worker epoch appears past the
+	// one recorded at restore (baselineEpoch). The session DTO reports the current
+	// epoch as terminalGeneration = MAX(agent terminal worker_epoch). Gating on the
+	// epoch — NOT runtimeConnected — is what makes a rapid delete→restore correct:
+	// the old worker's connection lingers for ~10s (so runtimeConnected stays true
+	// and a runtimeConnected-based latch lifts early), and the only attachable
+	// terminal in the provision+boot gap is the OLD epoch's — content shows but its
+	// box is being torn down, so you cannot type. Clear the reconnecting signal the
+	// instant the epoch advances past the baseline, which is also when the pane
+	// re-mints against the new epoch (terminalGeneration drives the mux key).
+	const currentEpoch = session?.terminalGeneration ? Number(session.terminalGeneration) || 0 : 0;
+	const baselineEpoch = useTerminalResetStore((store) =>
+		session?.id ? (store.baselineEpoch[session.id] ?? 0) : 0,
+	);
+	useEffect(() => {
+		if (isReconnecting && session?.id && currentEpoch > baselineEpoch) {
+			useTerminalResetStore.getState().markConnected(session.id);
+		}
+	}, [isReconnecting, currentEpoch, baselineEpoch, session?.id]);
+	useEffect(() => {
+		if (!terminal || state !== "attached" || !inputRequest) return;
+		if (lastInputRequestIdRef.current === inputRequest.id) return;
+		const accepted = terminal.sendUserInput(inputRequest.data);
+		if (accepted) lastInputRequestIdRef.current = inputRequest.id;
+		onInputRequestResult?.(inputRequest.id, accepted);
+	}, [inputRequest, onInputRequestResult, state, terminal]);
+	// xterm's write callback means the replay has been parsed, not that the
+	// browser has painted its final viewport. Keep the first-load cover mounted
+	// through the same render/paint preparation used when activating a retained
+	// terminal; otherwise large TUI replays can visibly repaint from their first
+	// row immediately after the loading cover disappears.
+	const [replayPaintPending, setReplayPaintPending] = useState(!replaySettled);
+	useLayoutEffect(() => {
+		if (!replaySettled) {
+			setReplayPaintPending(true);
+			return;
+		}
+		if (!replayPaintPending || !terminal) return;
+		let current = true;
+		void terminal.prepareForActivation().then(() => {
+			if (current) setReplayPaintPending(false);
+		});
+		return () => {
+			current = false;
+		};
+	}, [replayPaintPending, replaySettled, terminal]);
+	useEffect(() => {
+		if (!attachSession?.cloud) return;
+		onTerminalContentReadyChange?.(
+			(hasAttached && replaySettled && !replayPaintPending && hasVisibleContent)
+			|| state === "error" || state === "exited" || initFailed,
+		);
+	}, [attachSession?.cloud, hasAttached, hasVisibleContent, initFailed, onTerminalContentReadyChange, replayPaintPending, replaySettled, state]);
+	const handleId = shellTerminalHandleId ?? attachSession?.terminalHandleId;
+	const handleRetry = useCallback(() => {
+		// Re-attach from scratch: resets the connect-failure counter and starts a
+		// fresh connection attempt once the user has fixed their network policy.
+		if (terminal) attach(terminal);
+	}, [attach, terminal]);
+	const provider =
+		terminalTarget?.kind === "reviewer"
+			? terminalTarget.harness
+			: terminalTarget?.kind === "shell"
+				? undefined
+				: session?.provider;
+	const isSessionActive = session ? sessionIsActive(session) : false;
+	// A standalone shell is never restorable: there is no session row to restore.
+	const canRestoreSession =
+		terminalTarget?.kind !== "reviewer" &&
+		terminalTarget?.kind !== "shell" &&
+		session !== undefined &&
+		!isSessionActive;
+
+	const handleReady = useCallback((handle: AttachableTerminal) => {
+		setTerminal(handle);
+	}, []);
+	useLayoutEffect(() => {
+		if (terminal) onTerminalReady?.(terminal);
+	}, [onTerminalReady, terminal]);
+	const handleInitError = useCallback((err: unknown) => {
+		console.error("xterm failed to initialize", err);
+		void captureRendererException(err, { source: "terminal-init", operation: "xterm_init" });
+		setInitFailed(true);
+	}, []);
+	useEffect(() => {
+		if (initFailed) {
+			onFatal?.("renderer initialization failed");
+			onTerminalStateChange?.("error");
+			return;
+		}
+	}, [initFailed, onFatal, onTerminalStateChange]);
+	const handleLinkOpen = useSessionBrowserLink(session);
+	const handleSessionLinkOpen = useSessionLinkNavigation(session?.hostId);
+	const restoreSession = useCallback(async () => {
+		if (!session?.id || !canRestoreSession || isRestoring) return;
+		setIsRestoring(true);
+		setRestoreError(undefined);
+		try {
+			const result = await restoreSessionById(session.id, session.hostId);
+			if (result.status === "not_resumable") {
+				setRestoreUnavailable(true);
+				return;
+			}
+			if (result.status === "error") {
+				setRestoreError(result.message);
+			}
+		} catch (err) {
+			setRestoreError(err instanceof Error ? err.message : t("terminal.unableRestore"));
+		} finally {
+			setIsRestoring(false);
+		}
+	}, [canRestoreSession, isRestoring, restoreSessionById, session?.hostId, session?.id, t]);
+
+	useEffect(() => {
+		if (!terminal) return;
+		let current = true;
+		let detach: (() => void) | undefined;
+		// A new xterm starts at its constructor default (80×24). Opening the PTY
+		// before FitAddon has measured its real slot makes full-screen worker TUIs
+		// redraw once at 80×24 and again at the actual grid. Settle that first fit
+		// before attaching so the daemon receives only the authoritative size.
+		void terminal.prepareForActivation().then(() => {
+			if (!current) return;
+			detach = attach(terminal);
+		});
+		return () => {
+			current = false;
+			detach?.();
+		};
+	}, [terminal, handleId, attach, attachSession?.id]);
+
+	if (initFailed) {
+		return (
+			<div className="terminal-surface grid h-full place-items-center p-4 font-mono text-xs text-muted-foreground">
+				{t("terminal.initFailed")}
+			</div>
+		);
+	}
+
+	// A cloud pane that hit the connect-failure breaker (ticket minted but the
+	// WebSocket kept failing) shows a dedicated retryable overlay instead of the
+	// generic banner. Any other error (PTY crash, pane error) keeps the banner.
+	const isCloudConnectError =
+		state === "error" &&
+		Boolean(attachSession?.cloud) &&
+		!hasAttached &&
+		Boolean(error?.includes("WebSocket cannot connect"));
+	const banner = isCloudConnectError
+		? undefined
+		: bannerText(state, t, hasAttached, Boolean(attachSession?.cloud), error);
+	const showEmptyState = !handleId;
+	// Cover xterm while the attachment buffers the initial replay, so the pane
+	// appears already drawn at the tail instead of visibly scrolling down to it.
+	// Deliberately NOT the empty state above: that renders a centered "Starting
+	// session" card, and flashing it on every session switch would be worse than
+	// the scroll it replaces.
+	// Only while a replay is actually imminent. Gating on the state as well as
+	// the gate keeps the cover from reappearing over a pane that is visibly
+	// disconnected: an open timeout lifts it, the backoff reconnect would
+	// otherwise pull it straight back down, and the "reattaching" banner already
+	// explains that window better than a blank overlay does.
+	const showReplayCover =
+		Boolean(handleId) &&
+		(!replaySettled || replayPaintPending) &&
+		(state === "connecting" || state === "attached");
+	// A restored or resuming cloud session brings up a FRESH box (a new sandbox /
+	// container) that rehydrates the saved context. Until its worker connects,
+	// show a calm "Connecting…" instead of the previous box's dead terminal or
+	// the "process exited" strip: the user is connecting to a new box with their
+	// saved state, not looking at a broken session. Lifts the instant the new
+	// terminal attaches. Cloud only, so local terminals are unchanged.
+	// Show the Connecting cover for a restore in flight: from the restore click
+	// (isReconnecting, set synchronously) until the fresh worker's epoch appears
+	// past the baseline (isReconnecting is then cleared, above). This spans the
+	// entire provision+boot gap in which the only attachable terminal is the old,
+	// dead epoch's — so the user sees a calm "Connecting" the whole time instead of
+	// a terminal they cannot type into, and it never flickers back once the new
+	// epoch attaches (the epoch only moves forward). Cloud only.
+	const isBoxComingUp = Boolean(session?.cloud) && isReconnecting;
+	// The single connecting state for a cloud terminal: ONE opaque centered
+	// "Connecting" cover from first connect (or a restore box coming up) until the
+	// pane has been fully revealed once (attached, replay painted, content visible). It is
+	// LATCHED on that first reveal so a later transient reconnect (hasAttached
+	// briefly flips back to false) never flashes the cover back over an
+	// already-visible terminal. The latch resets when the terminal identity
+	// changes (a new session) so a fresh box connects cleanly again. It is keyed
+	// on the handle only, NOT the worker epoch: the epoch flips from unknown to its
+	// first value the instant the worker comes online, and keying on it would reset
+	// the latch and re-show the cover over an already-revealed pane (the second
+	// blank). A real re-provision (idle-resume or restore) remounts this component
+	// outright, giving a fresh latch anyway. Cloud only; local panes keep their
+	// existing messageless replay cover and reattaching banner. The top-right timer
+	// lives in SessionView's CloudLifecycleStatus.
+	const cloudTerminalIdentity = `${handleId ?? ""}`;
+	const cloudRevealedIdentityRef = useRef(cloudTerminalIdentity);
+	const cloudRevealedRef = useRef(false);
+	if (cloudRevealedIdentityRef.current !== cloudTerminalIdentity) {
+		cloudRevealedIdentityRef.current = cloudTerminalIdentity;
+		cloudRevealedRef.current = false;
+	}
+	if (hasAttached && replaySettled && !replayPaintPending && hasVisibleContent) cloudRevealedRef.current = true;
+	// Also when the agent exited but its pane survived on a keep-alive: the mux
+	// never reports "exited" there, so without this the strip — and the resume
+	// action on it — stays hidden in exactly the state that needs it (#3875).
+	const showEndedStatePreview =
+		state === "exited" || canRestoreSession || (terminalTarget?.kind === "worker" && sessionAgentExited(session));
+	const isCloudConnecting =
+		Boolean(attachSession?.cloud) &&
+		!isCloudConnectError &&
+		!showEmptyState &&
+		!showEndedStatePreview &&
+		!cloudRevealedRef.current;
+	// A terminal the move covered stays covered until the agent draws its first
+	// frame, even after the move commits. ponytail: no timeout; an agent that
+	// never draws exits, and the exited state ends the cover.
+	const switchingHeldRef = useRef<string | undefined>(undefined);
+	if (switchingLabel && !hasVisibleContent) switchingHeldRef.current = switchingLabel;
+	if (hasVisibleContent || state === "exited" || state === "error") switchingHeldRef.current = undefined;
+	const coverLabel = switchingLabel ?? switchingHeldRef.current;
+	const switchingCover = Boolean(coverLabel) && !hasVisibleContent && state !== "exited" && state !== "error";
+	// A Cloud session's terminated row is explained by the session view's own
+	// Cloud notice, and its socket also closes for a pause, a handoff or a
+	// reviewer whose verdict is still landing, so the strip shows there only
+	// for the exit the control plane recorded: the agent process gone in a
+	// live session.
+	const cloudEnded = Boolean(session?.cloud) && terminalTarget?.kind !== "reviewer" && terminalTarget?.kind !== "shell" && sessionAgentExited(session);
+	const showEndedState = showEndedStatePreview && (!session?.cloud || cloudEnded) && !isBoxComingUp && !booting && !coverLabel;
+
+	return (
+		<div className="terminal-surface flex h-full min-h-0 flex-col" data-testid="session-terminal">
+			{showEndedState && (
+				<TerminalEndedStrip
+					canRestore={canRestoreSession && !session?.cloud}
+					error={restoreError}
+					isRestoring={isRestoring}
+					onRestore={restoreSession}
+					session={session}
+					variant={
+						terminalTarget?.kind === "reviewer" ? "reviewer" : terminalTarget?.kind === "shell" ? "shell" : "session"
+					}
+					reviewStatus={terminalTarget?.kind === "reviewer" ? terminalTarget.reviewStatus : undefined}
+				/>
+			)}
+			{/* Keep a small gutter where terminal output starts, but let xterm use the
+			    full top/right/bottom extent. The host fills the remaining
+			    content box, so FitAddon still measures it correctly and the absolute
+			    overlays (empty state, banner) keep covering the full padding box. */}
+			<div className="relative min-h-0 flex-1 pl-2">
+				<LazyChunkBoundary>
+				<Suspense fallback={null}>
+				<XtermTerminal
+					ariaLabel={terminalTarget?.kind === "shell" ? t("terminal.shellAria") : t("terminal.sessionAria")}
+					saveDroppedFile={saveCloudDrop}
+					droppedFileMaxBytes={saveCloudDrop && cloudAttachmentMaxBytes !== undefined ? Math.min(cloudAttachmentMaxBytes, MAX_CLOUD_CP_BINARY_BYTES) : undefined}
+					fontSize={fontSize}
+					focusRequested={focusRequested}
+					isFullscreen={isFullscreen}
+					isVisible={isVisible}
+					onChangeFontSize={onChangeFontSize}
+					onError={handleInitError}
+					onLinkOpen={handleLinkOpen}
+					onSessionLinkOpen={handleSessionLinkOpen}
+					onReady={handleReady}
+					onVisibleContent={() => setHasVisibleContent(true)}
+					onToggleFullscreen={onToggleFullscreen}
+					onVisibleSize={syncVisibleSize}
+					// Only session panes, where new shell tabs open. Settings login and
+					// onboarding terminals have other sizes and must not set the hint.
+					onGridChange={session ? rememberPaneTerminalGrid : undefined}
+					paneScrollsByKeyboard={providerScrollsByKeyboard(provider)}
+					supportsCursorColorScheme={provider === "cursor"}
+					theme={theme}
+				/>
+				</Suspense>
+				</LazyChunkBoundary>
+				{(showEmptyState || booting || switchingCover) && (
+					<div className="terminal-surface absolute inset-0 grid place-items-center font-mono text-control">
+						{session ? (
+							<TerminalBootStatus subject={session.kind === "orchestrator" ? "orchestrator" : "agent"} label={coverLabel} />
+						) : (
+							<div className="text-center">
+								<div className="text-terminal">{"Orchestrator"}</div>
+								<div className="mt-2 text-terminal-dim">{t("terminal.noSessionSelected")}</div>
+							</div>
+						)}
+					</div>
+				)}
+				{isCloudConnecting && (
+					<div
+						className="terminal-surface absolute inset-0 grid place-items-center font-mono text-control"
+						data-testid="terminal-connecting-cover"
+					>
+						<div className="text-terminal">{t("terminal.connecting")}</div>
+					</div>
+				)}
+				{showReplayCover && !isCloudConnecting && (
+					<ReplayCover message={attachSession?.cloud ? t("terminal.connecting") : undefined} />
+				)}
+				{isCloudConnectError && <CloudConnectError onRetry={handleRetry} />}
+				{banner && !showEndedState && (
+					<div className="absolute inset-x-3 top-2 rounded-md border border-border bg-surface/95 px-3 py-1.5 font-mono text-caption text-muted-foreground">
+						{banner}
+					</div>
+				)}
+			</div>
+			{session && (
+				<RestoreUnavailableDialog
+					open={restoreUnavailable}
+					session={session}
+					onOpenChange={setRestoreUnavailable}
+					onRecreated={async () => {
+						await queryClient.invalidateQueries({ queryKey: workspaceQueryKeyForHost(session.hostId) });
+					}}
+				/>
+			)}
+		</div>
+	);
+}
+
+// Shown when a cloud terminal ticket was issued but the WebSocket permanently
+// failed to connect (proxy/firewall/CSP block). Distinct from a PTY error: it
+// is recoverable, so the user can retry once their network policy is fixed
+// without a full page reload.
+function CloudConnectError({ onRetry }: { onRetry: () => void }) {
+	const { t } = useTranslation();
+	return (
+		<div className="absolute inset-0 z-10 grid place-items-center bg-terminal-opaque pointer-events-auto">
+			<div className="flex max-w-sm flex-col items-center gap-4 rounded-lg border border-border bg-surface p-6 text-center shadow-lg">
+				<div className="font-mono text-sm font-medium text-foreground">{t("terminal.cloudConnectTitle")}</div>
+				<div className="text-xs leading-relaxed text-muted-foreground">{t("terminal.cloudConnectDescription")}</div>
+				<Button
+					type="button"
+					id="cloud-terminal-retry"
+					className="font-mono"
+					onClick={onRetry}
+					size="sm"
+					variant="secondary"
+				>
+					<RotateCcw className="size-3" aria-hidden="true" />
+					{t("terminal.cloudConnectRetry")}
+				</Button>
+			</div>
+		</div>
+	);
+}
+
+function ReplayCover({ message }: { message?: string }) {
+	return (
+		// xterm remains live underneath. Cloud startup has no meaningful output
+		// until the agent TUI draws, so it gets one continuous Connecting surface;
+		// local replay stays deliberately silent to avoid covering settled output.
+		<div
+			aria-hidden={message ? undefined : "true"}
+			className="bg-terminal-opaque pointer-events-none absolute inset-0 grid place-items-center"
+			data-testid="terminal-replay-cover"
+		>
+			{message ? <span className="font-mono text-sm text-terminal-dim">{message}</span> : null}
+		</div>
+	);
+}
+
+type TerminalEndedStripProps = {
+	canRestore: boolean;
+	error?: string;
+	isRestoring: boolean;
+	onRestore: () => void;
+	reviewStatus?: "running" | "complete" | "delivered" | "failed" | "cancelled";
+	session?: WorkspaceSession;
+	variant: "reviewer" | "session" | "shell";
+};
+
+function TerminalEndedStrip({ canRestore, error, isRestoring, onRestore, reviewStatus, session, variant }: TerminalEndedStripProps) {
+	const { t } = useTranslation();
+	const reviewDelivered = variant === "reviewer" && reviewStatus === "delivered";
+	const terminated = variant === "session" && session && !sessionIsActive(session);
+	const agentExited = variant === "session" && sessionAgentExited(session);
+	const startupFailed = variant === "session" && session?.provisionState === "failed";
+	const heading = reviewDelivered
+		? t("terminal.reviewCompleted")
+		: startupFailed
+			? t("terminal.startupFailed")
+			: terminated
+				? t("terminal.sessionTerminated")
+				: agentExited
+					? t("terminal.agentExited")
+					: t("terminal.ended");
+	const message = reviewDelivered
+		? t("terminal.reviewerCompleted")
+		: canRestore
+		? t("terminal.restoreToContinue")
+		: variant === "reviewer"
+			? t("terminal.reviewerEnded")
+			: variant === "shell"
+				? t("terminal.shellExited")
+				: t("terminal.sessionEndedNotTerminated");
+
+	return (
+		<div className="shrink-0 border-b border-border bg-surface/80 px-4 py-2">
+			<div className="flex min-h-control-board flex-wrap items-center gap-3">
+				<div className="min-w-0">
+					<div
+						className={cn(
+							"font-mono text-caption font-medium uppercase tracking-wide-md",
+							terminated || startupFailed ? "text-destructive" : "text-muted-foreground",
+						)}
+					>
+						{heading}
+					</div>
+					<div className="mt-0.5 text-xs text-muted-foreground">
+						{startupFailed && session?.provisionError ? session.provisionError : agentExited ? t("terminal.agentExitedHelp") : message}
+					</div>
+				</div>
+				{error && <div className="max-w-content-max truncate text-xs text-destructive">{error}</div>}
+				{variant === "session" && session ? <ResumeAgentControl session={session} /> : null}
+				{canRestore && (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<span className="inline-flex">
+								<Button
+									type="button"
+									aria-label={t("terminal.restoreSession")}
+									disabled={isRestoring}
+									onClick={onRestore}
+									variant="secondary"
+								>
+									<RotateCcw className={cn("size-icon-base", isRestoring && "animate-spin")} aria-hidden="true" />
+									{t("terminal.restoreSession")}
+								</Button>
+							</span>
+						</TooltipTrigger>
+						<TooltipContent side="bottom">{t("terminal.restoreSession")}</TooltipContent>
+					</Tooltip>
+				)}
+			</div>
+		</div>
+	);
+}

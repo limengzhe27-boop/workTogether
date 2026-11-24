@@ -1,0 +1,2085 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"golang.org/x/sync/singleflight"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/deliverytelemetry"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
+	"github.com/aoagents/agent-orchestrator/backend/internal/observe/ownership"
+	"github.com/aoagents/agent-orchestrator/backend/internal/observe/sentryobs"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/reqid"
+	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
+	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/sessionartifacts"
+	"github.com/aoagents/agent-orchestrator/backend/internal/telemetrymeta"
+)
+
+const maxDisplayNameLen = 100
+
+// Store is the read-only persistence surface needed to assemble controller-facing session read models.
+type Store interface {
+	GetSessionCleanupFacts(ctx context.Context, id domain.SessionID) (domain.SessionCleanupRecord, bool, error)
+	ListSessionCleanupFactsForSessions(ctx context.Context, ids []domain.SessionID) (map[domain.SessionID]domain.SessionCleanupRecord, error)
+	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
+	GetSessionByClientRequestID(ctx context.Context, id string) (domain.SessionRecord, bool, error)
+	ListSessions(ctx context.Context, project domain.ProjectID) ([]domain.SessionRecord, error)
+	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	RenameSession(ctx context.Context, id domain.SessionID, displayName string, updatedAt time.Time) (bool, error)
+	RenameSessionIfDisplayName(ctx context.Context, id domain.SessionID, currentDisplayName, displayName string, updatedAt time.Time) (bool, error)
+	SetSessionPreviewURL(ctx context.Context, id domain.SessionID, previewURL string, updatedAt time.Time) (bool, error)
+	SetSessionTerminateOnPRMerge(ctx context.Context, id domain.SessionID, terminate bool, updatedAt time.Time) (bool, error)
+	SetSessionAutoInjectReview(ctx context.Context, id domain.SessionID, autoInject bool, updatedAt time.Time) (bool, error)
+	SetSessionAutoInjectCI(ctx context.Context, id domain.SessionID, autoInject bool, updatedAt time.Time) (bool, error)
+	SetSessionPinned(ctx context.Context, id domain.SessionID, isPinned bool, pinnedAt *time.Time, updatedAt time.Time) (bool, error)
+	SetSessionReviewerConfig(ctx context.Context, id domain.SessionID, harness domain.ReviewerHarness, config domain.AgentConfig, updatedAt time.Time) (bool, error)
+	SetSessionAutoReview(ctx context.Context, id domain.SessionID, enabled bool, updatedAt time.Time) (bool, error)
+	GetDisplayPRFactsForSession(ctx context.Context, id domain.SessionID) (domain.PRFacts, bool, error)
+	ListPRFactsForSession(ctx context.Context, id domain.SessionID) ([]domain.PRFacts, error)
+	ListPRFactsForSessions(ctx context.Context, ids []domain.SessionID) (map[domain.SessionID][]domain.PRFacts, error)
+	ListCurrentHeadReviewRunsForSession(ctx context.Context, id domain.SessionID) ([]domain.CurrentHeadReviewRun, error)
+	ListCurrentHeadReviewRunsForSessions(ctx context.Context, ids []domain.SessionID) (map[domain.SessionID][]domain.CurrentHeadReviewRun, error)
+	ListInterruptedSessions(ctx context.Context, ids []domain.SessionID) (map[domain.SessionID]bool, error)
+	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
+	ListReportedPRURLs(ctx context.Context, id domain.SessionID) ([]string, error)
+	ListRepositoryRenames(ctx context.Context) ([]domain.RepositoryRename, error)
+	ListSessionWorktrees(ctx context.Context, id domain.SessionID) ([]domain.SessionWorktreeRecord, error)
+	ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error)
+	ListPRReviews(ctx context.Context, prURL string) ([]domain.PullRequestReview, error)
+	ListPRReviewThreads(ctx context.Context, prURL string) ([]domain.PullRequestReviewThread, error)
+	ListPRComments(ctx context.Context, prURL string) ([]domain.PullRequestComment, error)
+	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
+	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
+}
+
+// ListFilter captures API-facing session list query filters.
+type ListFilter struct {
+	ProjectID        domain.ProjectID
+	Active           *bool
+	OrchestratorOnly bool
+	Fresh            bool
+	// Kind keeps one kind of session. KindWorker matches every session that is
+	// not an orchestrator, so rows written before kinds existed still list.
+	Kind domain.SessionKind
+	// Limit pages the list: at most Limit sessions, pinned first and then most
+	// recently updated, resuming after Cursor. Zero lists every match in store
+	// order, as before paging.
+	Limit  int
+	Cursor string
+}
+
+// commander is the command-side surface Service delegates to: the
+// *sessionmanager.Manager in production, a fake in tests.
+type commander interface {
+	Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, int, int, error)
+	RunBackgroundTask(ctx context.Context, id domain.SessionID, systemPrompt, prompt string) (string, error)
+	RestoreWithMode(ctx context.Context, id domain.SessionID) (sessionmanager.RestoreResult, error)
+	ResumeAgentWithMode(ctx context.Context, id domain.SessionID) (sessionmanager.RestoreResult, error)
+	Kill(ctx context.Context, id domain.SessionID) (bool, error)
+	RequestKill(ctx context.Context, id domain.SessionID) (sessionmanager.KillResult, error)
+	RetireForReplacement(ctx context.Context, id domain.SessionID) error
+	WaitForMessageDeliveryReady(ctx context.Context, id domain.SessionID) error
+	Send(ctx context.Context, id domain.SessionID, message string, attachment *ports.SpawnAttachment) error
+	SendWithOptions(ctx context.Context, id domain.SessionID, message string, attachment *ports.SpawnAttachment, options ports.MessageDeliveryOptions) error
+	Cleanup(ctx context.Context, project domain.ProjectID) (sessionmanager.CleanupResult, error)
+	RollbackSpawn(ctx context.Context, id domain.SessionID) (deleted, killed bool, err error)
+	StageAttachments(ctx context.Context, id domain.SessionID, attachments []ports.SpawnAttachment) ([]string, error)
+	PrepareTaskWorkspace(context.Context, domain.ProjectRecord) (domain.TaskPreparationToken, error)
+	CancelTaskPreparation(context.Context, domain.TaskPreparationToken) error
+}
+
+// interfaceTransitionCommander is an optional command capability. Keeping it
+// separate avoids widening every focused session-service fake while production
+// can expose the feature through the concrete Session Manager.
+type interfaceTransitionCommander interface {
+	InterfaceTransitionStatus(context.Context, domain.SessionID) (sessionmanager.InterfaceTransitionStatus, error)
+	StartInterfaceTransition(context.Context, domain.SessionID, domain.SessionMode, domain.SessionInterfaceTransitionPolicy, domain.SessionInterfaceTransitionHistoryPolicy) (domain.SessionInterfaceTransition, error)
+	CancelInterfaceTransition(context.Context, domain.SessionID) error
+	AcknowledgeInterfaceTransitionNotice(context.Context, domain.SessionID, string) (domain.SessionInterfaceTransition, error)
+}
+
+// exitAgentCommander keeps the process-only lifecycle optional for focused
+// service fakes while production delegates to Session Manager.
+type exitAgentCommander interface {
+	ExitAgent(context.Context, domain.SessionID) (domain.SessionRecord, error)
+}
+
+// agentAccountCommander keeps account moves optional for focused service fakes.
+type agentAccountCommander interface {
+	StartAccountTransition(context.Context, domain.SessionID, string, domain.SessionInterfaceTransitionPolicy) (domain.SessionInterfaceTransition, error)
+}
+
+// RollbackOutcome reports what happened in a rollback: either the seed row was
+// deleted, or the partially-spawned session was killed (runtime+workspace torn
+// down, row marked terminated).
+type RollbackOutcome struct {
+	Deleted bool `json:"deleted"`
+	Killed  bool `json:"killed"`
+}
+
+// CleanupOutcome reports what session cleanup reclaimed and what it preserved.
+type CleanupOutcome struct {
+	Cleaned     []domain.SessionID `json:"cleaned"`
+	AlreadyGone []domain.SessionID `json:"alreadyGone"`
+	Skipped     []CleanupSkipped   `json:"skipped"`
+}
+
+// CleanupSkipped is one terminal session whose workspace was preserved by
+// cleanup (never force-deleted), with a stable code and the user-facing reason.
+type CleanupSkipped struct {
+	SessionID domain.SessionID       `json:"sessionId"`
+	Code      domain.CleanupSkipCode `json:"code"`
+	Reason    string                 `json:"reason"`
+}
+
+// RestoreModeView is the API-facing restore-mode enum.
+type RestoreModeView string
+
+const (
+	// RestoreModeViewNative restores a session using the runtime's native resume behavior.
+	RestoreModeViewNative RestoreModeView = "native"
+	// RestoreModeViewSavedPrompt restores a session by replaying the saved prompt.
+	RestoreModeViewSavedPrompt RestoreModeView = "saved_prompt"
+	// RestoreModeViewFresh restores a session by starting from a fresh runtime state.
+	RestoreModeViewFresh RestoreModeView = "fresh"
+)
+
+// RestoreOutcome reports the restored read model and how AO relaunched it.
+type RestoreOutcome struct {
+	Session domain.Session  `json:"session"`
+	Mode    RestoreModeView `json:"restoreMode"`
+}
+
+// ResumeAgentOutcome reports the resumed read model and how AO relaunched it.
+type ResumeAgentOutcome struct {
+	Session domain.Session  `json:"session"`
+	Mode    RestoreModeView `json:"resumeMode"`
+}
+
+// ExitAgentOutcome reports the still-live AO session after only its agent
+// controller has exited.
+type ExitAgentOutcome struct {
+	Session domain.Session `json:"session"`
+}
+
+// InterfaceTransitionStatus describes whether this session can cross between
+// its TUI and Chat controllers and includes the latest durable handoff attempt.
+type InterfaceTransitionStatus struct {
+	Supported  bool
+	TargetMode domain.SessionMode
+	ReasonCode string
+	Reason     string
+	Transition *domain.SessionInterfaceTransition
+}
+
+type scmProvider interface {
+	ParseRepository(remote string) (ports.SCMRepo, bool)
+	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
+	FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error)
+}
+
+// outputTypeReconciler recomputes and persists a session's durable OutputType
+// column. Production wiring supplies *lifecycle.Manager; declaring the
+// capability locally (rather than importing lifecycle) keeps this package
+// from depending on the reducer that already depends on it transitively.
+type outputTypeReconciler interface {
+	ReconcileSessionOutputType(ctx context.Context, id domain.SessionID) error
+}
+
+// Service is the controller-facing session service. It delegates command-side
+// session operations to the internal sessionmanager.Manager and owns read-model
+// assembly, including user-facing display status derivation.
+type Service struct {
+	manager             commander
+	store               Store
+	prClaimer           ports.PRClaimer
+	scm                 scmProvider
+	tracker             ports.Tracker
+	clock               func() time.Time
+	dataDir             string
+	telemetry           ports.EventSink
+	usageArchiveFlush   func(context.Context)
+	milestones          ports.InstallMilestones
+	firstSession        firstSessionClaims
+	delivery            *deliverytelemetry.Recorder
+	logger              *slog.Logger
+	backgroundContext   context.Context
+	agentReadiness      ports.AgentReadinessProvider
+	runBackground       func(func())
+	orchestratorLocksMu sync.Mutex
+	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
+	workspaceCache      *workspaceCache
+	workspaceManifests  *workspaceManifestIndex
+	// commitSelections caches resolved commit selections. Their keys are
+	// immutable SHAs, so entries never go stale.
+	commitSelections *commitSelectionCache
+	workspaceEditsMu sync.Mutex
+	// workspaceGroup coalesces concurrent cache-miss compare/status lookups
+	// for the same (session, root): "Expand All" on many files fires that
+	// many GetWorkspaceFile calls at once, and without this each one would
+	// independently spawn its own git subprocesses for identical work.
+	workspaceGroup singleflight.Group
+	manifestGroup  singleflight.Group
+	// branchStateMu serializes branch-state reconciles and guards branchTips,
+	// each session's last reconciled branch, remote, and base tips.
+	branchStateMu sync.Mutex
+	branchTips    map[domain.SessionID]string
+	// signalCapable reports whether a harness has a hook pipeline that can
+	// deliver activity signals at all. Only capable harnesses are eligible for
+	// the no_signal downgrade: a hook-less harness staying silent forever is
+	// normal, not a broken pipeline. nil means "unknown": never downgrade.
+	signalCapable         func(domain.AgentHarness) bool
+	chatProviderPreserved func(domain.SessionID) bool
+	// githubIdentity optionally resolves the operator's authenticated GitHub
+	// account so the handle rides along with product telemetry. Nil disables it
+	// and the emitter degrades to anonymous.
+	githubIdentity         ports.ScopedIdentityResolver
+	titleRefinementSlots   chan struct{}
+	titleRefinementMu      sync.Mutex
+	titleRefinementCancels map[domain.SessionID]context.CancelFunc
+	// outputTypeReconciler lets ClaimPR persist the pr OutputType immediately
+	// instead of waiting for the next artifact-output poll tick, so raising a
+	// PR on a session that already produced artifacts flips its Kanban
+	// placement with the same latency claiming a PR always had. Nil in
+	// service tests that construct Service directly; ClaimPR degrades to
+	// relying on the poller in that case.
+	outputTypeReconciler outputTypeReconciler
+	// artifactDeleter deletes a session's artifact files and version rows. Nil
+	// makes DeleteArtifacts fail rather than delete outside the capture lock.
+	artifactDeleter artifactDeleter
+	// runsOnComputerLogin reports whether a new session would launch on the
+	// computer's own CLI login rather than a saved account. Nil means always.
+	runsOnComputerLogin func(context.Context, domain.AgentHarness, string) bool
+}
+
+// SetComputerLoginCheck late-binds the account check the launch gate needs: the
+// computer's login state matters only to a session that will run on it.
+func (s *Service) SetComputerLoginCheck(check func(ctx context.Context, harness domain.AgentHarness, accountID string) bool) {
+	s.runsOnComputerLogin = check
+}
+
+// SetChatProviderPreserver wires the live Chat lifetime observation after both
+// services have been constructed. It performs no provider or filesystem probes.
+func (s *Service) SetChatProviderPreserver(preserves func(domain.SessionID) bool) {
+	s.chatProviderPreserved = preserves
+}
+
+// New wires a controller-facing session service over an internal session Manager.
+func New(manager *sessionmanager.Manager, store Store) *Service {
+	return NewWithDeps(Deps{Manager: manager, Store: store})
+}
+
+// Deps are optional collaborators for the session service. The default New
+// path keeps existing tests and callers small; daemon wiring uses NewWithDeps
+// to supply SCM observation for PR claiming.
+type Deps struct {
+	Manager   commander
+	Store     Store
+	PRClaimer ports.PRClaimer
+	SCM       scmProvider
+	Tracker   ports.Tracker
+	Clock     func() time.Time
+	DataDir   string
+	Telemetry ports.EventSink
+	// Milestones durably records the install's first spawned session, so
+	// ao.session.spawned carries first_for_install. Left nil, it is omitted.
+	Milestones ports.InstallMilestones
+	// Delivery emits ao.sessions.ended on kill and ao.pr.opened on claim. Left
+	// nil, neither is reported from this service.
+	Delivery *deliverytelemetry.Recorder
+	Logger   *slog.Logger
+	// AgentReadiness coordinates advisory native harness checks before launch.
+	AgentReadiness ports.AgentReadinessProvider
+	// BackgroundContext owns best-effort work that must survive an HTTP request
+	// returning but stop with the daemon. It defaults to context.Background for
+	// focused service tests and non-daemon callers.
+	BackgroundContext context.Context
+	// SignalCapable gates the no_signal status downgrade per harness; daemon
+	// wiring passes activitydispatch.SupportsHarness. Left nil, no session is
+	// ever downgraded to no_signal.
+	SignalCapable func(domain.AgentHarness) bool
+	// GithubIdentity resolves the operator's authenticated GitHub account so the
+	// handle rides along with product telemetry.
+	GithubIdentity ports.ScopedIdentityResolver
+	// OutputTypeReconciler persists the durable OutputType column; daemon
+	// wiring passes the shared *lifecycle.Manager. Left nil, ClaimPR still
+	// succeeds but the pr OutputType only lands on the next artifact-output
+	// poll tick.
+	OutputTypeReconciler outputTypeReconciler
+	// ArtifactDeleter deletes a session's artifacts; daemon wiring passes the
+	// shared *artifactversions.Capturer so a delete cannot race a capture.
+	ArtifactDeleter artifactDeleter
+}
+
+// NewWithDeps wires a session service with optional PR-claim dependencies.
+func NewWithDeps(d Deps) *Service {
+	backgroundContext := d.BackgroundContext
+	if backgroundContext == nil {
+		backgroundContext = context.Background()
+	}
+	s := &Service{manager: d.Manager, store: d.Store, prClaimer: d.PRClaimer, scm: d.SCM, tracker: d.Tracker, clock: d.Clock, dataDir: d.DataDir, signalCapable: d.SignalCapable, telemetry: d.Telemetry, milestones: d.Milestones, delivery: d.Delivery, logger: d.Logger, backgroundContext: backgroundContext, agentReadiness: d.AgentReadiness, githubIdentity: d.GithubIdentity, titleRefinementSlots: make(chan struct{}, delegatedTaskTitleConcurrency), titleRefinementCancels: map[domain.SessionID]context.CancelFunc{}, outputTypeReconciler: d.OutputTypeReconciler, artifactDeleter: d.ArtifactDeleter}
+	if s.prClaimer == nil {
+		if w, ok := d.Store.(ports.PRClaimer); ok {
+			s.prClaimer = w
+		}
+	}
+	if s.clock == nil {
+		s.clock = time.Now
+	}
+	s.workspaceCache = newWorkspaceCache(workspaceCacheTTL, s.clock)
+	s.workspaceManifests = newWorkspaceManifestIndex()
+	s.workspaceManifests.now = s.clock
+	s.commitSelections = newCommitSelectionCache(commitSelectionCacheSize)
+	return s
+}
+
+// SetUsageArchiveFlush sends pending session summaries after a user archive.
+func (s *Service) SetUsageArchiveFlush(flush func(context.Context)) {
+	s.usageArchiveFlush = flush
+}
+
+// Spawn creates a session and returns the API-facing read model plus
+// ephemeral prompt size measurements.
+func (s *Service) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Session, int, int, error) {
+	if rec, found, err := s.replayClientRequest(ctx, cfg.ClientRequestID, cfg.ClientRequestHash); err != nil {
+		return domain.Session{}, 0, 0, err
+	} else if found {
+		sess, err := s.toSession(ctx, rec)
+		return sess, 0, 0, err
+	}
+	if cfg.ClientRequestID != "" && cfg.Kind != domain.KindWorker {
+		return domain.Session{}, 0, 0, apierr.Invalid("CLIENT_REQUEST_WORKER_REQUIRED", "clientRequestId is supported for worker sessions only", nil)
+	}
+	if cfg.ProjectID == "" && cfg.Kind != domain.KindWorker {
+		return domain.Session{}, 0, 0, apierr.Invalid("STANDALONE_WORKER_REQUIRED", "Standalone sessions must be workers", nil)
+	}
+	if cfg.Kind == domain.KindOrchestrator {
+		cfg.Async = true
+		unlock := s.lockOrchestratorProject(cfg.ProjectID)
+		defer unlock()
+
+		existing, err := s.activeOrchestrators(ctx, cfg.ProjectID)
+		if err != nil {
+			return domain.Session{}, 0, 0, err
+		}
+		if len(existing) > 0 {
+			if cfg.AutomationRunID != nil {
+				for _, candidate := range existing {
+					if candidate.AutomationRunID != nil && *candidate.AutomationRunID == *cfg.AutomationRunID {
+						return candidate, 0, 0, nil
+					}
+				}
+				return domain.Session{}, 0, 0, apierr.Conflict(
+					"ORCHESTRATOR_ALREADY_ACTIVE",
+					"Another orchestrator is already active for this project",
+					nil,
+				)
+			}
+			return newestSession(existing), 0, 0, nil
+		}
+	}
+	return s.spawn(ctx, cfg)
+}
+
+func (s *Service) spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Session, int, int, error) {
+	var project domain.ProjectRecord
+	var err error
+	if cfg.ProjectID != "" {
+		project, err = s.requireProject(ctx, cfg.ProjectID)
+		if err != nil {
+			return domain.Session{}, 0, 0, err
+		}
+	} else {
+		if cfg.IssueID != "" || strings.TrimSpace(cfg.Branch) != "" {
+			return domain.Session{}, 0, 0, apierr.Invalid("STANDALONE_PROJECT_FEATURE_UNSUPPORTED", "Standalone sessions do not support issues or branches", nil)
+		}
+		if cfg.Harness == "" {
+			return domain.Session{}, 0, 0, apierr.Invalid("HARNESS_REQUIRED", "harness is required for a standalone session", nil)
+		}
+	}
+	if s.agentReadiness != nil && cfg.Harness != "" {
+		readiness, err := s.agentReadiness.EnsureAgentReadiness(ctx, string(cfg.Harness), domain.AgentReadinessPurposeLaunch)
+		if err != nil {
+			return domain.Session{}, 0, 0, err
+		}
+		if readiness.Installation.State == domain.AgentInstallationNotInstalled {
+			return domain.Session{}, 0, 0, apierr.Invalid("AGENT_BINARY_NOT_FOUND", "The selected agent harness is not installed", map[string]any{"agentId": cfg.Harness})
+		}
+		if cfg.Harness == domain.HarnessCodex &&
+			readiness.Authentication.State == domain.AgentAuthenticationUnauthorized &&
+			readiness.Authentication.Freshness == domain.AgentReadinessFresh &&
+			(s.runsOnComputerLogin == nil || s.runsOnComputerLogin(ctx, cfg.Harness, cfg.AgentAccountID)) {
+			return domain.Session{}, 0, 0, apierr.Conflict("CODEX_ACCOUNT_AUTH_UNVERIFIED", "Add or sign in to a Codex account in Settings before starting a Codex session", nil)
+		}
+	}
+	cfg = s.withIssueContext(ctx, cfg, project)
+	rec, promptBytes, systemPromptBytes, err := s.spawnWithTelemetry(ctx, cfg, project)
+	if err != nil {
+		s.invalidateAgentReadinessAfterLaunchFailure(cfg.Harness, err)
+		apiErr := toSpawnAPIError(err)
+		s.recordSpawnOutcome(ctx, cfg, domain.SessionRecord{}, actionStatusForError(err), apiErr)
+		return domain.Session{}, 0, 0, apiErr
+	}
+	s.recordSpawnOutcome(ctx, cfg, rec, domain.ActivityStatusCompleted, nil)
+	sess, err := s.toSession(ctx, rec)
+	if err != nil {
+		return domain.Session{}, 0, 0, err
+	}
+	return sess, promptBytes, systemPromptBytes, nil
+}
+
+// spawnWithTelemetry is the only path from the service into manager.Spawn, so
+// every created session emits ao.session.spawned or ao.session.spawn_failed
+// exactly once. Client-request replays return before reaching it.
+func (s *Service) spawnWithTelemetry(ctx context.Context, cfg ports.SpawnConfig, project domain.ProjectRecord) (domain.SessionRecord, int, int, error) {
+	// CLI and orchestrator workers use this same naming policy as desktop tasks.
+	if !cfg.NameFromPrompt && cfg.Kind == domain.KindWorker && project.ID != "" &&
+		project.Kind.WithDefault() != domain.ProjectKindScratch && strings.TrimSpace(cfg.Branch) == "" && strings.TrimSpace(cfg.Prompt) != "" {
+		cfg.NameFromPrompt = true
+		cfg.KeepDisplayName = cfg.DisplayName != ""
+	}
+	start := s.now()
+	firstSession, err := s.isFirstSession(ctx)
+	if err != nil {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("count sessions: %w", err)
+	}
+	// Registered before Spawn writes its seed row, so a concurrent spawn that
+	// sees that row cannot take this spawn's first_for_install claim.
+	s.firstSession.begin(firstSession)
+	createdBy := s.spawnCreatedBy(ctx, cfg)
+	rec, promptBytes, systemPromptBytes, err := s.manager.Spawn(ctx, cfg)
+	if err != nil {
+		s.firstSession.finish(s.milestones, firstSession, false)
+		s.emitSpawnFailed(ctx, cfg, err, s.now().Sub(start).Milliseconds())
+		return domain.SessionRecord{}, 0, 0, err
+	}
+	// Claimed even when telemetry is off: the marker describes the install.
+	firstForInstall, firstKnown := s.firstSession.finish(s.milestones, firstSession, true)
+	s.recordCreatedBy(ctx, rec.ID, createdBy)
+	s.emitSpawned(ctx, rec, s.now().Sub(start).Milliseconds(), firstForInstall, firstKnown, createdBy)
+	if firstSession {
+		s.emitFirstSessionSpawned(ctx, rec, project)
+	}
+	return rec, promptBytes, systemPromptBytes, nil
+}
+
+func (s *Service) invalidateAgentReadinessAfterLaunchFailure(harness domain.AgentHarness, err error) {
+	if s.agentReadiness == nil || harness == "" {
+		return
+	}
+	id := string(harness)
+	invalidated := false
+	if errors.Is(err, ports.ErrAgentBinaryNotFound) {
+		s.agentReadiness.InvalidateAgentInstallation(id)
+		invalidated = true
+	}
+	if errors.Is(err, ports.ErrChatAuthRequired) {
+		s.agentReadiness.InvalidateAgentAuthentication(id)
+		invalidated = true
+	}
+	if invalidated {
+		s.agentReadiness.RecheckAgent(id)
+	}
+}
+
+// requireProject verifies the project is registered before any spawn write
+// touches the session store, so an unknown projectId surfaces as a typed 404
+// rather than an opaque 500 with an orphan terminated row left behind.
+func (s *Service) requireProject(ctx context.Context, id domain.ProjectID) (domain.ProjectRecord, error) {
+	if id == "" {
+		return domain.ProjectRecord{}, apierr.Invalid("PROJECT_ID_REQUIRED", "projectId is required", nil)
+	}
+	if s.store == nil {
+		return domain.ProjectRecord{ID: string(id)}, nil
+	}
+	rec, ok, err := s.store.GetProject(ctx, string(id))
+	if err != nil {
+		return domain.ProjectRecord{}, fmt.Errorf("get project %s: %w", id, err)
+	}
+	if !ok {
+		return domain.ProjectRecord{}, apierr.NotFound("PROJECT_NOT_FOUND", "Unknown project. Register it with `ao project add`")
+	}
+	return rec, nil
+}
+
+func (s *Service) isFirstSession(ctx context.Context) (bool, error) {
+	if s.store == nil {
+		return false, nil
+	}
+	rows, err := s.store.ListAllSessions(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, row := range rows {
+		if !row.IsTaskPreparation {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// firstSessionClaims decides first_for_install on ao.session.spawned. The
+// prior-session check runs before Spawn, which persists a seed row before
+// provisioning, so a spawn that saw an empty install (eligible) can still be
+// provisioning when a later spawn that saw its row (ineligible) finishes.
+// While any eligible spawn is in flight, an ineligible one reports false
+// without claiming the durable marker; the eligible spawn owns the claim. With
+// none in flight, an ineligible spawn claims the marker so an install upgraded
+// from a build without markers never reports a later session as its first.
+type firstSessionClaims struct {
+	mu               sync.Mutex
+	eligibleInFlight int
+}
+
+func (c *firstSessionClaims) begin(eligible bool) {
+	if !eligible {
+		return
+	}
+	c.mu.Lock()
+	c.eligibleInFlight++
+	c.mu.Unlock()
+}
+
+// finish ends a spawn begun with begin. known is false when the flag should be
+// omitted: the spawn failed, there is no marker store, or it was unreadable.
+func (c *firstSessionClaims) finish(m ports.InstallMilestones, eligible, succeeded bool) (first, known bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if eligible {
+		c.eligibleInFlight--
+	}
+	if !succeeded || m == nil {
+		return false, false
+	}
+	if !eligible && c.eligibleInFlight > 0 {
+		return false, true
+	}
+	return ports.FirstForInstall(m, "session_spawned", eligible)
+}
+
+func (s *Service) emitSpawned(ctx context.Context, rec domain.SessionRecord, durationMs int64, firstForInstall, firstKnown bool, createdBy domain.SessionCreator) {
+	if s.telemetry == nil {
+		return
+	}
+	projectID := rec.ProjectID
+	sessionID := rec.ID
+	payload := map[string]any{
+		"kind":        telemetrymeta.SessionKind(rec.Kind, rec.ProjectID),
+		"harness":     string(rec.Harness),
+		"duration_ms": durationMs,
+		"created_by":  string(createdBy),
+	}
+	// Absent for spawns that no client request started (schedules, intake).
+	if surface, ok := telemetrymeta.SurfaceFromContext(ctx); ok {
+		payload["surface"] = string(surface)
+	}
+	if firstKnown {
+		payload["first_for_install"] = firstForInstall
+	}
+	if actor, ok := s.githubActor(ctx); ok {
+		payload["github_actor"] = actor
+	}
+	s.telemetry.Emit(context.Background(), ports.TelemetryEvent{
+		Name:       "ao.session.spawned",
+		Source:     "session_service",
+		OccurredAt: s.now(),
+		Level:      ports.TelemetryLevelInfo,
+		ProjectID:  &projectID,
+		SessionID:  &sessionID,
+		RequestID:  reqid.FromContext(ctx),
+		Payload:    payload,
+	})
+}
+
+// githubActor returns the operator's GitHub login when the authenticated
+// account resolves to a human, and ("", false) for every failure mode (resolver
+// unset, no token, GET /user failure, offline, org or bot account, empty login)
+// so the event stays anonymous. Host is left empty because GitHub identity is
+// not host-scoped.
+func (s *Service) githubActor(ctx context.Context) (string, bool) {
+	if s.githubIdentity == nil {
+		return "", false
+	}
+	identity, err := s.githubIdentity.AuthenticatedIdentityForProvider(ctx, "github", "")
+	if err != nil || !identity.Human || identity.Login == "" {
+		return "", false
+	}
+	return identity.Login, true
+}
+
+// emitFirstSessionSpawned is deprecated: it fires whenever the sessions table is
+// empty, so it repeats after a user clears their sessions. Use
+// ao.session.spawned with first_for_install=true. Kept for dashboard continuity.
+func (s *Service) emitFirstSessionSpawned(ctx context.Context, rec domain.SessionRecord, project domain.ProjectRecord) {
+	if s.telemetry == nil {
+		return
+	}
+	projectID := rec.ProjectID
+	sessionID := rec.ID
+	payload := map[string]any{
+		"kind":    telemetrymeta.SessionKind(rec.Kind, rec.ProjectID),
+		"harness": string(rec.Harness),
+	}
+	if !project.RegisteredAt.IsZero() {
+		payload["since_first_project_ms"] = s.now().Sub(project.RegisteredAt).Milliseconds()
+	}
+	s.telemetry.Emit(context.Background(), ports.TelemetryEvent{
+		Name:       "ao.onboarding.first_session_spawned",
+		Source:     "session_service",
+		OccurredAt: s.now(),
+		Level:      ports.TelemetryLevelInfo,
+		ProjectID:  &projectID,
+		SessionID:  &sessionID,
+		RequestID:  reqid.FromContext(ctx),
+		Payload:    payload,
+	})
+}
+
+func (s *Service) emitSpawnFailed(ctx context.Context, cfg ports.SpawnConfig, err error, durationMs int64) {
+	if s.telemetry == nil {
+		return
+	}
+	projectID := cfg.ProjectID
+	apiErr := toSpawnAPIError(err)
+	errorKind, errorCode := telemetrymeta.ErrorKindAndCode(apiErr)
+	payload := map[string]any{
+		"component":   "session_service",
+		"operation":   "spawn_session",
+		"kind":        telemetrymeta.SessionKind(cfg.Kind, cfg.ProjectID),
+		"harness":     string(cfg.Harness),
+		"duration_ms": durationMs,
+		"error_kind":  errorKind,
+		"fingerprint": telemetrymeta.Fingerprint("session_service", "spawn_session", string(cfg.Kind), string(cfg.Harness), errorKind, errorCode),
+	}
+	if errorCode != "" {
+		payload["error_code"] = errorCode
+	}
+	s.telemetry.Emit(context.Background(), ports.TelemetryEvent{
+		Name:       "ao.session.spawn_failed",
+		Source:     "session_service",
+		OccurredAt: s.now(),
+		Level:      ports.TelemetryLevelError,
+		ProjectID:  &projectID,
+		RequestID:  reqid.FromContext(ctx),
+		Payload:    payload,
+	})
+}
+
+// captureRelaunchError sends a relaunch failure through the daemon's gated,
+// privacy-safe Sentry boundary.
+var captureRelaunchError = func(ctx context.Context, err error, tags map[string]string, fingerprint string) {
+	sentryobs.CaptureError(ctx, err, tags, fingerprint, telemetrymeta.RoutePattern(nil), telemetrymeta.FailureSite{})
+}
+
+// emitRelaunchFailed records a failed agent relaunch. These answer 409
+// AGENT_RESUME_FAILED rather than 500, so neither ao.http.5xx nor the request
+// logger's Sentry capture sees them any more. PostHog gets the operation, step
+// and the root error's Go type (never its text, which can carry paths and env);
+// Sentry receives only fixed diagnostics after scrubbing the raw error.
+func (s *Service) emitRelaunchFailed(ctx context.Context, operation string, id domain.SessionID, err, mapped error) {
+	var relaunchErr *sessionmanager.RelaunchError
+	var apiErr *apierr.Error
+	// A canceled context means the client left mid-relaunch; there is no failure to count.
+	if errors.Is(err, context.Canceled) || !errors.As(err, &relaunchErr) ||
+		!errors.As(mapped, &apiErr) || apiErr.Code != "AGENT_RESUME_FAILED" {
+		return
+	}
+	cause := relaunchErr.Err
+	for next := errors.Unwrap(cause); next != nil; next = errors.Unwrap(cause) {
+		cause = next
+	}
+	fingerprint := telemetrymeta.Fingerprint("session_service", operation, relaunchErr.Step)
+	payload := map[string]any{
+		"component":   "session_service",
+		"operation":   operation,
+		"step":        relaunchErr.Step,
+		"cause_type":  fmt.Sprintf("%T", cause),
+		"error_code":  "AGENT_RESUME_FAILED",
+		"fingerprint": fingerprint,
+	}
+	var projectID *domain.ProjectID
+	if rec, ok, getErr := s.store.GetSession(ctx, id); getErr == nil && ok {
+		payload["harness"] = string(rec.Harness)
+		payload["kind"] = telemetrymeta.SessionKind(rec.Kind, rec.ProjectID)
+		projectID = &rec.ProjectID
+	}
+	tags := map[string]string{"area": "agent"}
+	for key, value := range payload {
+		tags[key] = fmt.Sprint(value)
+	}
+	captureRelaunchError(ctx, err, tags, fingerprint)
+	if s.telemetry == nil {
+		return
+	}
+	s.telemetry.Emit(context.Background(), ports.TelemetryEvent{
+		Name:       "ao.session.relaunch_failed",
+		Source:     "session_service",
+		OccurredAt: s.now(),
+		Level:      ports.TelemetryLevelError,
+		ProjectID:  projectID,
+		RequestID:  reqid.FromContext(ctx),
+		Payload:    payload,
+	})
+}
+
+// SpawnOrchestrator spawns an orchestrator session for a project. When clean is
+// true it first tears down any active orchestrator(s) for that project so the new
+// one is the only live coordinator. When clean is false it is idempotent: if an
+// active orchestrator already exists it is returned as-is. A business rule that
+// belongs here, not in the HTTP controller.
+func (s *Service) SpawnOrchestrator(
+	ctx context.Context,
+	projectID domain.ProjectID,
+	clean bool,
+	requestedMode domain.SessionMode,
+	approval domain.PermissionMode,
+) (domain.Session, error) {
+	project, err := s.requireProject(ctx, projectID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	// A start runs the project's Setup and a clean replacement first runs
+	// the retired orchestrator's Cleanup, both possibly longer than one REST
+	// request; the lock may also wait for another replacement. The request's
+	// budget covers them from here. The bounded context is not passed on:
+	// the spawn extends the budget again, from its own start, and a deadline
+	// set here would cap it.
+	budget := sessionmanager.SetupBudget(project)
+	if clean {
+		budget += sessionmanager.ReplacementCleanupBudget(project)
+	}
+	_, cancelBudget := ports.ExtendSpawnRequestBudget(ctx, budget)
+	defer cancelBudget()
+	unlock := s.lockOrchestratorProject(projectID)
+	defer unlock()
+
+	mode := requestedMode
+	if clean {
+		existing, err := s.activeOrchestrators(ctx, projectID)
+		if err != nil {
+			return domain.Session{}, err
+		}
+		if len(existing) > 1 {
+			// Each retirement runs its own Cleanup.
+			_, cancelRetireBudget := ports.ExtendSpawnRequestBudget(ctx,
+				sessionmanager.SetupBudget(project)+time.Duration(len(existing))*sessionmanager.ReplacementCleanupBudget(project))
+			defer cancelRetireBudget()
+		}
+		if len(existing) > 0 && mode == "" {
+			// Clean replacement preserves the controller contract of the
+			// orchestrator being replaced only when the caller did not make an
+			// explicit choice. The global default still must not silently flip an
+			// existing project's coordinator, but an explicit replacement mode is
+			// authoritative.
+			mode = newestSession(existing).Mode
+		}
+		retireCtx := context.WithoutCancel(ctx)
+		for _, orch := range existing {
+			before, live := s.liveSessionBeforeEnd(retireCtx, orch.ID)
+			_ = s.sendRetireNotice(retireCtx, orch.ID)
+			retireErr := s.manager.RetireForReplacement(retireCtx, orch.ID)
+			// A failed cleanup can follow a successful terminal transition.
+			s.recordKillOutcome(retireCtx, before, live, retireErr)
+			if retireErr != nil {
+				return domain.Session{}, toAPIError(retireErr)
+			}
+		}
+	} else {
+		existing, err := s.activeOrchestrators(ctx, projectID)
+		if err != nil {
+			return domain.Session{}, err
+		}
+		if len(existing) > 0 {
+			return newestSession(existing), nil
+		}
+	}
+	sess, _, _, err := s.spawn(ctx, ports.SpawnConfig{
+		ProjectID:     projectID,
+		Kind:          domain.KindOrchestrator,
+		Async:         true,
+		RequestedMode: mode,
+		AgentConfig: ports.AgentConfig{
+			Permissions: approval,
+		},
+	})
+	if err != nil {
+		return domain.Session{}, err
+	}
+	if err := s.verifyOrchestratorReplacement(project, sess); err != nil {
+		return domain.Session{}, err
+	}
+	return sess, nil
+}
+
+func (s *Service) activeOrchestrators(ctx context.Context, projectID domain.ProjectID) ([]domain.Session, error) {
+	active := true
+	return s.List(ctx, ListFilter{ProjectID: projectID, Active: &active, OrchestratorOnly: true})
+}
+
+const orchestratorRetireNotice = "AO is replacing this project orchestrator. Stop coordinating new work now; a fresh orchestrator will take over in a new workspace."
+
+func (s *Service) sendRetireNotice(ctx context.Context, id domain.SessionID) error {
+	if err := s.manager.Send(ctx, id, orchestratorRetireNotice, nil); err != nil {
+		return fmt.Errorf("send retire notice to %s: %w", id, err)
+	}
+	return nil
+}
+
+func (s *Service) verifyOrchestratorReplacement(project domain.ProjectRecord, sess domain.Session) error {
+	if sess.IsTerminated {
+		return orchestratorReplacementUnverified("new session %s is terminated", sess.ID)
+	}
+	if sess.Kind != domain.KindOrchestrator {
+		return orchestratorReplacementUnverified("new session %s has kind %q", sess.ID, sess.Kind)
+	}
+	if expected := project.Config.Orchestrator.Harness; expected != "" && sess.Harness != expected {
+		return orchestratorReplacementUnverified("new session %s uses harness %q, want %q", sess.ID, sess.Harness, expected)
+	}
+	expectedBranch := sessionmanager.DefaultOrchestratorBranch(serviceSessionPrefix(project), s.dataDir)
+	if branch := sess.Metadata.Branch; branch != "" && !isOrchestratorBranch(branch, expectedBranch) {
+		return orchestratorReplacementUnverified("new session %s uses branch %q, want %q", sess.ID, branch, expectedBranch)
+	}
+	return nil
+}
+
+// orchestratorReplacementUnverified carries a code so a failed check is not
+// reported as a bare INTERNAL_ERROR, which telemetry cannot tell apart.
+func orchestratorReplacementUnverified(format string, args ...any) error {
+	return apierr.Internal("ORCHESTRATOR_REPLACEMENT_UNVERIFIED",
+		"orchestrator replacement verification failed: "+fmt.Sprintf(format, args...))
+}
+
+// isOrchestratorBranch accepts the canonical branch and the <branch>-N branch
+// the spawn moves to when another worktree has the canonical one checked out.
+func isOrchestratorBranch(branch, expected string) bool {
+	if branch == expected {
+		return true
+	}
+	n, ok := strings.CutPrefix(branch, expected+"-")
+	if !ok || n == "" {
+		return false
+	}
+	_, err := strconv.Atoi(n)
+	return err == nil
+}
+
+func serviceSessionPrefix(project domain.ProjectRecord) string {
+	if p := strings.TrimSpace(project.Config.SessionPrefix); p != "" {
+		return p
+	}
+	id := project.ID
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
+}
+
+func newestSession(sessions []domain.Session) domain.Session {
+	newest := sessions[0]
+	for _, sess := range sessions[1:] {
+		if sessionNewer(sess.SessionRecord, newest.SessionRecord) {
+			newest = sess
+		}
+	}
+	return newest
+}
+
+func sessionNewer(a, b domain.SessionRecord) bool {
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.After(b.CreatedAt)
+	}
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		return a.UpdatedAt.After(b.UpdatedAt)
+	}
+	return string(a.ID) > string(b.ID)
+}
+
+func (s *Service) lockOrchestratorProject(projectID domain.ProjectID) func() {
+	s.orchestratorLocksMu.Lock()
+	if s.orchestratorLocks == nil {
+		s.orchestratorLocks = make(map[domain.ProjectID]*sync.Mutex)
+	}
+	mu := s.orchestratorLocks[projectID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.orchestratorLocks[projectID] = mu
+	}
+	s.orchestratorLocksMu.Unlock()
+
+	mu.Lock()
+	return mu.Unlock
+}
+
+// Restore relaunches a terminated session and returns the API-facing read model.
+func (s *Service) Restore(ctx context.Context, id domain.SessionID) (RestoreOutcome, error) {
+	res, err := s.manager.RestoreWithMode(ctx, id)
+	if err != nil {
+		apiErr := toAPIError(err)
+		s.emitRelaunchFailed(ctx, "restore_session", id, err, apiErr)
+		s.recordRestored(ctx, id, domain.SessionRecord{}, actionStatusForError(err), apiErr)
+		return RestoreOutcome{}, apiErr
+	}
+	session, err := s.toSession(ctx, res.Session)
+	if err != nil {
+		return RestoreOutcome{}, err
+	}
+	s.recordRestored(ctx, id, res.Session, domain.ActivityStatusCompleted, nil)
+	return RestoreOutcome{Session: session, Mode: restoreModeView(res.Mode)}, nil
+}
+
+// ExitAgent stops only the agent controller while preserving the AO session,
+// worktree, terminal identity, and provider-native conversation.
+func (s *Service) ExitAgent(ctx context.Context, id domain.SessionID) (ExitAgentOutcome, error) {
+	manager, ok := s.manager.(exitAgentCommander)
+	if !ok {
+		return ExitAgentOutcome{}, apierr.Conflict(
+			"AGENT_EXIT_UNSUPPORTED", "This build cannot exit an agent independently", nil)
+	}
+	rec, err := manager.ExitAgent(ctx, id)
+	if err != nil {
+		return ExitAgentOutcome{}, toAPIError(err)
+	}
+	session, err := s.toSession(ctx, rec)
+	if err != nil {
+		return ExitAgentOutcome{}, err
+	}
+	return ExitAgentOutcome{Session: session}, nil
+}
+
+// ResumeAgent relaunches an exited agent without restoring a terminated
+// session or recreating its workspace.
+func (s *Service) ResumeAgent(ctx context.Context, id domain.SessionID) (ResumeAgentOutcome, error) {
+	res, err := s.manager.ResumeAgentWithMode(ctx, id)
+	if err != nil {
+		apiErr := toAPIError(err)
+		s.emitRelaunchFailed(ctx, "resume_agent", id, err, apiErr)
+		return ResumeAgentOutcome{}, apiErr
+	}
+	session, err := s.toSession(ctx, res.Session)
+	if err != nil {
+		return ResumeAgentOutcome{}, err
+	}
+	return ResumeAgentOutcome{Session: session, Mode: restoreModeView(res.Mode)}, nil
+}
+
+// StartAccountTransition moves the session's agent to another provider account
+// through the durable controller handoff. stopTurn cancels a turn in progress;
+// otherwise the move waits for it to finish.
+func (s *Service) StartAccountTransition(ctx context.Context, id domain.SessionID, accountID string, stopTurn bool) (domain.SessionInterfaceTransition, error) {
+	manager, ok := s.manager.(agentAccountCommander)
+	if !ok {
+		return domain.SessionInterfaceTransition{}, apierr.Conflict(
+			"AGENT_ACCOUNT_UNSUPPORTED", "This build cannot move a session to another account", nil)
+	}
+	policy := domain.SessionInterfaceTransitionDrain
+	if stopTurn {
+		policy = domain.SessionInterfaceTransitionInterrupt
+	}
+	transition, err := manager.StartAccountTransition(ctx, id, accountID, policy)
+	return transition, toAPIError(err)
+}
+
+// InterfaceTransitionStatus returns capability and progress without launching
+// a provider process or mutating the session.
+func (s *Service) InterfaceTransitionStatus(ctx context.Context, id domain.SessionID) (InterfaceTransitionStatus, error) {
+	manager, ok := s.manager.(interfaceTransitionCommander)
+	if !ok {
+		return InterfaceTransitionStatus{}, apierr.Conflict(
+			"INTERFACE_HANDOFF_UNSUPPORTED", "This build cannot switch session interfaces", nil)
+	}
+	status, err := manager.InterfaceTransitionStatus(ctx, id)
+	if err != nil {
+		return InterfaceTransitionStatus{}, toAPIError(err)
+	}
+	return InterfaceTransitionStatus{
+		Supported: status.Supported, TargetMode: status.TargetMode,
+		ReasonCode: status.ReasonCode, Reason: status.Reason,
+		Transition: status.Transition,
+	}, nil
+}
+
+// StartInterfaceTransition begins a durable, asynchronous controller handoff.
+func (s *Service) StartInterfaceTransition(
+	ctx context.Context,
+	id domain.SessionID,
+	target domain.SessionMode,
+	policy domain.SessionInterfaceTransitionPolicy,
+	historyPolicy domain.SessionInterfaceTransitionHistoryPolicy,
+) (domain.SessionInterfaceTransition, error) {
+	if !target.Valid() {
+		return domain.SessionInterfaceTransition{}, apierr.Invalid(
+			"INVALID_SESSION_MODE", "Target mode must be chat or tui", nil)
+	}
+	if !policy.Valid() {
+		return domain.SessionInterfaceTransition{}, apierr.Invalid(
+			"INVALID_TRANSITION_POLICY", "Policy must be drain or interrupt", nil)
+	}
+	if !historyPolicy.Valid() {
+		return domain.SessionInterfaceTransition{}, apierr.Invalid(
+			"INVALID_TRANSITION_HISTORY_POLICY", "History policy must be strict or provider_history", nil)
+	}
+	manager, ok := s.manager.(interfaceTransitionCommander)
+	if !ok {
+		return domain.SessionInterfaceTransition{}, apierr.Conflict(
+			"INTERFACE_HANDOFF_UNSUPPORTED", "This build cannot switch session interfaces", nil)
+	}
+	transition, err := manager.StartInterfaceTransition(ctx, id, target, policy, historyPolicy)
+	return transition, toAPIError(err)
+}
+
+// CancelInterfaceTransition cancels a handoff while its source controller is
+// still safe to reopen.
+func (s *Service) CancelInterfaceTransition(ctx context.Context, id domain.SessionID) error {
+	manager, ok := s.manager.(interfaceTransitionCommander)
+	if !ok {
+		return apierr.Conflict(
+			"INTERFACE_HANDOFF_UNSUPPORTED", "This build cannot switch session interfaces", nil)
+	}
+	return toAPIError(manager.CancelInterfaceTransition(ctx, id))
+}
+
+// AcknowledgeInterfaceTransitionNotice durably dismisses one terminal failure
+// or recovery notice while retaining the transition record for diagnostics.
+func (s *Service) AcknowledgeInterfaceTransitionNotice(
+	ctx context.Context,
+	id domain.SessionID,
+	transitionID string,
+) (domain.SessionInterfaceTransition, error) {
+	manager, ok := s.manager.(interfaceTransitionCommander)
+	if !ok {
+		return domain.SessionInterfaceTransition{}, apierr.Conflict(
+			"INTERFACE_HANDOFF_UNSUPPORTED", "This build cannot switch session interfaces", nil)
+	}
+	transition, err := manager.AcknowledgeInterfaceTransitionNotice(ctx, id, transitionID)
+	return transition, toAPIError(err)
+}
+
+func restoreModeView(mode sessionmanager.RestoreMode) RestoreModeView {
+	switch mode {
+	case sessionmanager.RestoreModeNative:
+		return RestoreModeViewNative
+	case sessionmanager.RestoreModeSavedPrompt:
+		return RestoreModeViewSavedPrompt
+	case sessionmanager.RestoreModeFresh:
+		return RestoreModeViewFresh
+	default:
+		return RestoreModeView(mode)
+	}
+}
+
+// Kill delegates terminal intent and teardown to the internal manager.
+func (s *Service) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
+	s.cancelTitleRefinement(id)
+	before, live := s.liveSessionBeforeEnd(ctx, id)
+	freed, err := s.manager.Kill(ctx, id)
+	s.recordKillOutcome(ctx, before, live, err)
+	if err != nil {
+		apiErr := toAPIError(err)
+		s.recordTerminated(ctx, id, actionStatusForError(err), apiErr)
+		return freed, apiErr
+	}
+	s.recordTerminated(ctx, id, domain.ActivityStatusCompleted, nil)
+	if s.usageArchiveFlush != nil {
+		s.usageArchiveFlush(ctx)
+	}
+	return freed, nil
+}
+
+// RequestKill acknowledges terminal intent without waiting for cleanup scripts.
+func (s *Service) RequestKill(ctx context.Context, id domain.SessionID) (sessionmanager.KillResult, error) {
+	s.cancelTitleRefinement(id)
+	before, live := s.liveSessionBeforeEnd(ctx, id)
+	result, err := s.manager.RequestKill(ctx, id)
+	// Terminal intent is acknowledged even while cleanup still runs: the
+	// session has ended for the user, also when a later step then failed.
+	s.recordKillOutcome(ctx, before, live, err)
+	if err != nil {
+		apiErr := toAPIError(err)
+		s.recordTerminated(ctx, id, actionStatusForError(err), apiErr)
+		return result, apiErr
+	}
+	// RequestKill can acknowledge terminal intent while cleanup still runs.
+	// A later cleanup failure must not leave a completed action in chat.
+	if !result.CleanupPending {
+		s.recordTerminated(ctx, id, domain.ActivityStatusCompleted, nil)
+	}
+	if s.usageArchiveFlush != nil {
+		s.usageArchiveFlush(ctx)
+	}
+	return result, nil
+}
+
+// artifactDeleter deletes a session's artifact files and version rows. The
+// production implementation is *artifactversions.Capturer.
+type artifactDeleter interface {
+	DeleteSession(ctx context.Context, id domain.SessionID) error
+}
+
+// DeleteArtifacts deletes a terminated session's artifact files, version
+// history included, and its version rows, then reconciles its OutputType. The
+// directory itself is kept, so a restored session starts with an empty one.
+// Only the user's archive choice calls this; kill, cleanup and the reaper
+// never delete artifacts.
+func (s *Service) DeleteArtifacts(ctx context.Context, id domain.SessionID) error {
+	rec, ok, err := s.store.GetSession(ctx, id)
+	if err != nil {
+		return toAPIError(err)
+	}
+	if !ok {
+		return apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	if !rec.IsTerminated {
+		return apierr.Conflict("SESSION_NOT_TERMINATED", "Archive the session before deleting its artifacts.", nil)
+	}
+	if s.artifactDeleter == nil {
+		return fmt.Errorf("delete artifacts %s: no artifact deleter", id)
+	}
+	// The deleter only touches <dataDir>/artifacts/<id>. A row whose files live
+	// elsewhere (written under another data dir) is refused rather than
+	// reported deleted while its files stay where the UI reads them.
+	if stored := rec.Metadata.ArtifactDir; stored != "" && filepath.Clean(stored) != sessionartifacts.Dir(s.dataDir, id) {
+		return fmt.Errorf("delete artifacts %s: artifact dir %q is outside the data dir", id, stored)
+	}
+	err = s.artifactDeleter.DeleteSession(ctx, id)
+	// Reconcile even after a failure: the files may already be gone while the
+	// version rows were not dropped, and OutputType must follow what is on disk.
+	if s.outputTypeReconciler != nil {
+		if reconcileErr := s.outputTypeReconciler.ReconcileSessionOutputType(ctx, id); reconcileErr != nil && s.logger != nil {
+			s.logger.Warn("reconcile output type after deleting artifacts", "session", id, "err", reconcileErr)
+		}
+	}
+	return err
+}
+
+// sessionDeleteCommander is optional so focused fakes keep implementing the
+// stable commander surface.
+type sessionDeleteCommander interface {
+	DeleteSession(ctx context.Context, id domain.SessionID, cleanup bool) error
+}
+
+// Delete permanently removes a terminated session whose workspace is released,
+// then its artifact files; with cleanup it first releases a worktree still on
+// disk, never forced. The record goes first: a refused delete must not have
+// already thrown the artifacts away.
+func (s *Service) Delete(ctx context.Context, id domain.SessionID, cleanup bool) error {
+	deleter, ok := s.manager.(sessionDeleteCommander)
+	if !ok {
+		return apierr.NotImplemented("SESSION_DELETE_UNSUPPORTED", "Session deletion is not supported by this daemon")
+	}
+	if err := deleter.DeleteSession(ctx, id, cleanup); err != nil {
+		return toAPIError(err)
+	}
+	s.cancelTitleRefinement(id)
+	s.deleteArtifactDir(ctx, id)
+	return nil
+}
+
+// archivedSessionLister is optional so focused store fakes need not implement it.
+type archivedSessionLister interface {
+	ListReleasedArchivedSessions(ctx context.Context) ([]domain.ArchivedSession, error)
+}
+
+// DeleteExpired permanently deletes the archived sessions whose worktree is
+// released and that were archived more than days ago, the same way Delete
+// does. The store leaves out sessions with shared history, which the delete
+// always refuses. A session the delete refuses for now (an operation running)
+// or that is already gone is left for a later pass.
+func (s *Service) DeleteExpired(ctx context.Context, days int) error {
+	lister, ok := s.store.(archivedSessionLister)
+	if !ok || days <= 0 {
+		return nil
+	}
+	sessions, err := lister.ListReleasedArchivedSessions(ctx)
+	if err != nil {
+		return err
+	}
+	cutoff := s.now().AddDate(0, 0, -days)
+	var errs []error
+	for _, sess := range sessions {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if sess.ArchivedAt.After(cutoff) {
+			continue
+		}
+		err := s.Delete(ctx, sess.ID, false)
+		var apiErr *apierr.Error
+		if err == nil || errors.As(err, &apiErr) && (apiErr.Kind == apierr.KindConflict || apiErr.Kind == apierr.KindNotFound) {
+			continue
+		}
+		errs = append(errs, fmt.Errorf("delete expired session %s: %w", sess.ID, err))
+	}
+	return errors.Join(errs...)
+}
+
+// deleteArtifactDir removes a deleted session's artifact directory. Failures
+// are logged, not returned: the record is already gone.
+func (s *Service) deleteArtifactDir(ctx context.Context, id domain.SessionID) {
+	dir := sessionartifacts.Dir(s.dataDir, id)
+	if s.artifactDeleter == nil || dir == "" {
+		return
+	}
+	// The deleter waits out an in-flight capture, then leaves an empty
+	// directory for a restore that cannot happen now, so remove that too.
+	err := s.artifactDeleter.DeleteSession(ctx, id)
+	if err == nil {
+		err = os.Remove(dir)
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) && s.logger != nil {
+		s.logger.Warn("delete artifacts of deleted session", "session", id, "err", err)
+	}
+}
+
+// RollbackSpawn deletes a seed-state session row, or falls back to a Kill if
+// the session has spawn output. Used by the CLI to undo a `spawn --claim-pr`
+// when the claim step fails, avoiding the orphan terminated row that a plain
+// Kill would leave behind.
+func (s *Service) RollbackSpawn(ctx context.Context, id domain.SessionID) (RollbackOutcome, error) {
+	s.cancelTitleRefinement(id)
+	deleted, killed, err := s.manager.RollbackSpawn(ctx, id)
+	if err != nil {
+		return RollbackOutcome{}, toAPIError(err)
+	}
+	return RollbackOutcome{Deleted: deleted, Killed: killed}, nil
+}
+
+// Send delegates agent messaging to the internal manager. attachment is an
+// optional inline image (e.g. a browser-annotation snapshot) written into the
+// session worktree and referenced from the delivered message.
+func (s *Service) Send(ctx context.Context, id domain.SessionID, message string, attachment *ports.SpawnAttachment) error {
+	return toAPIError(s.manager.Send(ctx, id, message, attachment))
+}
+
+// SendWithOptions preserves authorship facts supplied by trusted UI surfaces.
+func (s *Service) SendWithOptions(ctx context.Context, id domain.SessionID, message string, attachment *ports.SpawnAttachment, options ports.MessageDeliveryOptions) error {
+	return toAPIError(s.manager.SendWithOptions(ctx, id, message, attachment, options))
+}
+
+// Rename updates the user-facing session display name.
+//
+// Display names are independent of orchestration identity, routing and permissions.
+func (s *Service) Rename(ctx context.Context, id domain.SessionID, displayName string) error {
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		return apierr.Invalid("DISPLAY_NAME_REQUIRED", "Display name is required", nil)
+	}
+	if utf8.RuneCountInString(displayName) > maxDisplayNameLen {
+		return apierr.Invalid("DISPLAY_NAME_TOO_LONG", fmt.Sprintf("Display name must be %d characters or fewer", maxDisplayNameLen), nil)
+	}
+	rec, ok, err := s.store.GetSession(ctx, id)
+	if err != nil {
+		return fmt.Errorf("rename %s: %w", id, err)
+	}
+	if !ok {
+		return apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	renamed, err := s.store.RenameSession(ctx, id, displayName, time.Now().UTC())
+	if err != nil {
+		wrapped := fmt.Errorf("rename %s: %w", id, err)
+		s.recordRenamed(ctx, id, rec.DisplayName, displayName, domain.ActivityStatusFailed, wrapped)
+		return wrapped
+	}
+	if !renamed {
+		missing := apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+		s.recordRenamed(ctx, id, rec.DisplayName, displayName, domain.ActivityStatusFailed, missing)
+		return missing
+	}
+	s.recordRenamed(ctx, id, rec.DisplayName, displayName, domain.ActivityStatusCompleted, nil)
+	return nil
+}
+
+// SetPreview persists the browser preview URL for a session and returns the
+// refreshed read model. The URL is taken verbatim from the caller (the
+// controller resolves it, either an explicit target or an autodetected entry).
+// Persisting it via the store fans out a session_updated CDC event through the
+// sessions_cdc_update trigger, mirroring how other session mutations surface on
+// the live event stream.
+func (s *Service) SetPreview(ctx context.Context, id domain.SessionID, previewURL string) (domain.Session, error) {
+	updated, err := s.store.SetSessionPreviewURL(ctx, id, previewURL, time.Now().UTC())
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("set preview url %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// SetTerminateOnPRMerge persists the user's merge-completion lifecycle policy
+// and returns the refreshed read model.
+func (s *Service) SetTerminateOnPRMerge(ctx context.Context, id domain.SessionID, terminate bool) (domain.Session, error) {
+	updated, err := s.store.SetSessionTerminateOnPRMerge(ctx, id, terminate, time.Now().UTC())
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("set terminate-on-pr-merge %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// SetAutoInjectReview persists whether new SCM and AO review feedback should be sent to the session.
+func (s *Service) SetAutoInjectReview(ctx context.Context, id domain.SessionID, autoInject bool) (domain.Session, error) {
+	updated, err := s.store.SetSessionAutoInjectReview(ctx, id, autoInject, time.Now().UTC())
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("set auto-inject review %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// SetAutoInjectCI persists the default automatic CI-failure injection policy
+// for PRs created after this update. Existing PRs keep their captured policy.
+func (s *Service) SetAutoInjectCI(ctx context.Context, id domain.SessionID, autoInject bool) (domain.Session, error) {
+	updated, err := s.store.SetSessionAutoInjectCI(ctx, id, autoInject, time.Now().UTC())
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("set auto-inject CI %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// Pin marks a session as pinned and returns the refreshed read model.
+func (s *Service) Pin(ctx context.Context, id domain.SessionID) (domain.Session, error) {
+	now := s.now()
+	updated, err := s.store.SetSessionPinned(ctx, id, true, &now, now)
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("pin %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// Unpin marks a session as unpinned and returns the refreshed read model.
+func (s *Service) Unpin(ctx context.Context, id domain.SessionID) (domain.Session, error) {
+	now := s.now()
+	updated, err := s.store.SetSessionPinned(ctx, id, false, nil, now)
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("unpin %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// SetReviewerHarness persists the reviewer selected for this session. Empty
+// clears the preference and restores the project-level fallback.
+func (s *Service) SetReviewerHarness(ctx context.Context, id domain.SessionID, harness domain.ReviewerHarness, config domain.AgentConfig) (domain.Session, error) {
+	if harness != "" && !harness.IsKnown() {
+		return domain.Session{}, apierr.Invalid("UNKNOWN_REVIEWER_HARNESS", "Unknown reviewer harness", nil)
+	}
+	if err := config.Validate(); err != nil {
+		return domain.Session{}, apierr.Invalid("INVALID_REVIEWER_CONFIG", "Invalid reviewer config", map[string]any{"detail": err.Error()})
+	}
+	updated, err := s.store.SetSessionReviewerConfig(ctx, id, harness, config, time.Now().UTC())
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("set reviewer config %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// SetAutoReview enables or disables daemon-side review automation for a session.
+func (s *Service) SetAutoReview(ctx context.Context, id domain.SessionID, enabled bool) (domain.Session, error) {
+	updated, err := s.store.SetSessionAutoReview(ctx, id, enabled, s.now())
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("set auto review %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// Cleanup delegates terminal workspace cleanup to the internal manager and
+// reports both reclaimed and preserved (skipped) workspaces.
+func (s *Service) Cleanup(ctx context.Context, project domain.ProjectID) (CleanupOutcome, error) {
+	res, err := s.manager.Cleanup(ctx, project)
+	if err != nil {
+		return CleanupOutcome{}, err
+	}
+	out := CleanupOutcome{
+		Cleaned:     res.Cleaned,
+		AlreadyGone: res.AlreadyGone,
+		Skipped:     make([]CleanupSkipped, 0, len(res.Skipped)),
+	}
+	if out.Cleaned == nil {
+		out.Cleaned = []domain.SessionID{}
+	}
+	if out.AlreadyGone == nil {
+		out.AlreadyGone = []domain.SessionID{}
+	}
+	for _, skip := range res.Skipped {
+		out.Skipped = append(out.Skipped, CleanupSkipped{SessionID: skip.SessionID, Code: skip.Code, Reason: skip.Reason})
+	}
+	return out, nil
+}
+
+// TeardownProject stops every live session in a project concurrently, then asks
+// the session manager to reclaim terminal workspaces. The expensive per-session
+// work (agent/runtime shutdown, controller teardown) is independent, so running
+// the kills in parallel is what makes removing a many-session project fast;
+// sessions of the same project that reach the shared repository are serialized
+// by the workspace adapter's per-repo teardown lock. Dirty worktrees are
+// preserved by Kill and Cleanup; callers only see hard teardown failures.
+func (s *Service) TeardownProject(ctx context.Context, project domain.ProjectID) error {
+	recs, err := s.listRecords(ctx, project)
+	if err != nil {
+		return err
+	}
+	errs := make([]error, len(recs))
+	var wg sync.WaitGroup
+	for i := range recs {
+		if recs[i].IsTerminated {
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := s.Kill(ctx, recs[i].ID); err != nil {
+				errs[i] = err
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	_, err = s.Cleanup(ctx, project)
+	return err
+}
+
+// List returns sessions as enriched display models after applying API filters.
+func (s *Service) List(ctx context.Context, filter ListFilter) ([]domain.Session, error) {
+	page, err := s.ListPage(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	return page.Sessions, nil
+}
+
+// ListPage lists the sessions matching filter, one page at a time when
+// filter.Limit is set, and reports the archive an active-only list left out.
+// The page is chosen from the stored rows before any read-model facts are
+// loaded, so a page of an archive of thousands costs a page's worth of reads.
+func (s *Service) ListPage(ctx context.Context, filter ListFilter) (ListPage, error) {
+	recoveryRevision := s.statusRecoveryRevision()
+	if filter.Limit < 0 || filter.Limit > MaxListLimit {
+		return ListPage{}, apierr.Invalid("INVALID_SESSION_LIMIT", fmt.Sprintf("Session list limit must be between 1 and %d", MaxListLimit), nil)
+	}
+	var after *listPageKey
+	if filter.Cursor != "" {
+		if filter.Limit == 0 {
+			return ListPage{}, invalidSessionCursor()
+		}
+		key, err := decodeSessionCursor(filter.Cursor)
+		if err != nil {
+			return ListPage{}, err
+		}
+		after = &key
+	}
+	recs, err := s.listRecords(ctx, filter.ProjectID)
+	if err != nil {
+		return ListPage{}, err
+	}
+	matched, archive := selectSessionRecords(recs, filter)
+	page := ListPage{Archived: archive}
+	if filter.Limit > 0 {
+		matched, page.NextCursor = pageSessionRecords(matched, after, filter.Limit)
+	}
+	page.Sessions, err = s.sessionsFromRecords(ctx, matched, recoveryRevision)
+	if err != nil {
+		return ListPage{}, err
+	}
+	return page, nil
+}
+
+// sessionsFromRecords builds the read model for already-selected rows, batching
+// every per-session fact read so the cost does not grow with the row count.
+func (s *Service) sessionsFromRecords(ctx context.Context, filtered []domain.SessionRecord, recoveryRevision uint64) ([]domain.Session, error) {
+	ids := make([]domain.SessionID, 0, len(filtered))
+	var archived []domain.SessionID
+	for _, rec := range filtered {
+		ids = append(ids, rec.ID)
+		if rec.IsTerminated {
+			archived = append(archived, rec.ID)
+		}
+	}
+	prsBySession, err := s.store.ListPRFactsForSessions(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("list pr facts: %w", err)
+	}
+	runsBySession, err := s.store.ListCurrentHeadReviewRunsForSessions(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("list review runs: %w", err)
+	}
+	interrupted, err := s.store.ListInterruptedSessions(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("list interrupted sessions: %w", err)
+	}
+	var cleanupBySession map[domain.SessionID]domain.SessionCleanupRecord
+	if len(archived) > 0 {
+		if cleanupBySession, err = s.store.ListSessionCleanupFactsForSessions(ctx, archived); err != nil {
+			return nil, fmt.Errorf("list workspace cleanup facts: %w", err)
+		}
+	}
+	out := make([]domain.Session, 0, len(filtered))
+	for _, rec := range filtered {
+		facts, found := cleanupBySession[rec.ID]
+		sess, err := s.toSessionWithFacts(ctx, rec, prsBySession[rec.ID], runsBySession[rec.ID], interrupted[rec.ID], currentWorkspaceCleanup(rec, facts, found))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
+	if s.statusRecoveryRevision() != recoveryRevision {
+		for i := range out {
+			out[i].StatusReadiness = "checking"
+		}
+	}
+	return out, nil
+}
+
+func (s *Service) statusRecoveryRevision() uint64 {
+	if recovery, ok := s.manager.(interface{ StatusRecoveryRevision() uint64 }); ok {
+		return recovery.StatusRecoveryRevision()
+	}
+	return 0
+}
+
+func (s *Service) listRecords(ctx context.Context, project domain.ProjectID) ([]domain.SessionRecord, error) {
+	if project == "" {
+		recs, err := s.store.ListAllSessions(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list all sessions: %w", err)
+		}
+		return recs, nil
+	}
+	recs, err := s.store.ListSessions(ctx, project)
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", project, err)
+	}
+	return recs, nil
+}
+
+func matchesSessionFilter(rec domain.SessionRecord, filter ListFilter) bool {
+	if rec.IsTaskPreparation {
+		return false
+	}
+	if filter.Active != nil && rec.IsTerminated == *filter.Active {
+		return false
+	}
+	switch filter.Kind {
+	case domain.KindOrchestrator:
+		if rec.Kind != domain.KindOrchestrator {
+			return false
+		}
+	case domain.KindWorker:
+		if rec.Kind == domain.KindOrchestrator {
+			return false
+		}
+	}
+	if filter.OrchestratorOnly && rec.Kind != domain.KindOrchestrator {
+		return false
+	}
+	if filter.Fresh && rec.IsTerminated {
+		return false
+	}
+	return true
+}
+
+// GetRecord reads a session's stored row without the read model Get builds on
+// top (PR facts, review runs, artifact listing, agent switch). It serves hot
+// paths that need only stored fields, such as the preview proxy, which runs
+// once for every module a dev server serves.
+func (s *Service) GetRecord(ctx context.Context, id domain.SessionID) (domain.SessionRecord, error) {
+	rec, ok, err := s.store.GetSession(ctx, id)
+	if err != nil {
+		return domain.SessionRecord{}, fmt.Errorf("get %s: %w", id, err)
+	}
+	if !ok || rec.IsTaskPreparation {
+		return domain.SessionRecord{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return rec, nil
+}
+
+// Get returns one session as an enriched display model, or an apierr.NotFound
+// (SESSION_NOT_FOUND) if it is absent.
+func (s *Service) Get(ctx context.Context, id domain.SessionID) (domain.Session, error) {
+	recoveryRevision := s.statusRecoveryRevision()
+	rec, ok, err := s.store.GetSession(ctx, id)
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("get %s: %w", id, err)
+	}
+	if !ok {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	if rec.IsTaskPreparation {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	sess, err := s.toSession(ctx, rec)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	if s.statusRecoveryRevision() != recoveryRevision {
+		sess.StatusReadiness = "checking"
+	}
+	return sess, nil
+}
+
+func (s *Service) toSessionWithFacts(ctx context.Context, rec domain.SessionRecord, prs []domain.PRFacts, runs []domain.CurrentHeadReviewRun, interrupted bool, cleanup domain.SessionCleanupRecord) (domain.Session, error) {
+	// A row created before artifact_dir existed carries it as '' (the
+	// migration's default) even though session_manager always prompts the
+	// agent to write into the deterministic dataDir/artifacts/<id> path.
+	// Fall back to that derived path here so the file listing and preview
+	// root (sess.Metadata.ArtifactDir, read directly by the preview
+	// controller) are correct on this read, rather than waiting for
+	// lifecycle.Manager.ReconcileSessionOutputType's next poll tick to
+	// persist the backfill.
+	//
+	// The artifact-output poller skips terminated sessions (nothing more can
+	// happen to a session that is done), so a terminated row would never get
+	// durably repaired through that path alone. Trigger the same reconcile
+	// here, on read, unconditionally of IsTerminated, in two cases: a legacy
+	// row whose ArtifactDir was empty, and a row whose persisted type does not
+	// yet record artifact files that exist on disk (the agent wrote output and
+	// the session ended before any reconcile ran). Both are one-time
+	// self-healing writes, not a recurring per-read cost.
+	backfilledArtifactDir := false
+	if rec.Metadata.ArtifactDir == "" {
+		if dir := sessionartifacts.Dir(s.dataDir, rec.ID); dir != "" {
+			rec.Metadata.ArtifactDir = dir
+			backfilledArtifactDir = true
+		}
+	}
+	artifactFiles, err := sessionartifacts.List(ctx, rec.Metadata.ArtifactDir)
+	if err != nil {
+		// An unwalkable artifact root must not fail the session read (and with
+		// it the whole board); the artifact list is simply empty for this read.
+		if s.logger != nil {
+			s.logger.Warn("list session artifacts", "session", rec.ID, "err", err)
+		}
+		artifactFiles = nil
+	}
+	if backfilledArtifactDir || (len(artifactFiles) > 0) != rec.OutputType.HasArtifact() {
+		// Reflect the repair in this response's OutputType too, not just
+		// future ones: the persisted write below lands asynchronously
+		// relative to this read.
+		rec.OutputType = sessionartifacts.DeriveOutputType(len(prs), len(artifactFiles))
+		if s.outputTypeReconciler != nil {
+			if err := s.outputTypeReconciler.ReconcileSessionOutputType(ctx, rec.ID); err != nil && s.logger != nil {
+				s.logger.Warn("reconcile output type on read", "session", rec.ID, "err", err)
+			}
+		}
+	}
+	runs = canonicalizeCurrentHeadReviewRuns(prs, runs)
+	prs = deduplicatePRFacts(prs)
+	// Both derivations read the clock once, from the same instant: they share
+	// the no-signal rule, and two reads could put them either side of its grace
+	// period and have the card contradict its own status.
+	now := s.now()
+	// rec.OutputType is the persisted column (lifecycle.Manager.
+	// ReconcileSessionOutputType is the sole writer); it is deliberately not
+	// recomputed here so the API and Kanban see the same durable
+	// classification rather than a value that can differ read to read.
+	presentation := deriveKanbanPresentation(rec, prs, runs, interrupted, now, s.harnessSignals(rec.Harness))
+	readiness := "ready"
+	if recovery, ok := s.manager.(interface {
+		SessionStatusReadiness(domain.SessionRecord) string
+	}); ok {
+		readiness = recovery.SessionStatusReadiness(rec)
+	}
+	return domain.Session{
+		SessionRecord:              rec,
+		WorkspaceCleanup:           cleanup.WorkspaceDisposition,
+		WorkspaceCleanupReportOnly: cleanup.ReportOnly,
+		StatusReadiness:            readiness,
+		ChatProviderPreserved: rec.Mode == domain.SessionModeChat && !rec.IsTerminated &&
+			s.chatProviderPreserved != nil && s.chatProviderPreserved(rec.ID),
+		Status:           deriveStatus(rec, prs, now, s.harnessSignals(rec.Harness)),
+		SCMStatus:        deriveSCMStatus(prs),
+		KanbanColumn:     presentation.Column,
+		DisplayStatus:    presentation.DisplayStatus,
+		TerminalHandleID: rec.Metadata.RuntimeHandleID,
+		ArtifactFiles:    artifactFiles,
+		PRs:              prs,
+	}, nil
+}
+
+// toAPIError maps the session engine's sentinel errors to their REST API
+// equivalents; an unrecognized error passes through and surfaces as a 500.
+func toAPIError(err error) error {
+	original := ownership.Own(err, ownership.OwnerHTTP)
+	return ownership.Preserve(original, mapSessionError(original))
+}
+
+func mapSessionError(err error) error {
+	var relaunchErr *sessionmanager.RelaunchError
+	var cleanupRefused *sessionmanager.CleanupRefusedError
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, sessionmanager.ErrNotFound):
+		return apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	case errors.Is(err, ErrPRNotOpen):
+		return apierr.Conflict("PR_NOT_OPEN", "PR is not open", nil)
+	case errors.Is(err, ports.ErrAgentAccountUnknown):
+		return apierr.NotFound("AGENT_ACCOUNT_NOT_FOUND", "Unknown agent account")
+	case errors.Is(err, ports.ErrAgentAccountProviderMismatch):
+		return apierr.Invalid("AGENT_ACCOUNT_PROVIDER_MISMATCH", "The account is for a different agent", nil)
+	case errors.Is(err, ports.ErrAgentAccountDefaultUnusable):
+		return apierr.Conflict("AGENT_ACCOUNT_DEFAULT_UNUSABLE", "The default account is signed out or now holds another login, and no other account is signed in. Sign one in again in Settings.", nil)
+	case errors.Is(err, ports.ErrAgentAccountSignedOut):
+		return apierr.Conflict("AGENT_ACCOUNT_SIGNED_OUT", "The account is signed out; sign it in again first", nil)
+	case errors.Is(err, ports.ErrAgentAccountUnchanged):
+		return apierr.Conflict("AGENT_ACCOUNT_UNCHANGED", "The session already uses this account", nil)
+	case errors.Is(err, ports.ErrAgentAccountUnshared):
+		return apierr.Conflict("AGENT_ACCOUNT_UNSHARED",
+			"AO cannot link this account's folder to this computer's history. On Windows, turn on Developer Mode.", nil)
+	case errors.Is(err, sessionmanager.ErrNotRestorable):
+		return apierr.Conflict("SESSION_NOT_RESTORABLE", "Session is not restorable", nil)
+	case errors.Is(err, sessionmanager.ErrTerminated):
+		return apierr.Conflict("SESSION_TERMINATED", "Session is terminated", nil)
+	case errors.Is(err, sessionmanager.ErrSessionNotTerminated):
+		return apierr.Conflict("SESSION_NOT_TERMINATED", "Archive the session before deleting it.", nil)
+	case errors.As(err, &cleanupRefused):
+		return apierr.Conflict("WORKSPACE_CLEANUP_REFUSED", "The worktree was kept, so the session was not deleted: "+cleanupRefused.Reason,
+			map[string]any{"code": string(cleanupRefused.Code)})
+	case errors.Is(err, sessionmanager.ErrWorkspaceNotReleased):
+		return apierr.Conflict("WORKSPACE_NOT_RELEASED",
+			"The session's worktree has not been cleaned up yet. Run `ao session cleanup` first.", nil)
+	case errors.Is(err, domain.ErrSessionHistoryShared):
+		return apierr.Conflict("SESSION_HISTORY_SHARED",
+			"This session's turns belong to a conversation that outlives it, so it cannot be deleted.", nil)
+	case errors.Is(err, chatsvc.ErrNoController), errors.Is(err, chatsvc.ErrNotProvisioning):
+		// A chat session whose controller stopped or never started. Same answer
+		// steer-or-send gives, so clients can offer a resume instead of a 500.
+		return apierr.Conflict("CHAT_CONTROLLER_NOT_READY",
+			"the agent controller for this session is not running", nil)
+	case errors.Is(err, sessionmanager.ErrAgentExited):
+		return apierr.Conflict("AGENT_EXITED",
+			"The agent process exited; relaunch it before sending another message", nil)
+	case errors.Is(err, sessionmanager.ErrAgentNotExited):
+		return apierr.Conflict("AGENT_NOT_EXITED",
+			"The agent is still running; only exited agents can be resumed", nil)
+	case errors.Is(err, sessionmanager.ErrResumeInProgress):
+		return apierr.Conflict("AGENT_RESUME_IN_PROGRESS",
+			"The agent is already being resumed", nil)
+	case errors.Is(err, sessionmanager.ErrAgentExitInProgress):
+		return apierr.Conflict("AGENT_EXIT_IN_PROGRESS",
+			"The agent is already exiting", nil)
+	case errors.Is(err, sessionmanager.ErrOperationInProgress):
+		return apierr.Conflict("SESSION_OPERATION_IN_PROGRESS", "Another operation is already running on this session", nil)
+	case errors.Is(err, sessionmanager.ErrInterfaceTransitionInProgress):
+		return apierr.Conflict("INTERFACE_TRANSITION_IN_PROGRESS",
+			"This session is already switching interfaces", nil)
+	case errors.Is(err, sessionmanager.ErrInterfaceHandoffUnsupported):
+		return apierr.Conflict("INTERFACE_HANDOFF_UNSUPPORTED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrNativeConversationMissing):
+		return apierr.Conflict("NATIVE_SESSION_MISSING",
+			"The agent has not exposed a native conversation that can resume in the other interface", nil)
+	case errors.Is(err, sessionmanager.ErrNativeConversationUnverified):
+		return apierr.Conflict("NATIVE_SESSION_UNVERIFIED",
+			"The current terminal launch has not confirmed that it owns the stored native conversation yet", nil)
+	case errors.Is(err, sessionmanager.ErrInterfaceWorkspaceUnavailable):
+		return apierr.Conflict("WORKSPACE_UNAVAILABLE",
+			"The session's workspace was never set up; retry its start before switching interfaces", nil)
+	case errors.Is(err, sessionmanager.ErrInterfaceTransitionNotCancellable):
+		return apierr.Conflict("INTERFACE_TRANSITION_NOT_CANCELLABLE",
+			"The source controller has already stopped; AO must finish or recover the switch", nil)
+	case errors.Is(err, sessionmanager.ErrInterfaceTransitionNoticeNotAcknowledgeable):
+		return apierr.Conflict("INTERFACE_TRANSITION_NOTICE_NOT_ACKNOWLEDGEABLE",
+			"This interface switch has no failure or recovery notice to acknowledge", nil)
+	case errors.Is(err, sessionmanager.ErrInterfaceProviderHistoryRecoveryUnavailable):
+		return apierr.Conflict("PROVIDER_HISTORY_RECOVERY_UNAVAILABLE",
+			"Provider history can be used only after AO identifies a legacy text-only mismatch", nil)
+	case errors.Is(err, sessionmanager.ErrInterfaceAlreadySelected):
+		return apierr.Conflict("INTERFACE_ALREADY_SELECTED",
+			"The session is already using the requested interface", nil)
+	case errors.Is(err, sessionmanager.ErrInterfaceTransitionNotFound):
+		return apierr.NotFound("INTERFACE_TRANSITION_NOT_FOUND", "Interface switch not found")
+	case errors.Is(err, sessionmanager.ErrAwaitingDecision):
+		return apierr.Conflict("SESSION_AWAITING_DECISION",
+			"Session is paused on a permission decision; answer it in the session terminal first", nil)
+	case errors.Is(err, sessionmanager.ErrComposerBusy):
+		return apierr.Conflict("SESSION_COMPOSER_BUSY",
+			"Session composer has an unsent draft; retry after the draft is submitted or cleared", nil)
+	case errors.Is(err, sessionmanager.ErrStartupPending):
+		return apierr.Conflict("SESSION_STARTUP_PENDING",
+			"Session agent is still starting; retry after the agent prompt is ready", nil)
+	case errors.Is(err, sessionmanager.ErrIncompleteHandle):
+		return apierr.Conflict("SESSION_INCOMPLETE_HANDLE", "Session is missing runtime or workspace handles", nil)
+	case errors.Is(err, sessionmanager.ErrNotResumable):
+		return apierr.Conflict("SESSION_NOT_RESUMABLE",
+			"This session has no saved agent session or prompt to resume from", nil)
+	case errors.Is(err, sessionmanager.ErrProjectNotResolvable):
+		return apierr.Invalid("PROJECT_NOT_RESOLVABLE", "Project is not registered or has no repo. Register it with `ao project add`", nil)
+	case errors.Is(err, sessionmanager.ErrUnknownHarness):
+		return apierr.Invalid("UNKNOWN_HARNESS", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrMissingHarness):
+		return apierr.Invalid("AGENT_REQUIRED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrArtifactOutputUnavailable):
+		return apierr.Invalid("ARTIFACT_OUTPUT_UNAVAILABLE", "Artifact output needs a daemon data directory to hold the session's artifacts", nil)
+	case errors.Is(err, sessionmanager.ErrHarnessInstallActive):
+		return apierr.Conflict("HARNESS_INSTALL_ACTIVE", "The selected harness is currently being installed", nil)
+	case errors.Is(err, sessionmanager.ErrUnsupportedModel):
+		return apierr.Invalid("UNSUPPORTED_MODEL", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrTargetAgentUnauthorized):
+		return apierr.Invalid("TARGET_AGENT_UNAUTHORIZED",
+			"The target agent is not authenticated; authenticate it before switching", nil)
+	case errors.Is(err, sessionmanager.ErrDeliveryUnconfirmed):
+		return apierr.Conflict("SESSION_DELIVERY_UNCONFIRMED",
+			"Message was written to the terminal but the agent did not start a turn; prompt may be unsubmitted", nil)
+	case errors.Is(err, sessionmanager.ErrScratchBranchUnsupported):
+		return apierr.Invalid("SCRATCH_BRANCH_UNSUPPORTED", err.Error(), nil)
+	case errors.Is(err, ports.ErrWorkspaceBranchCheckedOutElsewhere):
+		return apierr.Conflict("BRANCH_CHECKED_OUT_ELSEWHERE", err.Error(), nil)
+	case errors.Is(err, ports.ErrWorkspaceBranchAlreadyExists):
+		return apierr.Conflict("BRANCH_ALREADY_EXISTS", "Choose a branch name that does not already exist locally or on a remote", nil)
+	case errors.Is(err, ports.ErrWorkspaceDefaultBranchUnresolved):
+		return apierr.Invalid("DEFAULT_BRANCH_UNRESOLVED", err.Error(), nil)
+	case errors.Is(err, ports.ErrWorkspaceBranchNotFetched):
+		return apierr.Invalid("BRANCH_NOT_FETCHED", err.Error(), nil)
+	case errors.Is(err, ports.ErrWorkspaceBranchInvalid):
+		return apierr.Invalid("INVALID_BRANCH", err.Error(), nil)
+	case errors.Is(err, ports.ErrAgentBinaryNotFound):
+		return apierr.Invalid("AGENT_BINARY_NOT_FOUND", err.Error(), nil)
+	case errors.Is(err, ports.ErrRuntimePrerequisite):
+		return apierr.Invalid("RUNTIME_PREREQUISITE_MISSING", err.Error(), nil)
+	case errors.Is(err, ports.ErrRuntimeCommandLineTooLong):
+		return apierr.Invalid("WINDOWS_COMMAND_LINE_TOO_LONG",
+			"The agent launch command exceeds the Windows size limit. Shorten the task or project instructions.", nil)
+	case errors.Is(err, ports.ErrChatPermissionModeUnsupported):
+		return apierr.Invalid("CHAT_PERMISSION_MODE_UNSUPPORTED", err.Error(), nil)
+	case errors.Is(err, ports.ErrChatUnsupported):
+		var capabilityErr *ports.ChatCapabilityError
+		if errors.As(err, &capabilityErr) {
+			missing := make([]string, 0, len(capabilityErr.Missing))
+			for _, capability := range capabilityErr.Missing {
+				missing = append(missing, string(capability))
+			}
+			allowed := make([]string, 0, len(capabilityErr.AllowedPermissionModes))
+			for _, mode := range capabilityErr.AllowedPermissionModes {
+				allowed = append(allowed, string(mode))
+			}
+			return apierr.Conflict("SESSION_MODE_UNSUPPORTED", err.Error(), map[string]any{
+				"missingCapabilities":  missing,
+				"allowedApprovalModes": allowed,
+			})
+		}
+		return apierr.Conflict("SESSION_MODE_UNSUPPORTED", err.Error(), nil)
+	case errors.Is(err, ports.ErrChatRecoveryInconclusive):
+		// Checked before the envelope's transient mapping: a recovery that cannot
+		// safely take over a still-running provider fails the same way on every
+		// retry, often with a deadline in the chain, so it is not "momentarily
+		// unavailable".
+		return apierr.Conflict("CHAT_RECOVERY_INCONCLUSIVE",
+			"AO could not safely reconnect to the session's still-running chat process: "+err.Error(), nil)
+	case errors.Is(err, ports.ErrChatDriverUnavailable):
+		return apierr.Conflict("CHAT_DRIVER_UNAVAILABLE", err.Error(), nil)
+	case errors.Is(err, ports.ErrChatDriverIncompatible):
+		return apierr.Conflict("CHAT_DRIVER_INCOMPATIBLE", err.Error(), nil)
+	case errors.Is(err, ports.ErrChatAuthRequired):
+		return apierr.Conflict("CHAT_AUTH_REQUIRED", "The agent is installed but not authenticated", nil)
+	case errors.Is(err, ports.ErrChatResumeFailed):
+		return apierr.Conflict("CHAT_RESUME_FAILED",
+			"The agent could not resume its saved conversation. Your AO history is still available.", nil)
+	case errors.Is(err, ports.ErrAgentAuthRequired):
+		return apierr.Conflict("AGENT_AUTH_REQUIRED", "The agent is installed but the project credential was rejected", nil)
+	case errors.Is(err, ports.ErrUnsupportedEffort):
+		return apierr.Invalid("UNSUPPORTED_EFFORT", err.Error(), nil)
+	case errors.Is(err, ports.ErrModelCapabilitiesUnavailable):
+		return apierr.Invalid("MODEL_CAPABILITIES_UNAVAILABLE", err.Error(), nil)
+	case errors.Is(err, ports.ErrRuntimeWorkspaceCwdMismatch):
+		return apierr.Conflict("WORKSPACE_CWD_MISMATCH", err.Error(), nil)
+	case errors.Is(err, ports.ErrWorkspaceLocked):
+		return apierr.Conflict("WORKSPACE_LOCKED", err.Error(), nil)
+	case errors.Is(err, ports.ErrWorkspacePathOccupied):
+		return apierr.Conflict("WORKSPACE_PATH_OCCUPIED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrCleanupScript):
+		return apierr.Conflict("WORKSPACE_CLEANUP_FAILED", "Workspace cleanup script failed; the worktree was preserved. Fix the script and retry cleanup.", nil)
+	case errors.Is(err, context.DeadlineExceeded):
+		return err
+	case errors.As(err, &relaunchErr):
+		return apierr.Conflict("AGENT_RESUME_FAILED",
+			"AO could not relaunch the agent (step: "+relaunchErr.Step+"). Check the daemon log for details.",
+			map[string]any{"step": relaunchErr.Step})
+	default:
+		return err
+	}
+}
+
+// toSpawnAPIError maps spawn failures to structured API errors so telemetry and
+// clients never land in the unclassified internal bucket when a stage sentinel
+// is present. Known inner sentinels (branch state, agent binary, chat
+// preflight) still win via toAPIError. Already-mapped *apierr.Error values are
+// returned as-is so emitSpawnFailed can classify raw or pre-mapped errors.
+func toSpawnAPIError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var already *apierr.Error
+	if errors.As(err, &already) {
+		return already
+	}
+	if mapped := toAPIError(err); !errors.Is(mapped, err) {
+		return mapped
+	}
+	// A failed Setup step already explains itself; the spawn stage prefix is noise.
+	var setupErr *sessionmanager.SetupStepError
+	if errors.As(err, &setupErr) {
+		return apierr.Conflict("WORKSPACE_PROVISION_FAILED", setupErr.Error(), nil)
+	}
+	switch {
+	case errors.Is(err, sessionmanager.ErrClientRequestConflict):
+		return apierr.Conflict("CLIENT_REQUEST_CONFLICT", "clientRequestId belongs to a different task", nil)
+	case errors.Is(err, sessionmanager.ErrClientRequestIncomplete):
+		return apierr.Conflict("CLIENT_REQUEST_INCOMPLETE", "This task is still starting or its prior launch did not finish; check the session before trying again", nil)
+	case errors.Is(err, context.DeadlineExceeded):
+		return apierr.Conflict("SPAWN_TIMEOUT", "Session spawn timed out before the agent could start", nil)
+	case errors.Is(err, context.Canceled):
+		return apierr.Conflict("SPAWN_CANCELLED", "Session spawn was cancelled", nil)
+	case errors.Is(err, sessionmanager.ErrSpawnPrompt):
+		return apierr.Internal("SPAWN_PROMPT_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnCreate):
+		return apierr.Internal("SPAWN_CREATE_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnSystemPrompt):
+		return apierr.Internal("SPAWN_SYSTEM_PROMPT_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrWorkspaceCreate):
+		return apierr.Conflict("WORKSPACE_CREATE_FAILED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrWorkspaceProvision):
+		return apierr.Conflict("WORKSPACE_PROVISION_FAILED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrSpawnAttachments):
+		return apierr.Invalid("SPAWN_ATTACHMENTS_FAILED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrSpawnBrowser):
+		return apierr.Internal("SPAWN_BROWSER_CAPABILITY_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnPrepare):
+		return apierr.Internal("SPAWN_PREPARE_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnPromptDelivery):
+		return apierr.Internal("SPAWN_PROMPT_DELIVERY_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnLaunchCommand):
+		return apierr.Internal("SPAWN_LAUNCH_COMMAND_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnSupervisor):
+		return apierr.Internal("SPAWN_SUPERVISOR_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnPrepareLaunch):
+		return apierr.Internal("SPAWN_PREPARE_LAUNCH_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrRuntimeCreate):
+		return apierr.Internal("RUNTIME_CREATE_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnCommit):
+		return apierr.Internal("SPAWN_COMMIT_FAILED", err.Error())
+	case errors.Is(err, sessionmanager.ErrSpawnDeliverPrompt):
+		return apierr.Conflict("SPAWN_DELIVER_PROMPT_FAILED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrChatController):
+		return apierr.Conflict("CHAT_CONTROLLER_FAILED", err.Error(), nil)
+	default:
+		return apierr.Internal("SPAWN_INTERNAL", err.Error())
+	}
+}
+
+func (s *Service) replayClientRequest(ctx context.Context, id, hash string) (domain.SessionRecord, bool, error) {
+	if id == "" || s.store == nil {
+		return domain.SessionRecord{}, false, nil
+	}
+	rec, found, err := s.store.GetSessionByClientRequestID(ctx, id)
+	if err != nil || !found {
+		return rec, found, err
+	}
+	if rec.ClientRequestHash != hash {
+		return domain.SessionRecord{}, false, toSpawnAPIError(sessionmanager.ErrClientRequestConflict)
+	}
+	if !rec.ClientRequestCommitted {
+		return domain.SessionRecord{}, false, toSpawnAPIError(sessionmanager.ErrClientRequestIncomplete)
+	}
+	return rec, true, nil
+}
+
+func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord) (domain.Session, error) {
+	prs, err := s.store.ListPRFactsForSession(ctx, rec.ID)
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("pr facts %s: %w", rec.ID, err)
+	}
+	runs, err := s.currentHeadReviewRuns(ctx, rec, prs)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	var cleanup domain.SessionCleanupRecord
+	if rec.IsTerminated {
+		facts, found, err := s.store.GetSessionCleanupFacts(ctx, rec.ID)
+		if err != nil {
+			return domain.Session{}, fmt.Errorf("get workspace cleanup facts: %w", err)
+		}
+		cleanup = currentWorkspaceCleanup(rec, facts, found)
+	}
+	interrupted, err := s.store.ListInterruptedSessions(ctx, []domain.SessionID{rec.ID})
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("interrupted turn %s: %w", rec.ID, err)
+	}
+	return s.toSessionWithFacts(ctx, rec, prs, runs, interrupted[rec.ID], cleanup)
+}
+
+// currentWorkspaceCleanup is the teardown recorded for an archived session,
+// provided the facts row belongs to its current cleanup generation.
+func currentWorkspaceCleanup(rec domain.SessionRecord, facts domain.SessionCleanupRecord, found bool) domain.SessionCleanupRecord {
+	if found && facts.SessionGeneration == rec.CleanupGeneration {
+		return facts
+	}
+	return domain.SessionCleanupRecord{}
+}
+
+// currentHeadReviewRuns reads the session's AO review passes for the Kanban
+// reducer. Sessions the reducer already decides without them — terminated ones
+// and ones with no PR yet — skip the query, so listing a board of building
+// workers stays one read per session.
+func (s *Service) currentHeadReviewRuns(ctx context.Context, rec domain.SessionRecord, prs []domain.PRFacts) ([]domain.CurrentHeadReviewRun, error) {
+	if rec.IsTerminated || len(prs) == 0 {
+		return nil, nil
+	}
+	runs, err := s.store.ListCurrentHeadReviewRunsForSession(ctx, rec.ID)
+	if err != nil {
+		return nil, fmt.Errorf("review runs %s: %w", rec.ID, err)
+	}
+	return runs, nil
+}
+
+// now tolerates a zero-value Service (tests construct the struct literally
+// without going through New, which is where clock gets its default).
+func (s *Service) now() time.Time {
+	if s.clock == nil {
+		return time.Now().UTC()
+	}
+	return s.clock().UTC()
+}
+
+// harnessSignals tolerates a zero-value Service the same way now does. Without
+// an injected capability predicate the service cannot tell a broken pipeline
+// from a hook-less harness, so it never claims no_signal.
+func (s *Service) harnessSignals(h domain.AgentHarness) bool {
+	if s.signalCapable == nil {
+		return false
+	}
+	return s.signalCapable(h)
+}

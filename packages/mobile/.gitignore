@@ -1,0 +1,63 @@
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Push secrets — the FCM V1 service-account key and any admin SDK JSON must never
+# be committed (they authorize sending push to your devices).
+*-firebase-adminsdk-*.json
+*service-account*.json
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+# generated native folders
+/ios
+/android
+
+# logs
+*.log
+
+# Firebase Android config — kept out of the public repo (origin is PUBLIC).
+# Must exist locally for `expo run:android`.
+#
+# EAS Build gets it from the GOOGLE_SERVICES_JSON file environment variable, which
+# app.config.js copies to this directory before prebuild. Nothing needs committing:
+#
+#   eas env:set --name GOOGLE_SERVICES_JSON --type file \
+#     --value ./google-services.json --visibility secret \
+#     --environment preview --environment production
+#
+# Do NOT go back to committing it in a temp commit to force it past EAS's VCS
+# client. That dance also required deleting this line, and .gitignore is a
+# fingerprint input — so every build came out with a runtime version no normal
+# working tree could reproduce, and no OTA update would ever have matched it.
+google-services.json

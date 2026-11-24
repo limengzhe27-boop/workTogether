@@ -1,0 +1,7 @@
+node_modules
+.next
+out
+.source
+next-env.d.ts
+# Compiled from the PO catalogs by `npm run i18n:compile`
+locales/*/messages.ts

@@ -1,0 +1,56 @@
+# EAS upload ignore list. When this file exists, EAS Build uses it INSTEAD of
+# .gitignore to decide what to upload — so it must mirror .gitignore's excludes.
+# Keep this in sync with .gitignore.
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Push secrets — never upload the FCM service-account / admin SDK keys.
+*-firebase-adminsdk-*.json
+*service-account*.json
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+# generated native folders
+/ios
+/android
+
+# logs
+*.log
+
+# google-services.json is deliberately not re-included here. A `!google-services.json`
+# line does not work — EAS's git VCS client strips the file anyway because it matches
+# a .gitignore rule (verified 2026-07-25). It now reaches EAS Build as the
+# GOOGLE_SERVICES_JSON file environment variable instead; app.config.js copies it into
+# place before prebuild. See packages/mobile/.gitignore.

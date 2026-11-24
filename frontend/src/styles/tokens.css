@@ -1,0 +1,890 @@
+/*
+ * Design tokens — Agent Orchestrator frontend
+ * ============================================
+ * Source of truth for the app (Electron renderer) visual system.
+ * Extracted from the existing dark-first Cursor-like UI in
+ * src/renderer/styles.css — not a restyle.
+ *
+ * Theme switching:
+ *   - Default (:root)              → dark
+ *   - :root[data-theme="light"]    → light (renderer Zustand toggle)
+ *   - :root.dark / .dark           → alias for landing/docs (Fumadocs)
+ *
+ * Imported by src/renderer/styles.css. See DESIGN_TOKENS.md.
+ */
+
+:root,
+:root.dark,
+.dark {
+	/* ── Color scheme hint for native form controls / scrollbars ── */
+	color-scheme: dark;
+
+	/* Near-neutral graphite palette: the default app surfaces use only a trace of blue-gray. */
+	--background: oklch(0.210 0.002 250);
+	--foreground: oklch(0.970 0.002 250);
+	--card: oklch(0.250 0.002 250);
+	--card-foreground: oklch(0.970 0.002 250);
+	--popover: oklch(0.300 0.002 250);
+	--popover-foreground: oklch(0.970 0.002 250);
+	--primary: oklch(0.900 0.002 250);
+	--primary-foreground: oklch(0.210 0.002 250);
+	--secondary: oklch(0.295 0.002 250);
+	--secondary-foreground: oklch(0.970 0.002 250);
+	--muted: oklch(0.295 0.002 250);
+	--muted-foreground: oklch(0.720 0.002 250);
+	--accent: oklch(0.295 0.002 250);
+	--accent-foreground: oklch(0.970 0.002 250);
+	--destructive: oklch(0.704 0.191 22.216);
+	/* Hairlines separate, they do not decorate: below the shadcn dark default of
+	 * 10% so column rules and card edges recede behind content. */
+	--border: oklch(1 0 0 / 7%);
+	--input: oklch(1 0 0 / 4%);
+	--ring: oklch(0.620 0.002 250);
+	--chart-1: oklch(0.84 0 0);
+	--chart-2: oklch(0.6 0 0);
+	--chart-3: oklch(0.48 0 0);
+	--chart-4: oklch(0.4 0 0);
+	--chart-5: oklch(0.29 0 0);
+	--radius: 0.625rem;
+	--sidebar: oklch(0.180 0.002 250);
+	--sidebar-foreground: oklch(0.970 0.002 250);
+	--sidebar-primary: oklch(0.900 0.002 250);
+	--sidebar-primary-foreground: oklch(0.210 0.002 250);
+	--sidebar-accent: oklch(0.295 0.002 250);
+	--sidebar-accent-foreground: oklch(0.970 0.002 250);
+	--sidebar-border: var(--border);
+	--sidebar-ring: oklch(0.62 0 0);
+
+	/* ═══════════════════════════════════════════════════════════════
+	   COLOR — semantic (swap these per theme; do not invent new roles
+	   for one-off hex — map one-offs to the nearest existing role)
+	   ═══════════════════════════════════════════════════════════════ */
+
+	/* Surfaces */
+	--color-bg-primary: var(--background);
+	--color-bg-secondary: var(--card);
+	--color-bg-tertiary: var(--muted);
+	--color-bg-elevated: var(--popover);
+	--color-bg-sidebar: var(--sidebar);
+	/* Keep the terminal plate opaque so the p-2 gutter cannot composite into
+	   retained frames during terminal swaps. */
+	--color-bg-terminal-opaque: var(--background);
+	--color-bg-terminal: var(--background);
+	/* Opaque backing for terminal swaps/covers; prevents retained frames leaking through. */
+	--color-bg-terminal-opaque: var(--background);
+
+	/* Text */
+	--color-text-primary: var(--foreground);
+	--color-text-muted: var(--muted-foreground);
+	--color-text-passive: var(--chart-3);
+	--color-brand-logo: #79b0dc;
+	--color-brand-logo-bright: #a5cde7;
+	--color-brand-logo-foreground: #0a0b0d;
+	--color-text-markdown-code: var(--color-brand-logo);
+	--color-text-markdown-link: var(--color-brand-logo); /* underline distinguishes links */
+	--color-text-markdown-link-hover: var(--color-brand-logo-bright);
+	--color-text-terminal: #d6d6d6;
+	--color-text-terminal-dim: #8e8e8e;
+
+	/* Borders */
+	--color-border: var(--border);
+	--color-border-strong: var(--input);
+
+	/* Reverb workspace bar — derived from the shared shadcn token scale. The bar
+	 * reads as the top of the page it heads, not as sidebar chrome, so it takes
+	 * the page canvas and separates with its hairline alone. */
+	--color-bg-topbar: var(--background);
+	--color-bg-topbar-raised: var(--secondary);
+	--color-border-topbar: var(--border);
+	--color-border-topbar-strong: var(--input);
+	--color-text-topbar: var(--foreground);
+	--color-text-topbar-muted: var(--muted-foreground);
+	--color-text-topbar-passive: var(--chart-3);
+
+	/* Accent and destructive roles */
+	--color-accent: var(--primary);
+	--color-accent-foreground: var(--primary-foreground);
+	--color-accent-weak: color-mix(in oklch, var(--primary) 16%, transparent);
+	--color-accent-dim: var(--chart-4);
+	--color-accent-strong: var(--primary);
+	--color-danger-strong: var(--destructive);
+
+	/* Board lane signals, matched to the landing hero's board preview. */
+	--color-status-working: #60a5fa;
+	--color-status-needs-you: #f06445;
+	/* Validating is pink with the new sidebar design and yellow without it
+	   (`data-legacy-status-colors`, below). Themes set the two candidates;
+	   only this block and the legacy one pick between them. */
+	--color-status-validating-new: #e58bb5;
+	--color-status-validating-legacy: #facc15;
+	--color-status-validating: var(--color-status-validating-new);
+	--color-status-in-review: #f59e0b;
+	--color-status-ready: #4ade80;
+	--color-status-merged: #c084fc;
+	--color-status-idle: var(--muted-foreground);
+	--color-status-exited: var(--destructive);
+	--color-status-terminated: var(--chart-3);
+	--color-status-terminated-foreground: var(--chart-3);
+	--color-status-unknown: var(--chart-4);
+
+	/* Compatibility roles used by non-session surfaces. */
+	--color-working: var(--color-status-working);
+	--color-warning: var(--color-status-needs-you);
+	--color-success: var(--color-status-ready);
+	--color-success-bright: var(--chart-1);
+	--color-danger: var(--destructive);
+	--color-purple: var(--chart-4);
+
+	/* Interactive overlays */
+	--color-interactive-hover: color-mix(in oklch, var(--foreground) 4%, transparent);
+	--color-interactive-active: color-mix(in oklch, var(--foreground) 7%, transparent);
+	--color-overlay-subtle: color-mix(in oklch, var(--foreground) 1.8%, transparent);
+	--color-overlay-faint: color-mix(in oklch, var(--foreground) 2%, transparent);
+	--color-scrollbar: color-mix(in oklch, var(--foreground) 12%, transparent);
+	--color-scrollbar-board: color-mix(in oklch, var(--foreground) 26%, transparent);
+	--color-scrollbar-board-hover: color-mix(in oklch, var(--foreground) 45%, transparent);
+	--color-scrim: color-mix(in oklch, var(--background) 85%, transparent);
+	--blur-overlay: 1px;
+
+	/* ═══════════════════════════════════════════════════════════════
+	   TYPOGRAPHY
+	   ═══════════════════════════════════════════════════════════════ */
+
+	--font-family-base: "Geist Variable", "Geist", ui-sans-serif, system-ui, sans-serif;
+	--font-family-mono:
+		"Geist Mono Variable", "Geist Mono", "JetBrainsMono Nerd Font Mono", "JetBrainsMono Nerd Font",
+		"FiraCode Nerd Font Mono", "FiraCode Nerd Font", "MesloLGS NF", ui-monospace, SFMono-Regular, Menlo, Monaco,
+		Consolas, "Liberation Mono", "Courier New", monospace;
+
+	/* Scale — dense UI chrome uses half-steps between base sizes */
+	--font-size-2xs: 10.5px; /* uppercase meta, board footers */
+	--font-size-xs: 10px; /* micro labels, tight pills */
+	--font-size-nano: 8px; /* smallest chrome text — sidebar search label */
+	--font-size-caption: 11px; /* badges, kanban labels */
+	--font-size-sm-md: 11.5px; /* inspector tabs, status pills */
+	--font-size-sm: 12px; /* secondary chrome / Tailwind text-xs */
+	--font-size-md-sm: 12.5px; /* kv rows, PR summaries */
+	--font-size-base: 13px; /* dense controls (board buttons) */
+	--font-size-brand: 16px; /* titlebar / board project name */
+	--font-size-md: 14px; /* body / Tailwind text-sm */
+	--font-size-subtitle: 15px; /* dialog titles, stat values */
+	--font-size-heading-sm: 17px; /* empty-state headings */
+	--font-size-heading: 21px; /* dashboard subhead */
+	--font-size-heading-lg: 22px; /* preview mock headings */
+
+	--font-weight-medium: 500;
+	--font-weight-semibold: 600;
+
+	--line-height-normal: 1.5;
+	--line-height-snug: 1.42;
+	--line-height-row: 1.25rem; /* 20px — helper rows at text-xs / text-control */
+	--line-height-body-md: 1.55;
+	--line-height-relaxed: 1.6;
+	--line-height-loose: 1.7;
+
+	/* Letter-spacing — uppercase meta, tight headings */
+	--tracking-tight-xl: -0.025em;
+	--tracking-tight-lg: -0.015em;
+	--tracking-tight: -0.01em;
+	--tracking-wide-xs: 0.04em;
+	--tracking-wide-sm: 0.05em;
+	--tracking-wide: 0.06em;
+	--tracking-wide-md: 0.08em;
+	--tracking-wide-lg: 0.09em;
+	--tracking-wide-xl: 0.12em;
+
+	/* Motion */
+	--duration-fast: 120ms;
+	--duration-normal: 150ms;
+
+	/* State opacity */
+	--opacity-control-disabled: 0.35;
+
+	/* ═══════════════════════════════════════════════════════════════
+	   SPACING — 4px base (audit: 4/6/8/10/12/14/16/18 most common)
+	   Prefer even steps; map odd pixels (5/7/9/11/13/15) to nearest.
+	   ═══════════════════════════════════════════════════════════════ */
+
+	--space-0_5: 2px;
+	--space-0_75: 3px;
+	--space-1: 4px;
+	--space-1_25: 5px;
+	--space-1_5: 6px;
+	--space-1_75: 7px;
+	--space-2: 8px;
+	--space-2_25: 9px;
+	--space-2_5: 10px;
+	--space-2_75: 11px;
+	--space-3: 12px;
+	--space-3_25: 13px;
+	--space-3_5: 14px;
+	--space-3_75: 15px;
+	--space-4: 16px;
+	--space-4_5: 18px;
+	--space-5: 20px;
+	--space-5_5: 22px;
+	--space-6: 24px;
+	--space-8: 32px;
+	--space-10: 40px;
+
+	/* ═══════════════════════════════════════════════════════════════
+	   Z-INDEX — stacking layers
+	   chrome < sidebar-preview < titlebar < overlay
+	   Preview peeks paint behind the titlebar cluster so the expand
+	   toggle stays clickable while the overlay is open.
+	   ═══════════════════════════════════════════════════════════════ */
+
+	--z-chrome: 10;
+	--z-sidebar-preview: 15;
+	--z-titlebar: 20;
+	--z-overlay: 50;
+
+	/* ═══════════════════════════════════════════════════════════════
+	   RADIUS
+	   ═══════════════════════════════════════════════════════════════ */
+
+	--radius-xs: calc(var(--radius) * 0.4);
+	--radius-sm: calc(var(--radius) * 0.6);
+	--radius-md: calc(var(--radius) * 0.8);
+	--radius-lg: var(--radius);
+	--radius-panel: calc(var(--radius) * 1.4);
+	--radius-full: 999px; /* pills, avatars, status dots */
+	--radius-swatch: 2px; /* board lane squares: square-reading, not a dot */
+
+	/* ═══════════════════════════════════════════════════════════════
+	   BREAKPOINTS — documented here; @media cannot use var()
+	   ═══════════════════════════════════════════════════════════════ */
+
+	--breakpoint-layout-narrow: 680px; /* reviewer grid — @custom-media in styles.css */
+	--breakpoint-inspector-compact: 300px; /* inspector @container */
+
+	/* ═══════════════════════════════════════════════════════════════
+	   LAYOUT — fixed chrome dimensions (not spacing scale)
+	   ═══════════════════════════════════════════════════════════════ */
+
+	--ring-width-focus: 3px; /* select trigger focus ring */
+
+	--size-hairline: 1px;
+	--size-icon-2xs: 12px;
+	--size-icon-xs: 9px;
+	--size-icon-sm: 13px;
+	--size-icon-md: 14px;
+	--size-icon-base: 16px;
+	--size-icon-lg: 15px;
+	--size-icon-xl: 18px;
+	--size-dot-sm: 7px;
+	--size-swatch: 8px; /* board lane + topbar status squares */
+	--size-control-form: 32px;
+	--size-control-xs: 20px;
+	--size-control-sm: 24px;
+	--size-control-md: 28px;
+	--size-control-lg: 34px;
+	--size-control-xl: 38px;
+	--size-control-board-sm: 30px;
+	--size-control-board: 36px;
+	--size-table-head: var(--space-10);
+	/* Reverb's route-level workspace bar and pane-level secondary rows. Keep
+	   the old names as compatibility aliases while route mounts migrate. */
+	--size-topbar-primary: 36px;
+	--size-topbar-secondary: 36px;
+	--size-topbar-control: 28px;
+	--gap-topbar-control: var(--space-1);
+	--size-toolbar: var(--size-topbar-primary);
+	/* Controls center above the shared header's one-pixel bottom divider. */
+	--size-topbar-content: calc(var(--size-toolbar) - 1px);
+	/* Top offset for the Win/Linux browser and files pop-outs.
+	   Distinct from --size-toolbar (36px). */
+	--size-shell-topbar: 56px;
+	/* Windows custom title bar (.window-titlebar). */
+	--size-window-titlebar: 36px;
+	--size-inspector-tabs: var(--size-topbar-secondary);
+	--size-topbar-context-max: 32rem;
+	--space-topbar-x: 10px;
+	--space-topbar-zone: 10px;
+	--space-topbar-group: 4px;
+	--radius-topbar-control: 7px;
+	--size-row-md: 52px;
+	--size-browser-url: 29px;
+	--size-browser-min: 320px;
+	--size-sidebar-icon: 48px;
+	--size-sidebar-default: 240px;
+	--size-sidebar-mobile: 288px;
+	--size-titlebar-cluster-left: calc(84px / var(--ao-window-zoom, 1));
+	/* Linux has no traffic lights: with the sidebar open the cluster sits at the
+	 * sidebar's own left inset (TitlebarNav `left-titlebar-cluster-left-linux`). */
+	--size-titlebar-cluster-left-linux: 6px;
+	/* Sidebar off-canvas: the framed centre panel is flush-left, so the cluster
+	 * must clear its border (--size-center-panel-inline-inset) instead of
+	 * straddling it. */
+	--size-titlebar-cluster-left-linux-panel: calc(var(--size-center-panel-inline-inset) + 10px);
+	/* TitlebarNav cluster: 3 × --size-control-md buttons + 2 × 4px flex gaps. */
+	--size-titlebar-cluster-width: calc(3 * var(--size-control-md) + 2 * 4px);
+	/* Breathing room between the last arrow and the adjacent in-panel title. */
+	--size-titlebar-content-gap: 12px;
+	/* Clears fixed TitlebarNav (cluster-left + toggle/arrows) when the sidebar is off-canvas. */
+	--size-titlebar-content-offset: calc(
+		var(--size-titlebar-cluster-left) + var(--size-titlebar-cluster-width) + var(--size-titlebar-content-gap)
+	);
+	/* Same clearance measured from the off-canvas Linux cluster inset. */
+	--size-titlebar-content-offset-linux: calc(
+		var(--size-titlebar-cluster-left-linux-panel) + var(--size-titlebar-cluster-width) +
+			var(--size-titlebar-content-gap)
+	);
+
+	/* macOS traffic-light row: the route topbar plus the framed panel's top
+	 * offset (inset + 1px border) above and below, so the native buttons, the
+	 * sidebar brand, and the in-panel title share one centreline. Keep in sync
+	 * with MAC_TRAFFIC_LIGHT_ROW_HEIGHT in shared/window-chrome.ts. */
+	--size-traffic-light-clearance: calc(var(--size-toolbar) + 2 * (var(--size-center-panel-inset-mac) + 1px));
+	/* Fullscreen drops the panel frame, so the row matches the flush topbar. */
+	--size-traffic-light-clearance-fullscreen: var(--size-toolbar);
+	/* Bottom edge of the framed panel's header row: window chrome (drag strips)
+	 * that overlaps the panel must stop here so it never covers panel content. */
+	--size-mac-panel-header-bottom: calc(var(--size-traffic-light-clearance) - var(--size-center-panel-inset-mac) - 1px);
+	/* The same cluster clearance, measured from the framed panel's inner edge. */
+	--size-titlebar-content-offset-mac-panel: calc(
+		var(--size-titlebar-content-offset) - var(--size-center-panel-inset-mac) - 1px
+	);
+	/* Resize handle straddles the sidebar-panel boundary: offset = half the width
+	 * so the hairline lands exactly at the junction and the drag zone covers 6px
+	 * on each side of it. */
+	--size-resize-handle: 12px;
+	--size-resize-handle-offset: 6px;
+	--size-kanban-glow: 130px;
+	--size-kv-label: 74px;
+	--size-notification-width: 460px;
+	--size-notification-max-height: 420px;
+	--size-select-menu-max: 320px; /* agent/select dropdown scroll cap (was max-h-80) */
+	--size-settings-menu-width: 20rem; /* settings option menus — matches agent picker box width */
+	--size-settings-agent-menu-min-width: 20rem; /* agent harness picker — fixed width for status columns */
+	--size-notification-icon: 26px;
+	--size-session-topbar: calc(var(--size-inspector-tabs) + (2 * var(--space-1)));
+	/* DaemonFailureBanner floating toast (was w-[min(22rem,…)] / max-h-40). */
+	--size-daemon-failure-toast: 22rem;
+	--size-daemon-failure-details-max: 10rem;
+	--size-font-size-label: 44px;
+	--size-inspector-status-chip-max: 58%;
+	--size-board-empty: 460px;
+	--size-preview-max: 760px;
+	--size-preview-content: 400px;
+	--size-pr-table-actions: 220px;
+	--size-pr-col-number: 64px;
+	--size-pr-col-state: 96px;
+	--size-content-max: 320px;
+	/* Lets flex children shrink for truncation without hardcoding zero-width utilities in components. */
+	--size-flex-min: 0px;
+	/* Keeps terminal tabs usable after title truncation while leaving room for several tabs. */
+	--size-shell-tab-min: 64px;
+	/* Keeps added session tabs aligned with the owning tab in the secondary strip. */
+	--size-session-pane-tab-max: 112px;
+	/* Caps a standalone shell terminal's tab label so several open shells stay
+	   readable side by side instead of one long path crowding out the rest. */
+	--size-shell-tab-max: 140px;
+	/* Agent names and their status glyph need more room in Developer Mode. */
+	--size-agent-shell-tab-max: 192px;
+	--size-dialog-md: 420px;
+	--size-dialog-lg: 440px;
+	--size-dialog-orchestrator: 460px;
+	--size-dialog-xl: 560px;
+
+	/* Glass overlay: Cmd+K and the New task modal show the app through a
+	 * blurred, see-through modal surface. The see-through share is low enough
+	 * that body text keeps its contrast over any content. */
+	--color-bg-overlay-glass: color-mix(in oklch, var(--popover) 60%, transparent);
+	--blur-overlay-glass: 28px;
+
+	/* Command palette */
+	--color-bg-command-palette: var(--color-bg-overlay-glass);
+	--color-border-command-palette: var(--color-border-overlay);
+	--color-bg-command-item-active: color-mix(in oklch, var(--foreground) 10%, transparent);
+	--color-text-command-item: var(--foreground);
+	--color-text-command-placeholder: var(--muted-foreground);
+	--color-text-command-muted: var(--muted-foreground);
+	--radius-command-palette: var(--radius-panel);
+	--radius-command-item: 6px;
+	--shadow-command-palette: var(--shadow-popover);
+	/* Overlay edge: a faint edge so a transient layer (menu, popover, dialog,
+	 * toast) separates from content without a drawn frame. */
+	--color-border-overlay: color-mix(in oklch, var(--foreground) 2%, transparent);
+	/* Overlay shadow: a barely-there lift. Black, not --background, so it
+	 * reads on a graphite canvas. */
+	--shadow-popover: 0 4px 12px -4px oklch(0 0 0 / 14%);
+	--size-command-palette: 720px;
+	--size-command-palette-top: 14vh;
+	--size-command-palette-list-max: 420px;
+	--size-command-palette-list-vh: 50vh;
+	--size-command-subtitle-max: 45%;
+	--size-command-pad-x: 16px;
+	--size-command-item-inset: 6px;
+	--size-command-item-pad-l: 14px;
+	--font-size-command-input: 16px;
+	--leading-command-item: 22px;
+	--size-branch-chip: 13rem;
+	--size-inspector-min: 280px;
+	--size-textarea-min: 112px;
+	/* Two 24px actions + one 6px gap + 4px right inset + 4px label clearance. */
+	--size-sidebar-project-actions: 58px;
+	/* A pinned row adds a third 24px action and its 2px gap. */
+	--size-sidebar-project-actions-pinned: 84px;
+
+	/* Shared inset-panel geometry (welcome board + settings page) */
+	--size-center-panel-inset: 24px;
+	--size-center-panel-inline-inset: 16px;
+	--size-center-panel-bottom-inset: 14px;
+	/* macOS frames the panel with one uniform inset on all four sides. It stays
+	 * near-flush so in-panel titles align with the fixed TitlebarNav row. */
+	--size-center-panel-inset-mac: 6px;
+	/* Formula: inner = outer_window_radius - inset (nested corner alignment).
+	 * macOS window corner ≈ 18px; inset = 6px → inner = 12px. */
+	--radius-window: 18px;
+	--radius-center-panel: calc(var(--radius-window) - var(--size-center-panel-inset-mac));
+
+	/* Welcome / import radius alias (CreateProjectFlow rounded-welcome-panel) */
+	--color-border-welcome-panel: var(--border);
+	--radius-welcome-panel: var(--radius-center-panel);
+
+	/* Import mode picker */
+	--color-bg-import-modal: var(--card);
+	--color-border-import-modal: var(--border);
+	--color-text-import-title: var(--foreground);
+	--color-text-import-muted: var(--muted-foreground);
+	--color-bg-import-card: var(--popover);
+	--color-bg-import-card-hover: var(--accent);
+	--color-bg-import-illustration: var(--color-bg-import-chip);
+	--color-bg-import-chip: var(--secondary);
+	--shadow-import-modal: var(--shadow-popover);
+	--size-import-modal-max: 896px;
+	--size-import-folder-dialog: 640px;
+	--size-composer-prompt-min: 112px;
+	--size-composer-start-button: 7.25rem;
+	--radius-chat-composer: 20px;
+	/* Task composer — inline toolbar values. Quieter than a filled control at rest
+	 * so the task field stays the only thing with visual weight. */
+	--color-bg-composer-chip: color-mix(in oklab, var(--input) 55%, transparent);
+	--color-bg-composer-chip-hover: var(--secondary);
+	/* Shared equal edge inset for modal header/body/footer sections. */
+	--size-modal-padding: var(--space-6);
+	--size-import-modal-padding: var(--space-8);
+	--size-import-dialog-padding: var(--size-modal-padding);
+	--size-import-mode-card-min: 252px;
+	--size-import-mode-card-min-sm: 292px;
+	--size-import-mode-illustration: 178px;
+
+	/* Settings */
+	--color-bg-settings-row: transparent;
+	--color-bg-settings-menu: var(--popover);
+	--color-bg-settings-menu-selected: color-mix(in oklch, var(--popover) 92%, var(--foreground) 8%);
+	--color-bg-settings-dialog: var(--card);
+	--color-text-settings-title: var(--foreground);
+	--color-text-settings-muted: var(--muted-foreground);
+	--color-text-settings-row: var(--foreground);
+	--color-border-settings: var(--color-border-welcome-panel);
+	--color-border-settings-menu: var(--color-border-overlay);
+	--font-size-settings-title: 28px;
+	--tracking-settings-title: -0.015em;
+	--tracking-settings-section: 0.06em;
+	--tracking-settings-mono: 0.08em;
+	--radius-settings-panel: var(--radius-lg);
+	--radius-settings-row: 16px;
+	--size-settings-row: 52px;
+	--size-settings-section-gap: 40px;
+	--size-settings-section-inner-gap: 12px;
+	--size-settings-row-padding: 16px;
+	--size-settings-row-icon-gap: 12px;
+	--size-settings-menu-min-width: 9rem;
+	--size-settings-inline-input-min: 3.5rem;
+	--size-settings-inline-input-max: 12rem;
+	--size-settings-inline-input-max-percent: 42%;
+	--size-settings-inline-input-height: 28px;
+	--size-settings-row-value-max: 20rem;
+	--size-settings-row-value-max-percent: 55%;
+	--size-settings-footer-button-padding-x: 20px;
+	--color-settings-footer-button-primary-fg: var(--primary-foreground);
+	--size-settings-dialog: 575px;
+	--size-settings-dialog-wide: 920px;
+	--size-settings-dialog-height: 680px;
+	--size-settings-dialog-max-h: 680px;
+	--color-border-settings-dialog: var(--color-border-overlay);
+	--color-border-settings-dialog-header: var(--border);
+	--color-bg-settings-input: var(--input);
+	--color-border-settings-input: oklch(1 0 0 / 3%);
+	--color-text-settings-input: var(--foreground);
+	--color-text-settings-placeholder: var(--muted-foreground);
+	--color-text-import-sep: var(--color-text-import-muted);
+	--color-settings-accent: var(--primary);
+	--color-settings-switch-on: var(--primary);
+
+	/* Project / workspace agents sheet — aliases shared chrome where themes match */
+	--color-bg-agents-sheet: var(--color-bg-settings-dialog);
+	--color-border-agents-sheet: var(--border);
+	--color-bg-agents-sheet-control: var(--input);
+	--color-text-agents-sheet-title: var(--foreground);
+	--color-text-agents-sheet-description: var(--muted-foreground);
+	--color-text-agents-sheet-label: var(--foreground);
+	--radius-agents-sheet: var(--radius-center-panel);
+	/* Settings layout sizes (Figma) */
+	--size-settings-mobile-dialog: 550px;
+	--size-settings-mobile-dialog-pad-x: 24px;
+	--size-settings-mobile-desc: 420px;
+	--size-settings-mobile-qr: 220px;
+	--size-settings-mobile-qr-code: 204px;
+	--size-settings-mobile-warning: 400px;
+	--size-settings-mobile-label: 55px;
+	--size-settings-mobile-regen-width: 179px;
+	--size-settings-mobile-switch-w: 42px;
+	--size-settings-mobile-switch-h: 26px;
+	--size-settings-mobile-details-pad-x: 19px;
+	--size-settings-mobile-switch-travel: 18px;
+	--leading-settings-mobile-title: 22px;
+	--leading-settings-mobile-hint: 14px;
+	--leading-settings-mobile-warning: 15px;
+	--size-settings-action-height: 38px;
+	--size-composer-toolbar-height: var(--size-control-form);
+	--radius-settings-action: 16px;
+	--radius-settings-dialog-lg: 24px;
+	--shadow-settings-dialog: var(--shadow-popover);
+	--shadow-settings-qr: var(--elevation-md);
+
+	--size-empty-offset-y: 5vh; /* board empty-state vertical nudge */
+
+	/* Browser static preview (light mock page inside dark app) */
+	--color-preview-bg: #f7f8fb;
+	--color-preview-fg: #17202a;
+	--color-preview-muted: #687384;
+	--color-preview-link: #2f5b9d;
+	--color-preview-card-border: #d7dee8;
+	--color-preview-heading: #111827;
+	--color-preview-body: #526070;
+	--color-preview-success-bg: #e7f8ed;
+	--color-preview-tile-border: #e1e7ef;
+	--color-preview-tile-bg: #fbfcfe;
+	--color-preview-terminal-border: #dce4ef;
+	--color-preview-terminal-bg: #0f172a;
+	--color-preview-terminal-fg: #cbd5e1;
+
+	/* Mock project accent swatches (sidebar dots) */
+--color-project-accent-mint: var(--chart-1);
+	--color-project-accent-sky: var(--chart-2);
+	--color-project-accent-violet: #c4b5fd;
+
+	/* Terminal ANSI palette. Keep this independent from product status colors:
+	   agent TUIs own the semantic meaning of these slots. */
+	--color-term-black: #1f2329;
+	--color-term-red: #f05d5e;
+	--color-term-green: #44c97a;
+	--color-term-yellow: #e5c34b;
+	--color-term-blue: #5b9cff;
+	--color-term-magenta: #c678dd;
+	--color-term-cyan: #56b6c2;
+	--color-term-white: #d7dae0;
+	--color-term-selection-dark: rgb(77 141 255 / 0.3);
+	--color-term-selection-light: rgb(37 99 235 / 0.25);
+	--color-term-selection-inactive: rgb(128 128 128 / 0.2);
+	--color-term-selection-inactive-light: rgb(128 128 128 / 0.15);
+	--color-term-bright-black: #7f8792;
+	--color-term-bright-red: #ff7b7c;
+	--color-term-bright-green: #62df91;
+	--color-term-bright-yellow: #f2d66d;
+	--color-term-bright-blue: #79b1ff;
+	--color-term-bright-magenta: #d99aee;
+	--color-term-bright-cyan: #79d4df;
+	--color-term-bright-white: #f4f5f7;
+
+	/* ═══════════════════════════════════════════════════════════════
+	   SHADOWS
+	   ═══════════════════════════════════════════════════════════════ */
+
+	--elevation-sm: 0 1px 0 color-mix(in oklch, var(--background) 35%, transparent);
+	--elevation-md:
+		0 1px 0 color-mix(in oklch, var(--background) 40%, transparent),
+		0 12px 32px color-mix(in oklch, var(--background) 50%, transparent);
+	--elevation-lg: 0 8px 40px color-mix(in oklch, var(--background) 55%, transparent);
+	--elevation-xl:
+		0 1px 0 color-mix(in oklch, var(--background) 40%, transparent),
+		0 20px 50px color-mix(in oklch, var(--background) 55%, transparent);
+
+	/* @theme bridge — avoids Tailwind theme key / :root name collisions */
+	--bridge-border: var(--color-border);
+	--bridge-border-strong: var(--color-border-strong);
+	--bridge-accent: var(--color-accent);
+	--bridge-accent-fg: var(--color-accent-foreground);
+	--bridge-accent-weak: var(--color-accent-weak);
+	--bridge-accent-dim: var(--color-accent-dim);
+	--bridge-accent-strong: var(--color-accent-strong);
+	--bridge-working: var(--color-working);
+	--bridge-success: var(--color-success);
+	--bridge-warning: var(--color-warning);
+	--bridge-danger: var(--color-danger);
+	--bridge-danger-strong: var(--color-danger-strong);
+	--bridge-status-working: var(--color-status-working);
+	--bridge-status-needs-you: var(--color-status-needs-you);
+	--bridge-status-validating: var(--color-status-validating);
+	--bridge-status-in-review: var(--color-status-in-review);
+	--bridge-status-ready: var(--color-status-ready);
+	--bridge-status-merged: var(--color-status-merged);
+	--bridge-status-idle: var(--color-status-idle);
+	--bridge-status-exited: var(--color-status-exited);
+	--bridge-status-terminated: var(--color-status-terminated);
+	--bridge-status-terminated-foreground: var(--color-status-terminated-foreground);
+	--bridge-status-unknown: var(--color-status-unknown);
+	--bridge-interactive-hover: var(--color-interactive-hover);
+	--bridge-interactive-active: var(--color-interactive-active);
+	--bridge-scrim: var(--color-scrim);
+	--bridge-preview-muted: var(--color-preview-muted);
+	--bridge-preview-link: var(--color-preview-link);
+	--bridge-preview-heading: var(--color-preview-heading);
+	--bridge-preview-body: var(--color-preview-body);
+	--bridge-preview-card: var(--color-preview-card-border);
+	--bridge-preview-success: var(--color-preview-success-bg);
+	--bridge-preview-tile: var(--color-preview-tile-bg);
+	--bridge-preview-tile-border: var(--color-preview-tile-border);
+	--bridge-preview-terminal: var(--color-preview-terminal-bg);
+	--bridge-preview-terminal-border: var(--color-preview-terminal-border);
+	--bridge-preview-terminal-fg: var(--color-preview-terminal-fg);
+
+	/* Legacy renderer aliases. The Reverb workspace styles still consume these
+	   names; keep them as semantic pointers rather than reintroducing a second
+	   palette. They resolve through the active theme's supplied shadcn tokens. */
+	--bg: var(--color-bg-primary);
+	--bg-0: var(--color-bg-primary);
+	--bg-1: var(--color-bg-secondary);
+	--bg-2: var(--color-bg-tertiary);
+	--surface: var(--color-bg-secondary);
+	--fg: var(--color-text-primary);
+	--fg-muted: var(--color-text-muted);
+	--fg-passive: var(--color-text-passive);
+	--border-1: var(--color-border-strong);
+	--interactive-hover: var(--color-interactive-hover);
+	--interactive-active: var(--color-interactive-active);
+	--accent-weak: var(--color-accent-weak);
+	--term-bg: var(--color-bg-terminal);
+	--green: var(--color-success);
+	--red: var(--color-danger);
+	--orange: var(--color-working);
+	--amber: var(--color-warning);
+
+	--font-sans: var(--font-family-base);
+	--font-mono: var(--font-family-mono);
+}
+
+/* macOS uses the system faces (SF Pro / SF Mono). Preload sets data-ao-platform
+   before first paint; the Nerd Font entries stay as per-glyph fallbacks for
+   terminal powerline and file-type icons. */
+:root[data-ao-platform="darwin"] {
+	--font-family-base: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+	--font-family-mono:
+		"SF Mono", SFMono-Regular, ui-monospace, "JetBrainsMono Nerd Font Mono", "JetBrainsMono Nerd Font",
+		"FiraCode Nerd Font Mono", "FiraCode Nerd Font", "MesloLGS NF", Menlo, monospace;
+}
+
+/* The new sidebar design switched off in Developer mode: the old yellow Validating. */
+:root[data-legacy-status-colors] {
+	--color-status-validating: var(--color-status-validating-legacy);
+}
+
+/* Light theme — set via data-theme (apply-initial-theme + Zustand toggle). */
+
+:root[data-theme="light"] {
+	color-scheme: light;
+
+	--background: oklch(0.985 0 0);
+	--foreground: oklch(0.18 0 0);
+	--card: oklch(1 0 0);
+	--card-foreground: oklch(0.18 0 0);
+	--popover: oklch(1 0 0);
+	--popover-foreground: oklch(0.18 0 0);
+	--primary: oklch(0.24 0 0);
+	--primary-foreground: oklch(0.97 0 0);
+	--secondary: oklch(0.955 0 0);
+	--secondary-foreground: oklch(0.18 0 0);
+	--muted: oklch(0.955 0 0);
+	--muted-foreground: oklch(0.48 0 0);
+	--accent: oklch(0.945 0 0);
+	--accent-foreground: oklch(0.18 0 0);
+	--destructive: oklch(0.577 0.245 27.325);
+	/* Translucent like dark: hairlines and input wells are overlays on whatever
+	 * surface they sit on, so a card edge never reads as an opaque gray stroke. */
+	--border: oklch(0 0 0 / 8%);
+	--input: oklch(0 0 0 / 4%);
+	--ring: oklch(0.64 0 0);
+	--chart-1: oklch(0.72 0 0);
+	--chart-2: oklch(0.52 0 0);
+	--chart-3: oklch(0.4 0 0);
+	--chart-4: oklch(0.32 0 0);
+	--chart-5: oklch(0.24 0 0);
+	--sidebar: oklch(0.968 0 0);
+	--sidebar-foreground: oklch(0.18 0 0);
+	--sidebar-primary: oklch(0.24 0 0);
+	--sidebar-primary-foreground: oklch(0.97 0 0);
+	--sidebar-accent: oklch(0.94 0 0);
+	--sidebar-accent-foreground: oklch(0.18 0 0);
+	--sidebar-border: var(--border);
+	--sidebar-ring: oklch(0.64 0 0);
+
+	--color-bg-primary: var(--background);
+	--color-bg-secondary: var(--card);
+	--color-bg-tertiary: var(--muted);
+	--color-bg-elevated: var(--popover);
+	--color-bg-sidebar: var(--sidebar);
+	--color-bg-terminal-opaque: var(--background);
+	--color-bg-terminal: var(--background);
+	--color-bg-terminal-opaque: var(--background);
+
+	--color-text-primary: var(--foreground);
+	--color-text-muted: var(--muted-foreground);
+	--color-text-passive: oklch(0.62 0 0);
+	--color-brand-logo: #304c83;
+	--color-brand-logo-bright: #466daa;
+	--color-brand-logo-foreground: #ffffff;
+	--color-text-markdown-code: var(--color-brand-logo);
+	--color-text-markdown-link: var(--color-brand-logo);
+	--color-text-markdown-link-hover: var(--color-brand-logo-bright);
+	--color-text-terminal: #3d3d3d;
+	--color-text-terminal-dim: #757575;
+
+	--color-border: var(--border);
+	--color-border-strong: var(--input);
+
+	/* Reverb workspace bar — derived from the shared shadcn token scale. */
+	--color-bg-topbar: var(--background);
+	--color-bg-topbar-raised: var(--secondary);
+	--color-border-topbar: var(--border);
+	--color-border-topbar-strong: var(--input);
+	--color-text-topbar: var(--foreground);
+	--color-text-topbar-muted: var(--muted-foreground);
+	--color-text-topbar-passive: var(--color-text-passive);
+
+	--color-accent: var(--primary);
+	--color-accent-foreground: var(--primary-foreground);
+	--color-accent-weak: color-mix(in oklch, var(--primary) 12%, transparent);
+	--color-accent-dim: var(--chart-1);
+	--color-accent-strong: var(--primary);
+	--color-danger-strong: var(--destructive);
+
+	/* Same lane hues as dark, deepened so they hold contrast on a light canvas. */
+	--color-status-working: #2563eb;
+	--color-status-needs-you: #c2412d;
+	--color-status-validating-new: #9b4871;
+	--color-status-validating-legacy: #ca8a04;
+	--color-status-in-review: #d97706;
+	--color-status-ready: #16a34a;
+	--color-status-merged: #9333ea;
+	--color-status-idle: var(--muted-foreground);
+	--color-status-exited: var(--destructive);
+	--color-status-terminated: var(--color-text-passive);
+	--color-status-terminated-foreground: var(--color-text-passive);
+	--color-status-unknown: var(--chart-4);
+
+	--color-working: var(--color-status-working);
+	--color-warning: var(--color-status-needs-you);
+	--color-success: var(--color-status-ready);
+	--color-success-bright: var(--chart-1);
+	--color-danger: var(--destructive);
+	--color-purple: var(--chart-4);
+
+	--color-interactive-hover: color-mix(in oklch, var(--foreground) 4%, transparent);
+	--color-interactive-active: color-mix(in oklch, var(--foreground) 7%, transparent);
+	--color-overlay-subtle: color-mix(in oklch, var(--foreground) 2%, transparent);
+	--color-overlay-faint: color-mix(in oklch, var(--foreground) 3%, transparent);
+	--color-scrollbar: color-mix(in oklch, var(--foreground) 12%, transparent);
+	--color-scrollbar-board: color-mix(in oklch, var(--foreground) 26%, transparent);
+	--color-scrollbar-board-hover: color-mix(in oklch, var(--foreground) 45%, transparent);
+	--color-scrim: color-mix(in oklch, var(--foreground) 45%, transparent);
+
+	--elevation-sm: 0 1px 0 color-mix(in oklch, var(--foreground) 6%, transparent);
+	--elevation-md:
+		0 1px 0 color-mix(in oklch, var(--foreground) 3%, transparent),
+		0 12px 30px color-mix(in oklch, var(--foreground) 10%, transparent);
+	--elevation-lg: 0 16px 48px color-mix(in oklch, var(--foreground) 16%, transparent);
+	--elevation-xl:
+		0 1px 0 color-mix(in oklch, var(--foreground) 3%, transparent),
+		0 20px 50px color-mix(in oklch, var(--foreground) 14%, transparent);
+
+	--color-bg-overlay-glass: color-mix(in oklch, var(--popover) 68%, transparent);
+
+	/* Command palette */
+	--color-bg-command-palette: var(--color-bg-overlay-glass);
+	--color-border-command-palette: var(--color-border-overlay);
+	--color-bg-command-item-active: color-mix(in oklch, var(--foreground) 9%, transparent);
+	--color-text-command-item: var(--foreground);
+	--color-text-command-placeholder: var(--muted-foreground);
+	--color-text-command-muted: var(--muted-foreground);
+	--shadow-command-palette: var(--shadow-popover);
+	--color-border-overlay: color-mix(in oklch, var(--foreground) 2%, transparent);
+	--shadow-popover: 0 4px 12px -4px color-mix(in oklch, var(--foreground) 5%, transparent);
+
+	/* Welcome / import radius alias */
+	--color-border-welcome-panel: var(--border);
+
+	/* Import mode picker */
+	--color-bg-import-modal: var(--popover);
+	--color-border-import-modal: var(--border);
+	--color-text-import-title: var(--foreground);
+	--color-text-import-muted: var(--muted-foreground);
+	--color-bg-import-card: var(--card);
+	--color-bg-import-card-hover: var(--accent);
+	--color-bg-import-illustration: var(--color-bg-import-chip);
+	--color-bg-import-chip: var(--secondary);
+	--shadow-import-modal: var(--shadow-popover);
+
+	/* Project / workspace agents sheet */
+	--color-border-agents-sheet: var(--border);
+	--color-bg-agents-sheet-control: var(--input);
+	--color-text-agents-sheet-title: var(--foreground);
+	--color-text-agents-sheet-description: var(--muted-foreground);
+	--color-text-agents-sheet-label: var(--foreground);
+
+	--color-bg-settings-row: transparent;
+	--color-bg-settings-menu: var(--popover);
+	--color-bg-settings-menu-selected: color-mix(in oklch, var(--popover) 96%, var(--foreground) 4%);
+	--color-bg-settings-dialog: var(--card);
+	--color-text-settings-title: var(--foreground);
+	--color-text-settings-muted: var(--muted-foreground);
+	--color-text-settings-row: var(--foreground);
+	--color-border-settings-menu: var(--color-border-overlay);
+	--color-border-settings-dialog: var(--color-border-overlay);
+	--color-border-settings-dialog-header: var(--border);
+	--color-border-settings-input: var(--border);
+	--color-bg-settings-input: var(--input);
+	--color-text-settings-input: var(--foreground);
+	--color-text-settings-placeholder: var(--muted-foreground);
+	--color-settings-accent: var(--primary);
+	--color-settings-switch-on: var(--primary);
+
+	--color-term-black: #24292f;
+	--color-term-red: #a13c37;
+	--color-term-green: #2e6b3e;
+	--color-term-yellow: #87660f;
+	--color-term-blue: #3b5aa6;
+	--color-term-magenta: #7b5799;
+	--color-term-cyan: #3d7a7a;
+	--color-term-white: #666d75;
+	--color-term-bright-black: #4c535b;
+	--color-term-bright-red: #7e3330;
+	--color-term-bright-green: #265231;
+	--color-term-bright-yellow: #6b5108;
+	--color-term-bright-blue: #31487f;
+	--color-term-bright-magenta: #5f4476;
+	--color-term-bright-cyan: #316061;
+	--color-term-bright-white: #24292f;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════
+   NAMED THEMES — applied via data-style-theme on :root.
+   "orchestrate" is the default (no attribute) and owns the tokens above.
+
+   Named palettes live in renderer/lib/theme-palettes.ts. theme-tokens.ts
+   derives every color token from them (surfaces, status, links, terminal
+   ANSI) and injects one stylesheet at startup, so a theme never shows
+   Orchestrate colors through the gaps.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* A named palette owns the terminal's default plate and text as well as the
+   surrounding app chrome. */
+:root[data-style-theme] {
+	--color-bg-terminal-opaque: var(--background);
+	--color-bg-terminal: var(--background);
+	--color-text-terminal: var(--foreground);
+	--color-text-terminal-dim: var(--muted-foreground);
+}

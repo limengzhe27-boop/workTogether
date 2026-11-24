@@ -1,150 +1,460 @@
-# WorkTogether · Codex 工作界面参考规范
+---
+name: agent-orchestrator-design-system
+description: "Use for any renderer UI, visual polish, component, layout, theme, motion, or interaction change in Agent Orchestrator. Read before proposing or implementing visual work."
+---
 
-版本 3 · 2026-10-10。用户明确要求尽量对齐 Codex，随后提供完整深色截图并要求据此修改；该截图是本轮视觉基准，替代 v2 浅色方向。保留先前确认的 L1 轻动效。
+# Design system — Agent Orchestrator
 
-参考优先级：用户截图 > [官方项目与对话导航示意](https://learn.chatgpt.com/docs/features) > 旧界面。截图约 2040×1540 像素，按桌面逻辑尺寸解释比例，不把高分辨率截图的像素当作 CSS 字号。截图不纳入公开仓库。旧后端架构记录见 [design-legacy-v1.md](docs/design-legacy-v1.md)。
+Agent Orchestrator (AO) is serious desktop software for supervising parallel AI coding work. It makes the state of a project legible: what is running, what needs a human, what is safe to ship, and where intervention will have the most leverage.
 
-## 1. Visual Theme & Atmosphere
+This is a product UI, not a marketing site. It must feel calm under sustained use, reward scanning, and preserve the terminal as a first-class working surface.
 
-Codex-style dark workspace：石墨黑、平面层级、宽阅读区、弱分隔线、项目树、底部大圆角输入。结构分为四块：顶部工作栏、左侧窄工具轨、项目/任务栏、主对话区。主内容不是卡片仪表盘。
-保留 WorkTogether 品牌；不冒充官方产品。不复制 macOS 红黄绿窗控、虚构通知、账号身份、语音按钮、宠物或未接入的文件上传。所有显示的操作均有真实功能。
+## Reference boundary and migration stance
 
-## 2. Color Palette & Roles
+This guide is deliberately based only on these approved visual references: the app shell; sidebar and its project section; tooltips; iconography; typography; tokens and themes; borders, shadows and outlines; the New Task, Clone Repository, Settings and Add Project flows; dropdowns used in Settings and New Task; and the kanban board with its cards.
 
-以截图视觉采样估值为准，并非从 Codex 私有代码获取：
-```css
-:root {
-  color-scheme: dark;
-  --bg: #181818; --surface: #202020; --surface-alt: #303030;
-  --surface-hover: #383838; --rail: #252727; --chrome: #262f36;
-  --composer: #353535; --border: #333333; --border-hover: #626262;
-  --text: #ededed; --secondary: #cccccc; --muted: #a2a2a2;
-  --accent: #3072d2; --accent-hover: #3375d5; --on-accent: #ffffff;
-  --user-bubble: #1b4079; --on-user: #eef4ff;
-  --error: #ffb4b4; --error-bg: #382526;
-  --shadow-rgb: 0,0,0; --accent-rgb: 48,114,210; --bg-rgb: 24,24,24;
-}
-```
-蓝色主要用于用户气泡与发送按钮。选中任务使用灰色底而非蓝色描边。历史失败不涂满首屏，当前阻塞保留高对比入口。注册表中的用户自选颜色属于数据，不作为页面主题色。
+Do **not** infer a visual rule from another AO screen merely because it exists today. Much of the application is still being de-slopped. Existing rounded cards, isolated borders, shadows, all-caps metadata, extra helper copy, or one-off button styling outside the approved references are migration debt, not precedent.
 
-## 3. Typography Rules
+The guide is a future-state standard and a review tool. When current code conflicts with it, preserve functional behavior but move the surface toward this standard in the smallest safe change. Do not copy a legacy inconsistency into new work.
 
-中文优先字体栈：'Noto Sans SC','PingFang SC','Microsoft YaHei',sans-serif。字体引用：
-```css
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600&display=swap');
-```
-离线使用本机回退。正文 16px / 1.8；侧栏与控件 15px / 1.7；辅助标签 12–13px；顶部标题 16px / 1.5；首页标题 28px。字距 .02em，字重 400/500/600，代码采用 SFMono-Regular/Consolas。
-H1/H2/H3 均无渐变、无投影；正文按 Markdown 显示真实加粗、列表、链接和代码。忽略原始 HTML，不自动加载远程图片。禁止全大写装饰标签、伪造时间和截图正文占位。
+### Reference implementation map
 
-## 4. Component Stylings
+Use these files to inspect the approved references. They show current behavior and component boundaries; this guide decides which details are intentional future-state rules.
 
-```css
-button { min-height:44px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--text); }
-button:hover { background:var(--surface-hover); }
-button:active { background:var(--surface-alt); }
-button:disabled { opacity:.45; cursor:not-allowed; }
-:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
-.icon-button { width:44px; padding:10px; border-color:transparent; background:transparent; display:inline-flex; align-items:center; justify-content:center; }
-.task-link { background:transparent; border-color:transparent; border-radius:10px; }
-.task-link[aria-current=page] { background:var(--surface-alt); }
-.user-message { width:fit-content; max-width:84%; margin-left:auto; background:var(--user-bubble); color:var(--on-user); border-radius:22px; padding:12px 18px; }
-.chat-composer { background:var(--composer); border:1px solid var(--border); border-radius:24px; padding:14px; }
-.chat-composer:focus-within { border-color:var(--border-hover); }
-.send-button { background:var(--accent); border-radius:50%; }
-.card { background:var(--surface); border:1px solid var(--border); border-radius:12px; }
-.card:hover { border-color:var(--border-hover); }
-a { color:var(--secondary); text-decoration:underline; text-underline-offset:3px; }
-a:hover { color:var(--text); }
-.badge { background:var(--surface-alt); color:var(--secondary); border-radius:6px; }
-```
-图标统一 lucide-react 20–22px，描边 1.7；不混用 Emoji。Agent 回复无独立气泡、没有彩色左边线，身份小标题和细线分隔，底部可复制正文。
-弹窗使用原生 dialog（焦点锁定、Escape、焦点归还）；设置、团队、任务搜索复用相同暗色规范。折叠使用原生 details/summary。
+| Surface | Primary reference files |
+| --- | --- |
+| App shell, page layout, topbar | [center-panel shell](frontend/src/renderer/components/CenterPanelShell.tsx), [page topbar](frontend/src/renderer/components/PageTopbar.tsx), [shell styles](frontend/src/renderer/styles.css) |
+| Home landing | [HomePage](frontend/src/renderer/components/HomePage.tsx), [NavRowHighlight](frontend/src/renderer/components/NavRowHighlight.tsx) |
+| Sidebar, sidebar buttons, project rows | [Sidebar](frontend/src/renderer/components/Sidebar.tsx), [sidebar primitive](frontend/src/renderer/components/ui/sidebar.tsx), [topbar button](frontend/src/renderer/components/TopbarButton.tsx), [NavRowHighlight](frontend/src/renderer/components/NavRowHighlight.tsx) |
+| Shell resize grips | [ResizeHandle](frontend/src/renderer/components/ResizeHandle.tsx), [useResizable](frontend/src/renderer/hooks/useResizable.ts) |
+| Tokens, themes, typography | [tokens](frontend/src/styles/tokens.css), [renderer semantic styles](frontend/src/renderer/styles.css), [docs tokens](frontend/src/docs/src/styles/tokens.css) |
+| Tooltips, icons, buttons | [Tooltip](frontend/src/renderer/components/ui/tooltip.tsx), [Button](frontend/src/renderer/components/ui/button.tsx), [icon usage](frontend/src/renderer/components/icons.tsx) |
+| Shared dialog and field primitives | [Dialog](frontend/src/renderer/components/ui/dialog.tsx), [Input](frontend/src/renderer/components/ui/input.tsx), [Label](frontend/src/renderer/components/ui/label.tsx) |
+| New Task and its selectors | [New chat page](frontend/src/renderer/components/NewChatPage.tsx), [New Task dialog, cloud projects only for now](frontend/src/renderer/components/NewTaskDialog.tsx), [turn settings bar](frontend/src/renderer/components/chat/TurnSettingsBar.tsx), [task launch hook](frontend/src/renderer/components/TaskComposer.tsx), [settings option menu](frontend/src/renderer/components/settings/SettingsOptionMenu.tsx) |
+| Clone Repository and Add Project | [Clone Repository](frontend/src/renderer/components/CloneRepositoryDialog.tsx), [Add Project flow](frontend/src/renderer/components/CreateProjectFlow.tsx), [agent sheet](frontend/src/renderer/components/CreateProjectAgentSheet.tsx) |
+| Settings and settings selectors | [Settings dialog](frontend/src/renderer/components/SettingsDialog.tsx), [global settings](frontend/src/renderer/components/GlobalSettingsForm.tsx), [project settings](frontend/src/renderer/components/ProjectSettingsForm.tsx), [Select](frontend/src/renderer/components/ui/select.tsx), [Dropdown menu](frontend/src/renderer/components/ui/dropdown-menu.tsx) |
+| Kanban board and cards | [Board route](frontend/src/renderer/components/SessionsBoard.tsx), [renderer adapter](frontend/src/renderer/components/SessionsBoardAdapters.tsx), [shared board/card view](packages/product-ui/src/SessionsBoardView.tsx), [board state presentation](frontend/src/renderer/lib/session-presentation.ts) |
 
-## 5. Layout Principles
+When a referenced file and this guide disagree, follow this guide for new work and log a targeted migration rather than spreading the discrepancy.
 
-桌面网格：54px 工具轨 + 246px 项目栏 + minmax(0,1fr) 对话；48px 顶部工作栏横跨全宽。对话区尽量用满剩余宽度，最大内容宽 1240px，左右留白 24–32px。结构比例接近截图的约 5% 工具轨、23% 项目栏、72% 对话。
-项目为文件夹行，当前项目下缩进显示任务；左上“新任务”，搜索图标打开当前项目任务搜索。侧栏支持折叠，折叠后对话扩宽。
-主区不再保留常驻双标签栏：顶部“任务详情”图标切换详情；进度和下一步压为一条轻量栏。模型授权流程与原 API 保持不变。
-底部输入框内部：上半部多行文字，下半部“团队”入口、仅交流说明、接收成员选择、圆形发送。输入框和正文同宽、固定在 flex 面板底部，不盖住正文。
-间距梯度 4/8/12/16/24/32；用户消息与 Agent 回复间 28–36px，正文不做浮动卡片。
+## 1. Product and reader
 
-## 6. Depth & Elevation
+- **Reader:** an engineer coordinating several coding-agent sessions, often while switching among repositories, terminals, pull requests, and reviews.
+- **Reader's job:** understand the current state in seconds; open the right session; make a precise intervention; return to the board without losing context.
+- **Core object:** a session. Each session carries a task, agent, worktree, conversation or terminal, files, PR, checks, review facts, and derived status.
+- **Memorable promise:** “I can run several agents without losing the thread.”
+- **Product posture:** operational, technically literate, compact, direct. AO does not pretend that software delivery is effortless; it makes the work visible and tractable.
 
-正文和侧栏基本无阴影，通过 #181818/#202020/#303030 分层。只有弹窗和手机抽屉使用 0 16px 40px rgba(var(--shadow-rgb),.35)。不加光晕、毛玻璃或背景渐变。工作栏略带冷灰色，区别于纯灰内容区。
+### Working preferences for design changes
 
-## 7. Animation & Interaction
+- Prefer direct implementation over a long planning conversation when the intended change is clear. Inspect the existing component and nearby primitives first, then make the smallest coherent change.
+- Keep updates and handoffs concise. Explain the user-visible result, meaningful tradeoffs, files or surfaces affected, and verification status; do not narrate routine tool use.
+- Preserve unrelated work in a dirty worktree. Do not reset, overwrite, or broaden a change without explicit scope.
+- Reuse existing primitives, tokens, and interaction patterns before proposing a new abstraction. If a visual mismatch is local, fix it locally.
+- Verify visual changes with the narrowest relevant tests and, when possible, the real renderer surface. Report pre-existing verification blockers separately from regressions introduced by the change.
+- Treat repeated feedback as a design rule. When a preference recurs—compact copy, sentence case, alignment, no redundant subtext—encode it here instead of solving it as a one-off.
 
-L1，CSS only，无额外动效依赖：
-```css
-button { transition:background 140ms,border-color 140ms; }
-@keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
-.page-enter, dialog[open] { animation:fadeIn 180ms ease-out; }
-@media(prefers-reduced-motion:reduce) {
-  *,*::before,*::after { animation:none!important; transition:none!important; scroll-behavior:auto!important; }
-}
-```
-不做滚动 reveal、跳动、自动打字或假忙碌。消息只有初次加载、自己发送或靠近底部时跟随；向上阅读时给新动态入口。
-项目切换隔离任务；搜索只读；复制不执行代码；“仅交流”不授权开发；讨论/执行仍需原确认和预算说明。调用中不替用户关闭权限检查。
-真实时间字段存在才显示时间分隔；不添加“用时 xx 秒”假数据。
+### Non-negotiable hierarchy
 
-## 8. Do’s / Don’ts
+When design requirements compete, preserve them in this order:
 
-Do：
+1. Truthful operational state and safe actions.
+2. The user's active task and their next useful action.
+3. Terminal, conversation, file, PR, and review context for the active session.
+4. Fast scanning across projects and sessions.
+5. A coherent visual system and refined motion.
 
-1. 以截图的四区结构与深灰层级为基准。
-2. 对话作为主要工作面，保持足够阅读宽度。
-3. 左侧呈现项目与任务层级，选中行低调高亮。
-4. Agent 身份、当前阻塞、审批和额度说明保持真实。
-5. 保留草稿、项目隔离、手动交接、日志、恢复与重试。
-6. 所有图标按钮有名称、提示和键盘焦点。
+Never use visual polish to obscure a state transition, destructive action, connection failure, or uncertainty.
 
-Don’t：
+## 2. Visual thesis
 
-1. 不再沿用浅色商务卡片风。
-2. 不把浅色 CSS 简单反色了事。
-3. 不冒充 Codex 官方品牌或用户身份。
-4. 不造语音、宠物、文件上传、反馈投票等空按钮。
-5. 不复制截图里的私人项目或对话作为示例数据。
-6. 不把 Agent 配置就绪显示为在线/授权已就绪。
-7. 不把发送消息改为自动开发。
-8. 不自动开启云端 Agent。
-9. 不引入虚假日期、进度、未读蓝点或运行耗时。
-10. 不在视觉改版中改变后端调度或清理用户任务。
+**Dark-first precision instrument.** AO is a low-glare, near-neutral control surface with calm typography, disciplined color, and dense but breathable information. The visual result should feel more like a thoughtful desktop tool than a generic SaaS dashboard.
 
-## 9. Responsive Behavior
+- **Decoration:** minimal. Type, alignment, spacing, surface tone, and only necessary one-pixel boundaries establish hierarchy.
+- **Material:** layered charcoal surfaces—not pure black—with small tonal shifts reserved for nesting, hover, and elevation.
+- **Color:** rare, semantic, and stateful. A colored element must answer “what does this mean?”
+- **Shape:** modest radius, not a field of pills. A rounded control should read as a control; a panel should read as one composed container; ordinary metadata should remain text.
+- **Density:** compact by default. AO is used all day and needs high information capacity without cramped target sizes.
+- **Personality:** quiet competence. No gradients, glass, glow, stock imagery, decorative textures, emoji, or novelty visual language in the working UI, except the transient glass surfaces defined below.
 
->=960px 展示完整工作栏+工具轨+项目树；601–959px 默认折叠项目栏，以抽屉打开；<=600px 隐藏工具轨，由顶部导航按钮打开项目抽屉。抽屉锁定焦点、Escape 关闭，主区与顶部在打开时 inert。
-移动端正文 15–16px、16px 留白、输入框 20px 圆角；图标点击区至少 44×44px。整体 100dvh，正文独立滚动；小屏不出现横向溢出。模态框宽 calc(100vw - 24px)，内部表单单列。
-验收：1046×653、1440×900、390×844；确认底部输入可见、导航收放、项目切换、搜索、复制、草稿与授权入口。对照截图记录对齐点和有意差异。仅本地假服务可用于自动化发送测试，不触发真实 Agent。
+## 3. App architecture expressed visually
 
-## 10. 项目上下文与对话增强（v3.1，2026-10-11）
+AO has one persistent shell; routes replace the center surface rather than replacing the app's orientation.
 
-动机：用户在自己的项目里问“你们知道这个项目是做什么的”，只做对话的 Agent 回答“不知道”。因此界面要在不改变审批与权限模型的前提下，把项目本身交给 Agent。
+### Shell
 
-新增面：
+- **Sidebar:** persistent project navigation and global utility. It answers “where am I?” and “what can I switch to?”
+- **Center:** the primary task surface: home, board, session, terminals, settings, or setup.
+- **Inspector:** contextual detail and secondary actions. It is collapsible, resizable, and must never make the center task unreadable.
+- **Topbar/titlebar:** orientation and high-value actions only. It must not duplicate the entire page's controls.
 
-1. **项目上下文弹窗**（首页“项目上下文”、任务详情“项目上下文与变更”）。原生 dialog，三段卡片：项目记忆（textarea + 保存／追加）、代码变更（Git 状态清单 + 逐文件“还原”二次确认 + 折叠的统一 diff）、项目文件（折叠列表，显示路径与字节数）。底部“项目维护·删除项目”为危险操作，使用 `button.danger`（`--error` 描边与 `--error-bg` 悬停），明确说明只删平台记录、不动代码文件。
-2. **对话输入框工具行**：左侧仍是 Agent 多选；右侧依次为「引用文件」（切换内联文件选择器，最多 10 个，选中后显示可移除的 chip）、「允许修改」（默认关闭的写入授权，`ShieldAlert` 图标）、「轮次」1/2 下拉（仅当成员 ≥2 可选）、圆形发送。
-3. **消息标记**：用户气泡内用 `message-flag` 小标签显示“允许修改”“N 轮发言”“N 个文件”，不改变气泡本身的蓝色身份。
-4. **回复中断恢复**：`BLOCKED` 消息在原错误提示下显示一行恢复操作——“重试该 Agent”与“跳过并继续下一位”，都需用户显式点击，不做自动重放；跳过会留下写明“已跳过”的回复占位。
-5. **Agent 设置扩展**：每张卡片增加“编辑档案”（名称／描述／系统提示／模型／API Key）与自定义 Agent 的“移除”；注册表单新增接入类型二选一（OpenAI 兼容接口 / 克隆本机 CLI）与系统提示、密钥输入。
+The layout is desktop-first. On constrained widths, preserve task content first, compact or hide sidebar chrome second, and collapse secondary inspector content before reducing control targets below usable size.
 
-约束：这些控件都遵循既有规范——原生 dialog、44px 触达区、`aria-label` 与 `aria-pressed`、无 Emoji 装饰图标（Agent 头像除外）、危险操作必须二次确认、说明文字用 `small muted`。引用文件与写入授权默认关闭，且不改变“发送消息不等于授权开发”的既有原则。
+### Route rules
 
-可访问性与文案：文件选择器列表项为 `label + checkbox`；危险操作按钮有明确禁用条件；“允许修改”的 title 说明仍受各自 CLI 沙箱限制。
+- **Home:** intentionally minimal. It introduces the next meaningful action, not a fake dashboard.
+  - One centered column (`max-w-[640px]`); no decorative upward translate.
+  - "Star us" is a quiet text link with dashed underline on hover — never a TopbarButton, accent pill, or bordered card.
+  - Primary actions are a 2×2 grid; standalone agent is a grid cell (Clone to the cloud takes that cell when Developer Mode and Cloud are on), never a full-width extra row. Card labels follow verb + source: Clone a repo, Open a local folder, Open a workspace, Clone to the cloud, Start a standalone agent. Connect Mobile stays in settings — not on home.
+  - Recent project rows use shared `NavRowHighlight` (same growing pill as sidebar), not a flat `hover:bg-interactive-hover` wash. On home the pill fills with `bg-card` so a hovered row matches the action cards.
+- **Board:** the operational overview. Each lane has a semantic reason to exist and derived status determines placement.
+- **Session:** the working room. The conversation or terminal is primary; tabs, files, PRs, and inspector are supporting context.
+- **Terminals:** a dedicated surface for standalone shells; do not accidentally route users here from unrelated project-board shortcuts.
+- **Settings:** a deliberate configuration surface with grouped sections, explicit save feedback, and no dashboard chrome masquerading as preferences.
 
-## 11. 项目群聊（v4，2026-10-11）
+### Shell resize grips
 
-用户反馈：期望的是“把几个客户端 Agent 拉进一个群聊，我说一句他们同时收到、互相讨论、互相派活，并且能在项目里干活”，而不是“排队跟几个聊天助手说话”。本节记录改版后的形态与约束。
+Sidebar and inspector share `ResizeHandle`. Do not regress:
 
-结构：
+- On hover only, a 2px line is drawn over the **center-pane border** (sidebar: `.center-panel-surface` left; inspector: panel `border-l`), fading out at the top and bottom, with a short opacity fade in/out. No pill, nothing painted on click/drag, not always-visible.
+- The line is pure CSS inside the hit strip (no JS positioning); `useResizable` stays the only width integrator.
+- While dragging, width **must stop at the same min/max as the panel**. Never follow raw `clientX` past limits. Inspector also clamps against computed CSS `max-width` (`--session-inspector-max-width`); prop/`rangeRef` max alone is insufficient.
+- Call sites must pass the same `minWidth`/`maxWidth` as `useResizable`.
 
-1. **一轮即一次广播**。你发出的一句话在第 1 轮内并行派发给所有选中的 Agent，每人一个独立 CLI 会话进程。第 1 轮**不注入任何同伴回复**，所以是真的同时；第 2 轮（可选）才把第 1 轮全部发言交给所有人。回合数由输入框的“轮次”选择（1 或 2）。
-2. **Agent 发言有独立形态**。用户消息仍是右侧蓝色气泡；Agent 之间的消息是左侧卡片，头部为「头像 · 名称 → 目标 · 意图徽章」，意图为 提问/派活/认领/汇报。被轮次预算拦下的卡片额外显示“等待你确认”与一行说明。
-3. **并行状态条**。消息处于 RUNNING 时在其下方显示 chips：`第 N 轮 / 共 M 轮`、`K 位同时回复中`、每位“正在回复…/等待中”、以及“X 持有项目写入”。
-4. **预算横幅**。存在被拦下的跨 Agent 消息时，在输入框上方显示“有 N 条…（已用 x/y 轮）”与“让他们继续”。
-5. **会话级写入开关**。输入框工具行里的“可在项目里工作”，默认开启、由会话配置驱动（不再是每条消息一个勾选框）。文案说明同一时刻只有一个 Agent 持有写入。
-6. **改动归因**。回复头部在确实改过文件时显示 `改了 N 个文件` 徽章（`--accent` 描边），下方展开「本轮改动 · N 个文件」，逐条列出 `M/A/D` 状态与路径。没有改动时不显示徽章也不写审计事件——只反映真实变化，不做“正在工作”的假象。
+### Brand → home
 
-约束：写入串行只保证平台内部不互相覆盖，不是文件系统锁；不引入未读蓝点、假进度或“正在输入”动画；并行状态只反映真实的 dispatch 状态。
+The sidebar brand mark/name is the home control. Click navigates home. Do **not** add hover or focus fill behind the brand (`[data-sidebar-brand]` opts out of `.sidebar-focusless` wash in `styles.css`).
 
+## 4. Navigation and project rows
+
+The sidebar is a compact directory, not a second dashboard.
+
+- Use a quiet sentence-case section label only when a section needs disambiguation. Prefer no label to ornamental chrome. Never use ALL CAPS labels.
+- Projects form one shared list container: no card gap and no individual row border. Use a subtle divider only between sibling rows.
+- Project rows are compact: 28–32px visual height in expanded rail, 12–13px label text, and 14px folder/provider icon. Keep the hit target at least 32px high.
+- Project icon/avatar and label are the primary scan anchors. Do not place status pills, branches, diffs, or PR counts in the row by default.
+- Expanded sessions are visibly children through indentation and reduced contrast, never through heavy nesting or permanent decorative rails.
+- The active project/session uses restrained surface contrast plus a clear selection cue; blue is acceptable for focus/active edge, not as a broad row fill.
+- Row actions appear on hover or focus without moving the label. Actions must not change the row's measured width or trigger navigation.
+- The collapsed rail is icon-first and keeps tooltips, keyboard focus, and fixed titlebar controls usable.
+- Interactive nav rows share `NavRowHighlight`: host backgrounds stay transparent on hover/active/focus; the growing pill owns the fill. Keyboard focus uses `:focus-visible` (not `:focus-within`) so mouse click focus does not stick the pill on.
+- Sidebar chrome uses `top`/`bottom` (not `inset-y` + `h-svh`) so `top-(--sidebar-chrome-offset)` can clear the titlebar without fighting a second height constraint.
+
+## 5. Operational state and color
+
+Status is derived from durable runtime, PR, CI, and review facts. The renderer communicates it; it does not invent or store a separate display truth.
+
+### Semantic mapping
+
+| Meaning | Token / visual treatment | Use |
+| --- | --- | --- |
+| Working | `--color-status-working` / #60a5fa | active spinner, live activity, progress that is currently observed |
+| Needs human input | `--color-status-needs-you` / #f06445 | blocked, question, actionable interruption |
+| Validating | `--color-status-validating` / #e58bb5 | AO is turning the PR: checks, review pass, or fixing feedback. Yellow (#facc15) when the new sidebar design is switched off in Developer mode |
+| Review / caution | `--color-status-in-review` / #f59e0b | review pending, changes requested |
+| Ready / success | `--color-status-ready` / #4ade80 | mergeable, approved, completed actionable success |
+| Merged | `--color-status-merged` / #c084fc | historical terminal completion state |
+| Failure | `--color-status-exited` / `--destructive` | failed CI, destructive or failed operation |
+| Idle / unknown | muted or passive tokens | neutral, not a hidden failure |
+
+### Status glyph rules
+
+Use one fixed status slot where status belongs. Prefer an icon/glyph over a prose badge.
+
+1. If the session is actively working, show the working spinner.
+2. Otherwise, if a PR is relevant, show the PR glyph tinted by its actionable state.
+3. Otherwise, show a dot: amber/red for attention, muted for idle/complete.
+
+Do not show multiple competing status chips on a session card or sidebar row. Text labels are allowed when needed for accessibility, an empty state, an inspector summary, or a decision the user must make.
+
+## 6. Tokens: source of truth
+
+Do not introduce one-off hex values, arbitrary radius, or unreviewed spacing. Use `frontend/src/styles/tokens.css` and the semantic aliases in `frontend/src/renderer/styles.css`.
+
+### Surface stack
+
+- Canvas: `--color-bg-primary`
+- Raised card / grouped content: `--color-bg-secondary`
+- Hover or selected sub-surface: `--color-bg-tertiary` or `--color-interactive-active`
+- Popover / modal elevation: `--color-bg-elevated`
+- Sidebar: `--color-bg-sidebar`
+- Terminal: `--color-bg-terminal-opaque` as a painted surface; preserve terminal-specific text colors
+- Boundaries: `--color-border` for ordinary hairlines; `--color-border-strong` only when separation must survive dense content
+
+### Text stack
+
+- Primary content: `--color-text-primary`
+- Secondary explanation: `--color-text-muted`
+- Passive metadata / de-emphasized chrome: `--color-text-passive`
+- Code and links: `--color-text-markdown-code` and `--color-text-markdown-link`
+- Never reduce essential task information to passive contrast.
+
+### Accent rules
+
+- `--color-accent` is for the live edge: primary action, focus ring, meaningful selected state, or progress.
+- Success, warning, and destructive colors never decorate neutral UI.
+- Do not use color as the only state signal. Pair it with a distinct icon, label, position, or action affordance.
+
+## 7. Typography
+
+Use the font tokens. On macOS they resolve to the system faces (SF Pro / SF Mono); elsewhere to the bundled Geist families. Do not add a new web font or substitute a generic font for visual novelty.
+
+- **UI and body:** `--font-family-base` (`-apple-system` on macOS, `Geist Variable` elsewhere).
+- **Code, terminal, compact labels:** `--font-family-mono` (`SF Mono` on macOS, `Geist Mono Variable` elsewhere).
+- **Weights:** 500 medium for controls and small hierarchy; 600 only for headings, selected values, and genuinely primary emphasis.
+- **Numbers:** use tabular figures for metrics, timestamps, diffs, and columns where alignment matters.
+
+### Type scale
+
+| Role | Token | Intended use |
+| --- | --- | --- |
+| Nano | 8px | exceptional compact rail chrome only |
+| Micro | 10px / `--font-size-xs` | compact metadata and tight pills |
+| Caption | 11px / `--font-size-caption` | lane labels, secondary labels, compact metadata |
+| Secondary | 12px / `--font-size-sm` | helper copy and compact list detail |
+| Dense control | 13px / `--font-size-base` | buttons, board controls, project rows |
+| Body | 14px / `--font-size-md` | readable prose and normal UI content |
+| Dialog title | 15px / `--font-size-subtitle` | modal and section titles |
+| Empty state | 17px / `--font-size-heading-sm` | short guidance headings |
+| Page heading | 21–22px | route-level title only |
+
+Use sentence case everywhere a user reads or acts: page titles, buttons, menu items, field labels, section labels, statuses, and compact metadata. Mono is for code-like values (branches, paths, repository URLs, commands, aligned numbers), not for making ordinary UI feel technical. Never use ALL CAPS labels.
+
+## 8. Spacing, dimensions, and shape
+
+### Spacing
+
+The base unit is 4px. Use the token scale, with 4/6/8/10/12/14/16/18px as the normal dense rhythm. Use 24/32/40px for meaningful section separation, not for routine card padding.
+
+- In a component, keep label → value → helper text close.
+- Between peer controls, use 4–8px.
+- Between related groups, use 12–16px.
+- Between distinct regions, use 20–32px.
+- Avoid gaps that only exist to make cards feel separate; let containment and dividers do the work.
+
+### Fixed dimensions
+
+- Compact icon control: 20–24px.
+- Standard compact control: 28–32px.
+- Board action: 30–36px.
+- Minimum pointer target for an ordinary row: 32px; use 36px when the interaction is high-frequency or imprecise.
+- Default sidebar: 240px; icon rail: 48px; mobile overlay: 288px.
+- Page and session topbar row: 36px on every platform. Windows adds its own 36px window titlebar above the panel.
+
+### Radius and borders
+
+- Borders are exceptional structure, never default decoration. Start with spacing, alignment, type, and a restrained surface shift.
+- A hairline is 1px and may separate durable regions: shell panes, a modal from its backdrop, a shared list's adjacent rows, a board lane boundary, or an input's hit area when contrast needs it.
+- Do not give every card, row, input group, and nested region its own outline. Never add a border simply because a component is rectangular.
+- `--radius-xs` and `--radius-sm` suit tiny controls; `--radius-md` suits buttons and inputs; `--radius-lg` is the maximum routine component radius.
+- `--radius-panel` is reserved for route-level framed surfaces and larger dialogs.
+- `--radius-full` is only for avatars, dots, and intentional pills.
+- Shadows are elevation cues for transient layers only: dialogs, menus, and tooltips. They are subtle, short-range, and neutral. No permanent card shadows, glow, or decorative drop shadow.
+- Focus is not decoration: use the semantic focus ring/outline with sufficient contrast. Never remove it or replace it with a barely visible background shift.
+- Avoid cards inside cards. If hierarchy is weak, fix spacing, typography, or surface contrast before adding another border.
+
+## 9. Components and interaction contracts
+
+### Buttons
+
+- One clear primary action per focused region. It uses accent fill or strong foreground contrast.
+- Secondary actions use a quiet surface; tertiary actions are text/icon controls. An outline is a contrast fallback, not the default secondary-button style.
+- Icon-only buttons require an accessible label and tooltip when their meaning is not universally obvious.
+- Destructive actions require destructive color and confirmation when the operation is difficult to reverse.
+- Disabled states explain why when the missing prerequisite is not obvious.
+- Every action is a `Button` (`components/ui/button.tsx`); never a raw `<button>` outside `components/ui/`. Rows, cards, tabs and disclosure toggles use `Pressable` (`components/ui/pressable.tsx`); a dialog ✕ uses `CloseButton`.
+- Pick the variant for what the action means, not for a look: `primary` (the one main action), `accent` (brand-blue decision the turn waits on: approve, open link), `secondary` (quiet surface), `ghost`, `quiet` (muted toolbar/row actions), `destructive` (danger fill), `destructive-ghost` (remove/delete/kill), `link` (inline text), `footer*` (settings and modal footers), `outline` (contrast fallback only). Sizes: `xs` 24, `sm` 28, `default` 32, plus `icon-xs`/`icon-sm`/`icon`; `shape="pill"` only for chips. A `className` adjusts layout, never the variant's color, height or hover.
+- Ghost-family buttons (`ghost`, `quiet`, `destructive-ghost`) hover with the sidebar's growing pill. On-states come from `aria-pressed`, `data-state="open"` or `data-active="true"`, not from swapping variants. Tabs keep `role="tab"` + `aria-selected` and add `data-active` for the look.
+- No press motion: buttons, rows and controls never scale or shift when clicked.
+
+### Tooltips and iconography
+
+- Use Lucide icons through the existing shared icon/button primitives. Icons are functional marks, never decoration or a substitute for a missing information hierarchy.
+- Default UI icons are 14–16px; use 12px only for dense metadata and 18–20px only for a high-level source choice or empty-state action. Do not enlarge an icon merely to fill empty space.
+- Keep stroke weight, optical size, and alignment consistent with nearby controls. Do not mix filled, multicolor, emoji, or custom illustration styles into the working UI.
+- A tooltip names an icon-only action, disambiguates a truncated value, or reveals a compact metric. It must be a short phrase, not a paragraph, help article, or duplicate of visible text.
+- Tooltips appear after the existing deliberate hover delay, never block pointer interaction, and remain available to keyboard focus. They should use elevated surface contrast and at most a subtle transient elevation—no dramatic shadow, animation, or callout treatment.
+
+### Inputs, dropdowns, menus, and dialogs
+
+- Labels precede inputs. Placeholder text is an example, never the sole label.
+- Validation appears close to the field and uses both wording and semantic color.
+- A select/dropdown trigger is one compact control: selected value first, chevron second; it should not add a second visible label when the surrounding field label already establishes meaning.
+- Dropdown content is a single elevated surface with a quiet edge, consistent item height, clear selected/focus state, and dividers only between meaningful groups. Never make each option a separately bordered mini-card.
+- Settings and New Task selectors use the same shared menu/select primitive and option rhythm. Model, agent, mode, and settings choices must not invent bespoke pills or popovers.
+- Menus group related actions, separate destructive actions once, preserve focus order, and close after a completed single-choice action. Do not use a tooltip to explain a menu item that can be named clearly.
+- Dialogs interrupt for a real decision; do not use them for ordinary navigation or success confirmation.
+- Dialogs retain the route context beneath them and restore focus to the trigger on close.
+
+### Modal composition
+
+Every modal is one composed, elevated surface: a restrained overlay, one clear title, a close control, the decision/form body, and a concise action area when needed. Modal content has no ornamental header band, no nested card stack, no gradient, and no explanatory prose unless it changes the user's decision.
+
+Cmd+K and the cloud New task dialog may use the shared `overlay-glass` surface to keep the underlying task visible. This exception is limited to those transient surfaces: use the shared background and blur tokens, preserve text contrast, and fall back to a solid surface in translucent windows or when reduced transparency is requested.
+
+- **Clone Repository:** compact back, title, and close controls establish its place in the Add Project sequence. Repository URL is code-like and uses mono; owner/provider identity may be an unobtrusive visual cue. Destination is one full-width chooser row with its action embedded at the trailing edge. Validate after intent to continue and place field errors directly below the field; do not turn errors into a large alarm card.
+- **Add Project:** present one decision at a time. With Cloud on, the first step is two tiles, On this computer and Cloud, with one line each saying where agents run; the local sources come only after On this computer. The sources (Clone a repo, Open a local folder, Open a workspace, Start a standalone agent) are a 2×2 grid of the same tiles, matching the Home grid. A tile is borderless: a faint `interactive-hover` fill at rest, `interactive-active` on hover with no transition, a bare muted icon aligned with the title, and one short line saying why you would pick it, not restating the label. Steps cross-fade in place while the panel springs to the new height; nothing slides sideways. Cloud sign-in and project creation remain part of this same flow rather than a competing dashboard.
+- **Settings:** use one modal split into a quiet navigation rail and a content pane. The rail is a list of compact icon-and-text rows with a restrained selected surface; it is not a collection of pills. The content pane gives the active section one sentence-case title, fields in logical groups, and no redundant introduction. Each group is one card with no outline: a filled background groups it and hairline dividers separate its items (rows fit their content with 10px vertical padding); the page title and section headings share the rows' 16px text inset. For project settings, keep the persistent save action anchored in the rail/footer position so it is predictable and does not float beside every field.
+- **Errors and status:** show error text close to the failed action or field. Reserve a full-width alert region for a blocking, form-level failure; it is a state treatment, not a permanently outlined component.
+
+#### Settings language and agent-management rules
+
+- Settings names describe the user's job, not internal vocabulary. Use **Agents** for installing and configuring agent tools, and **Accounts** for signing in and managing Codex accounts. Do not use “Harness” or “Subscriptions” as navigation labels for these surfaces.
+- Remove introductory copy when the title, control, or nearby status already explains the task. Keep only text that changes a decision, explains a failure, or provides a required next step.
+- Use concise, sentence-case labels and ordinary search placeholders such as “Search agents”. Avoid trailing ellipses in simple search fields and avoid repeating the same context in a label, placeholder, and subtext.
+- Agent installation rows use one shared install control: a ghost **Install · <method>** button with a borderless chevron menu for other methods. The installed state is terminal: show muted **Installed** text (not a button), hide installation details, and do not show a separate check icon or retry/details affordance.
+- When a completed install method is trustworthy, the secondary line may say “Installed via Homebrew”, “Installed via npm”, or “Installed via Official”. Never display internal cache fingerprints, hashes, or other implementation identifiers as user-facing versions.
+- Installation details are an expandable disclosure below the row's primary controls. Animate the details region between collapsed and expanded states, keep the disclosure control below the details, and align the content with the agent icon/list edge.
+- Icon-only actions must have an accessible name and a tooltip when their meaning is not obvious. If a text action already fits naturally, prefer the text action over an icon-only control.
+
+### Kanban board and cards
+
+- The board is the project’s operational overview, not a KPI dashboard. The canonical delivery lanes are Working, Needs you, In review, and Ready to merge; archive is a separate history state.
+- Lanes are one continuous grid separated by shared vertical dividers, with a compact header: semantic dot, sentence-case name, and count. Do not turn every lane into a rounded panel.
+- A board card represents one session—the legitimate exception to “no individual borders.” It is an actionable object with a bounded, draggable/clickable area. Keep its edge quiet; attention is expressed by the single semantic status treatment, not extra colored strips, badges, or shadows.
+- Card information order: agent avatar + task title; branch only when it adds identity; PR/review evidence only when present; one derived status line; then compact time/usage metadata. Avoid duplicate status words, repeated provider names, and metric clutter.
+- Title gets the visual weight. Avatar is small and recognisable, branch is mono and muted, PRs are compact evidence links, and timestamps/numbers use tabular figures where they scan in columns.
+- One fixed action slot may appear on hover/focus without shifting the title. Destructive action remains visually quiet until intentional hover/focus but always keyboard reachable.
+- Needs-human attention may use the dedicated semantic color and restrained motion. Do not pulse multiple cards, animate lane counts, or make success/caution states compete for attention.
+
+### Shared-list rule
+
+When several peer objects are primarily chosen or scanned—projects, settings sections, source choices, dropdown options—use a shared surface with adjacent rows and subtle dividers where necessary. Use individual cards only when each object carries a distinct, actionable operational payload, as board sessions do. Settings cards follow this with no outline: the filled background groups them and hairline dividers separate the items (rows fit their content with 10px vertical padding).
+
+### Terminal and conversation
+
+- The terminal is a working surface, not a decorative dark panel. Preserve its own palette, contrast, scroll behavior, and selection semantics.
+- Never layer translucent UI or decorative gradients over live terminal content.
+- Chat and TUI are alternate interfaces for the same session. Their surrounding orientation and actions must remain coherent across mode changes.
+
+## 10. Motion, transitions, and feedback
+
+Motion is functional and modest.
+
+- Fast feedback: `--duration-fast` (120ms) for hover, color, icon, and small opacity changes.
+- Normal movement: `--duration-normal` (150ms) for small layout and panel state changes.
+- Sidebar and route shell may use the established ~280ms settle transition where layout must remain spatially legible.
+- Use ease-out for entry, ease-in for exit, and ease-in-out for positional movement.
+- The working spinner/pulse may animate to show liveness. Do not animate text, metrics, or layout merely to make the interface feel busy.
+- Respect reduced-motion preferences: remove nonessential transforms and reduce transitions to immediate state changes.
+
+## 11. Platform and responsive behavior
+
+- **macOS:** maintain traffic-light clearance and the fixed titlebar navigation cluster. Page and session headers are the drag region; controls inside them opt out.
+- **Windows/Linux:** each page renders its own header inside the center panel; preserve the Windows titlebar and Linux native frame and collapsed-sidebar inset.
+- **Narrow center panels:** compact secondary actions, then inspector content, before hiding the task itself.
+- **Sidebar:** may collapse to its icon rail or an overlay; every icon must remain labeled through tooltip and accessible name.
+- **Inspector:** collapses to zero without reflowing the active terminal/chat into an unusable transient width.
+- **Keyboard:** every action that is visible on hover must be reachable by focus; shortcuts must respect the current route and never trigger a surprising cross-surface navigation.
+
+## 12. Accessibility and resilience
+
+- Meet contrast requirements in both dark and light themes; test real token pairs rather than assumed hex values.
+- Visible focus rings use the semantic focus/ring token and are never removed for mouse-centric aesthetics.
+- Communicate loading, error, offline, empty, and permission states explicitly.
+- Preserve text alternatives for icons, provider avatars, status glyphs, and action-only buttons.
+- Do not infer that a session is dead from an absent or failed runtime probe; the UI must communicate uncertainty accurately.
+- Preserve spatial continuity while data streams: avoid flicker, sudden reorder, and broad skeleton replacement for a small local update.
+
+### Interaction lifecycle to design and test
+
+For every approved surface, design the full lifecycle rather than only the happy-path screenshot:
+
+| Moment | Required question |
+| --- | --- |
+| Arrive | Is the purpose and next action clear without tutorial copy? |
+| Leave untouched | Is there a calm, complete default state with no fake urgency? |
+| Begin | Does focus move predictably and does the control state make the pending decision obvious? |
+| Active / submitting | Is progress local, truthful, and free of layout shift or duplicate submit affordances? |
+| Finish | Does success move the user forward naturally; does failure explain the actionable next step in place? |
+| Interrupt | Do Escape, close, navigation, lost focus, daemon/network failure, disabled actions, and changed project/session state preserve user work and restore a predictable focus target? |
+
+Test meaningful variants: dark/light theme, expanded/collapsed sidebar, long project or task text, keyboard-only use, narrow central pane, loading/error/empty state, and a state change arriving while the surface is open.
+
+## 13. Explicit anti-patterns
+
+Reject these patterns in renderer work unless a specific exception is approved:
+
+- Generic SaaS hero/feature-grid language inside the application shell.
+- Decorative gradients, glows, glass (except the Cmd+K and cloud New task surfaces defined above), blobs, textures, or ornamental shadows.
+- ALL CAPS labels, uppercase tracking used as decoration, or mono used to make ordinary prose look technical.
+- A rainbow of status colors, decorative accent borders, or color-only meaning.
+- Oversized avatars or icons that compete with task names and state.
+- Large empty padding that lowers operational density without aiding comprehension.
+- Uniform rounded cards separated by gaps when a shared container with dividers better expresses a list.
+- A border around every row, field, option, card, and nested panel; stacks of outlined containers; or a drop shadow on permanent content.
+- Repeated labels, helper paragraphs, captions, or subtext that merely restate an obvious control or choice.
+- A new button, select, tooltip, menu, dialog, or icon treatment when the matching shared primitive already exists.
+- Repeated metric tiles when one table, timeline, or state glyph is clearer.
+- Tiny low-contrast explanatory copy that conceals an important system state.
+- Fake terminal screenshots, fake progress, or generic “AI” illustration.
+- Moving controls on hover, layout shifts on data refresh, or shortcut behavior that changes routes unexpectedly.
+
+## 14. Implementation rules
+
+- Start with existing renderer components, shadcn primitives, semantic tokens, and nearby patterns.
+- Do not create a parallel token system, raw inline color palette, or one-off global style for a single screen.
+- Keep visual behavior in the renderer; daemon facts and lifecycle logic remain in the backend.
+- For a new named token, prove that existing semantic roles cannot express the need. Add it to `frontend/src/styles/tokens.css`, then expose it through `styles.css` only when Tailwind/component usage requires it.
+- For visual changes, test dark and light themes, compact sidebar, narrow center panel, keyboard focus, disabled/loading/error states, and at least one screen with real long project/session names.
+
+## 15. Design QA checklist
+
+Before calling a visual change done, verify:
+
+1. Does the reader see the active task and next useful action before secondary metadata?
+2. Is every color semantic and every status truthful?
+3. Did we reuse existing tokens and primitives?
+4. Is every word sentence case, necessary, and at the right point in the decision—not a label or subtext duplicate?
+5. Did we remove default borders/shadows and then add back only the structural ones this surface genuinely needs?
+6. Are peer choices a shared list with dividers rather than spaced, individually bordered cards?
+7. Are dense lists grouped and scan-friendly without becoming cramped? Are project rows compact enough for an all-day sidebar?
+8. Does focus work without hover? Does reduced motion remain coherent? Are icon-only actions named by accessible label and, where needed, tooltip?
+9. Does the change hold on dark/light themes, all desktop platforms, compact sidebar, narrow center width, long text, and loading/error/empty states?
+10. Did we avoid introducing a generic dashboard/card-grid pattern where AO already has a stronger operational model?
+
+### Review outcome
+
+Approve only when the answer to every applicable check is yes. Otherwise classify the finding so the next step is concrete:
+
+- **Blocker:** creates misleading operational state, inaccessible action/focus, unsafe destructive affordance, or a new one-off primitive.
+- **Must fix:** violates an explicit visual rule: heavy/individual borders, gradient, permanent decorative shadow, ALL CAPS label, noisy helper copy, or duplicated component treatment.
+- **Follow-up migration:** a legacy surface outside this reference boundary that should be aligned later; record it without using it to lower the standard for this change.
+
+## Decisions log
+
+| Date | Decision | Rationale |
+| --- | --- | --- |
+| 2026-09-03 | Dark-first, token-led, compact operational UI | Matches AO's long-running desktop workflow and renderer source of truth. |
+| 2026-09-03 | Geist/Geist Mono remain the typographic system | They are bundled, legible at dense sizes, and already define renderer hierarchy. |
+| 2026-10-09 | macOS uses SF Pro / SF Mono; Geist stays the bundled default elsewhere | System faces match native macOS chrome and get optical sizing for free. |
+| 2026-09-03 | Color is reserved for semantics and active focus | Parallel-agent supervision depends on fast, trustworthy scanning. |
+| 2026-09-03 | Shared list containers with dividers are preferred over spaced sibling cards | Better density and clearer grouping for projects and sessions. |
+| 2026-09-03 | Existing platform shell behavior is part of the design system | macOS traffic lights, Windows titlebar, and collapsible inspector are product behavior, not incidental CSS. |
+| 2026-09-03 | The approved reference set is intentionally narrow | AO is mid-migration; unfinished screens must not become accidental design authority. |
+| 2026-09-03 | Sentence case and concise decision-relevant copy are mandatory | The interface should carry operational clarity through hierarchy and state, not verbose explanation or technical-looking labels. |
+| 2026-09-03 | Borders and shadows are structural/elevational exceptions | The future UI favors one composed surface, shared lists, quiet dividers, and stable hierarchy over a field of outlined cards. |
+| 2026-09-04 | Settings language follows the user's task, not internal architecture | “Agents” describes installation/setup and “Accounts” describes sign-in/account management more clearly than “Harness” or “Subscriptions”. |
+| 2026-09-04 | Installed agent rows use a terminal, compact state | A disabled Installed button is clearer than a detached check icon; stale details must not make a completed installation look actionable. |
+| 2026-09-04 | Only trustworthy user-facing data belongs below an agent name | The model catalog's `binaryVersion` is an internal cache fingerprint, so it must not be presented as a CLI version. |
+| 2026-09-16 | Home: quiet Star-us link; 2×2 action grid with standalone in-grid; recent rows use NavRowHighlight | Rejected accent CTAs, Connect Mobile on home, and flat hover washes — keep home minimal and aligned with sidebar row chrome. |
+| 2026-09-16 | Brand mark clicks to home with no hover/focus fill | Separate home affordance and sidebar focus wash on the brand were rejected. |
+| 2026-09-16 | Resize grips: fixed 80vh hover pill on center-pane border; clamp to panel min/max ∩ CSS max-width | Rejected always-on/`::after`/inset grips and unclamped pointer-following (inspector flew past both limits). |
+| 2026-10-08 | Resize grips: replaced the 80vh pill with a hover-only 2px line on the edge that fades out at both ends | The pill (including active/click state and cursor-following variants) looked bad; JS border tracking removed. |
+| 2026-10-09 | Home: with Developer Mode and Cloud on, Clone to the cloud replaces the standalone cell; card labels use verb + source; cards rest on `bg-card` and hover to `bg-accent`; recent rows sit under the grid with no heading of their own, one 40px line each (no path), hover pill on `bg-card` | A fifth full-width row broke the 2×2 grid; the old translucent hover made cards darker instead of lifting them; the separate recent-projects title and two-line rows made home taller than it needs to be. |
+| 2026-10-14 | Installed agent rows show muted "Installed" text; install is one ghost "Install · <method>" with a borderless chevron menu | A disabled filled button read as a control, and the bordered split pill broke the settings rule that only inputs, selects and switches carry an edge or fill. Supersedes the 2026-09-04 disabled-button row. |
+| 2026-10-14 | Settings cards: no outline, filled background groups them, hairline dividers between items, rows fit their content with 10px vertical padding | The person asked for borders only between items, not around containers. Rows sit 16px in from the card edge and the page title and section headings follow that inset. |
+| 2026-10-15 | New Task is a page, not a modal (cloud projects keep the dialog for now): the session's own chat with no session yet. An empty header-height strip (window drag on macOS) holds the session header's place, the empty chat centers in the window, the agent sits at the top of the model menu, and the project is the only control in a tray hung under the composer. Sending keeps everything in place with no composer shimmer; the composer stays usable for queued follow-ups while the session sets up, and the session header slides into the strip. Welcome sample prompts are a centered row of bordered pill chips with short labels | The modal hid the chat the task becomes, and every handoff moved the composer; the chips are an intentional pill exception, read as suggestions rather than list rows. |
+| 2026-11-01 | Add Project: Local/Cloud is a first step of two tiles, and the sources are a 2×2 grid of the same borderless tiles | Cloud sat in the same list as local sources, mixing "where agents run" with "where the code comes from"; tiles in both steps keep the flow consistent with Home. |
+| 2026-11-04 | One `Button` for every action, `Pressable` for rows/cards/tabs; ghost buttons use the growing hover pill; no press scale anywhere | The person disliked the tap-scale and found ~280 raw buttons and ~200 variant-restyling overrides; the sidebar's hover pill is the ghost interaction they want everywhere. |
+| 2026-11-05 | Every settled chat turn opens with "Worked for <time>": the fold, with a chevron, when the turn has steps; plain text when it went straight to its answer. The time never repeats on the action row. As a turn settles nothing in view jumps: "Worked for" fades into the row reserved under the prompt, the reply slides up into the room its steps left, and the live row fades where it was | The person wanted the time on every reply, and the time moved between the top of some turns and the action row of others; the settle handover dipped the whole chat and glided it back. |
+
+## WorkTogether project room extension
+
+The project room follows the existing shell, typography, semantic color tokens and shared Button/ChatMarkdown components. Project navigation stays in the shell; a local project exposes Board and Project Room views. The room is a restrained single conversation column (max-width 48rem), flexible scrolling history and fixed-in-layout composer. Members and policy details are disclosed above the history. On narrow screens controls wrap; no fixed-width panels. No new font, palette, dependency or decorative animation is introduced. Native session identity and recipient are visible on each message; delivery acceptance is distinct from completion. Partial failure is explicit, never automatically replayed. Keyboard form controls have labels and visible focus. This implements the user-approved conversation-first layout, with L1 interaction inherited from existing controls.
+
+## WorkTogether project chat (2026-11-12)
+
+1. **Atmosphere:** Codex-style conversation first; restrained existing light/dark theme, L1 motion. No operational prose wall above the composer.
+2. **Palette:** existing background, secondary, foreground, muted-foreground, border, ring and destructive semantic tokens only. Status dots must also have accessible text.
+3. **Typography:** retain system font stack; chat prose 16px/1.75, identity 12px, toolbar 13px. No remote fonts.
+4. **Components:** one rounded composer, plus action, per-member access/approval action, member icon chips, arrow submit. Icon chips open member settings (name, actual provider model/effort, connection details). Buttons use shared hover, active, focus and disabled states. Messages show sender identity inline.
+5. **Layout:** centered 768px reading column; composer at bottom; message body unboxed, user bubble softly tinted. Move membership, grants, connection diagnostics and collaboration budgets to on-demand room settings. Settings do not consume permanent conversation height.
+6. **Depth:** no message shadows; only shared popover elevation. No nested message cards.
+7. **Interaction:** existing subtle L1 transitions and reduced-motion handling. Enter sends, Shift+Enter adds a line, IME preserved. Saving member settings blocks send until confirmed; no optimistic permission escalation.
+8. **Guardrails:** no repeated recipient paragraph; no success receipt wall; no raw IDs in primary labels; no fabricated models; no universal effort list; no silent recipients change; no hiding actionable failures; no automatic old-message resend. Keep immutable session identity separate from editable display name.
+9. **Responsive:** toolbar wraps, icons remain accessible, popovers fit viewport, main area scrolls independently. At narrow widths preserve 44px touch targets and avoid horizontal overflow.
+
+### Composer density correction (2026-11-12)
+
+The composer is content-sized rather than manually resizable: one text row (40px with padding) at rest, a 32px toolbar, and 8px outer padding. Native CSS field-sizing grows and shrinks with wrapping, line breaks, deletion and width changes; the text region stops at min(180px, 25dvh) and scrolls internally. Keep a 22px radius, subtle neutral fill and border, and no heavy focus frame. Compact provider/number labels replace raw generated session IDs in the toolbar; custom names remain visible and full names remain accessible. Overflowing members scroll within their own row, never displace Send or create multiple toolbar rows. The secondary header uses small quiet controls instead of another row of filled buttons. Existing send, permissions and recipient rules are unchanged.

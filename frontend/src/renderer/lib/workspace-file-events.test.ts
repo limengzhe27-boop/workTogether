@@ -1,0 +1,461 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { computeSseRetryDelayMs } from "./sse-backoff";
+
+const { getApiBaseUrlMock, hasTrustedApiBaseUrlMock, subscribeApiBaseUrlMock, unsubscribeBaseUrlMock } = vi.hoisted(
+	() => ({
+		getApiBaseUrlMock: vi.fn(() => "http://127.0.0.1:3001"),
+		hasTrustedApiBaseUrlMock: vi.fn(() => true),
+		subscribeApiBaseUrlMock: vi.fn(),
+		unsubscribeBaseUrlMock: vi.fn(),
+	}),
+);
+const { baseUrlForHostMock, subscribeConnectedHostsMock } = vi.hoisted(() => ({
+	baseUrlForHostMock: vi.fn((_hostId: string): string | undefined => undefined),
+	subscribeConnectedHostsMock: vi.fn(),
+}));
+
+vi.mock("./api-client", () => ({
+	// Streams keep the daemon base URL here; api-client.test.ts covers the stream host.
+	eventStreamBaseUrl: (baseUrl: string) => baseUrl.replace(/\/+$/, ""),
+	getApiBaseUrl: getApiBaseUrlMock,
+	hasTrustedApiBaseUrl: hasTrustedApiBaseUrlMock,
+	subscribeApiBaseUrl: subscribeApiBaseUrlMock,
+}));
+vi.mock("./host-clients", () => ({
+	baseUrlForHost: baseUrlForHostMock,
+	subscribeConnectedHosts: subscribeConnectedHostsMock,
+}));
+
+import { getWorkspaceFileConnectionState, subscribeWorkspaceFileChanges } from "./workspace-file-events";
+
+let baseUrlListener: (() => void) | undefined;
+const INVALIDATE_TEST_WINDOW_MS = 150;
+let hostListeners: Array<() => void> = [];
+
+class EventSourceStub {
+	static instances: EventSourceStub[] = [];
+	static throwNext = false;
+	url: string;
+	closed = false;
+	readyState = 0;
+	onopen: (() => void) | null = null;
+	onerror: (() => void) | null = null;
+	listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
+
+	constructor(url: string) {
+		if (EventSourceStub.throwNext) {
+			EventSourceStub.throwNext = false;
+			throw new Error("connection setup failed");
+		}
+		this.url = url;
+		EventSourceStub.instances.push(this);
+	}
+
+	addEventListener(type: string, listener: (event: MessageEvent<string>) => void) {
+		const listeners = this.listeners.get(type) ?? new Set();
+		listeners.add(listener);
+		this.listeners.set(type, listeners);
+	}
+
+	dispatch(type: string, data = "") {
+		for (const listener of this.listeners.get(type) ?? []) listener({ data } as MessageEvent<string>);
+	}
+
+	close() {
+		this.closed = true;
+		this.readyState = 2;
+	}
+}
+
+function fakeQueryClient() {
+	return { getQueryData: vi.fn(), invalidateQueries: vi.fn(), isFetching: vi.fn(() => 0) } as unknown as Parameters<typeof subscribeWorkspaceFileChanges>[1];
+}
+
+beforeEach(() => {
+	EventSourceStub.instances = [];
+	EventSourceStub.throwNext = false;
+	baseUrlListener = undefined;
+	hostListeners = [];
+	getApiBaseUrlMock.mockReset().mockReturnValue("http://127.0.0.1:3001");
+	hasTrustedApiBaseUrlMock.mockReset().mockReturnValue(true);
+	subscribeApiBaseUrlMock.mockReset().mockImplementation((listener: () => void) => {
+		baseUrlListener = listener;
+		return unsubscribeBaseUrlMock;
+	});
+	unsubscribeBaseUrlMock.mockReset();
+	baseUrlForHostMock.mockReset().mockReturnValue(undefined);
+	subscribeConnectedHostsMock.mockReset().mockImplementation((listener: () => void) => {
+		hostListeners.push(listener);
+		return () => { hostListeners = hostListeners.filter((candidate) => candidate !== listener); };
+	});
+	(globalThis as unknown as { EventSource: unknown }).EventSource = EventSourceStub;
+});
+
+afterEach(() => {
+	vi.useRealTimers();
+	vi.restoreAllMocks();
+	delete (globalThis as unknown as { EventSource?: unknown }).EventSource;
+});
+
+describe("subscribeWorkspaceFileChanges", () => {
+	it("rechecks once after an initial preview request that predates the file event", async () => {
+		vi.useFakeTimers();
+		const client=fakeQueryClient();
+		vi.mocked(client.isFetching).mockReturnValueOnce(1).mockReturnValue(0);
+		const stop=subscribeWorkspaceFileChanges("initial-annotation",client);
+		EventSourceStub.instances[0].dispatch("workspace_changed");
+		await vi.advanceTimersByTimeAsync(6000);
+		const calls=vi.mocked(client.invalidateQueries).mock.calls.filter(([filters])=>filters?.queryKey?.[0]==="file-annotation-source");
+		expect(calls).toHaveLength(2);
+		expect(calls[0][1]).toEqual({cancelRefetch:false});
+		stop();
+	});
+	it("shares a two-second annotation throttle without delaying the file viewer", async () => {
+		vi.useFakeTimers();
+		const client=fakeQueryClient();
+		const stop=subscribeWorkspaceFileChanges("annotation-throttle",client);
+		const stopSecond=subscribeWorkspaceFileChanges("annotation-throttle",client);
+		expect(EventSourceStub.instances).toHaveLength(1);
+		const source=EventSourceStub.instances[0];
+		for(let i=0;i<20;i++) {source.dispatch("workspace_changed");await vi.advanceTimersByTimeAsync(100);}
+		const calls=vi.mocked(client.invalidateQueries).mock.calls;
+		expect(calls.filter(([filters])=>filters?.queryKey?.[0]==="file-annotation-source")).toHaveLength(1);
+		expect(calls.filter(([filters])=>filters?.queryKey?.[0]==="session-workspace-file").length).toBeGreaterThan(5);
+		stop();stopSecond();
+	});
+	it("queues one follow-up for writes during a slow annotation check and cancels scheduled work on disposal", async () => {
+		vi.useFakeTimers();
+		const client=fakeQueryClient();
+		let release!:()=>void;
+		vi.mocked(client.isFetching).mockReturnValueOnce(1).mockReturnValue(0);
+		vi.mocked(client.invalidateQueries).mockImplementation((filters)=>filters?.queryKey?.[0]==="file-annotation-source" ? new Promise<void>(resolve=>{release=resolve}) : Promise.resolve());
+		const stop=subscribeWorkspaceFileChanges("slow-annotation",client);
+		const source=EventSourceStub.instances[0];
+		source.dispatch("workspace_changed");await vi.advanceTimersByTimeAsync(2000);
+		for(let i=0;i<30;i++){source.dispatch("workspace_changed");await vi.advanceTimersByTimeAsync(100);}
+		const count=()=>vi.mocked(client.invalidateQueries).mock.calls.filter(([filters])=>filters?.queryKey?.[0]==="file-annotation-source").length;
+		expect(count()).toBe(1);
+		release();await Promise.resolve();await vi.advanceTimersByTimeAsync(2000);
+		expect(count()).toBe(2);
+		source.dispatch("workspace_changed");stop();release();
+		await vi.advanceTimersByTimeAsync(4000);
+		expect(count()).toBe(2);
+	});
+	it("refreshes during continuous writes instead of waiting for the final event", () => {
+		vi.useFakeTimers();
+		const queryClient = fakeQueryClient();
+		const stop = subscribeWorkspaceFileChanges("continuous", queryClient);
+		const source = EventSourceStub.instances[0]!;
+		source.dispatch("ready");
+		vi.advanceTimersByTime(150);
+		vi.mocked(queryClient.invalidateQueries).mockClear();
+		source.dispatch("workspace_changed");
+		vi.advanceTimersByTime(100);
+		source.dispatch("workspace_changed");
+		vi.advanceTimersByTime(50);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-diffs", "continuous"] });
+		vi.mocked(queryClient.invalidateQueries).mockClear();
+		source.dispatch("workspace_changed");
+		vi.advanceTimersByTime(150);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-diffs", "continuous"] });
+		stop();
+	});
+
+	it("polls while probing, then uses SSE after a delivered frame", () => {
+		vi.useFakeTimers();
+		baseUrlForHostMock.mockReturnValue("http://127.0.0.1:4000/host-a");
+		const queryClient = fakeQueryClient();
+		const stop = subscribeWorkspaceFileChanges("session-a", queryClient, "host-a");
+		expect(EventSourceStub.instances).toHaveLength(1);
+		expect(getWorkspaceFileConnectionState("session-a", "host-a")).toBe("connected");
+		vi.advanceTimersByTime(2_150);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-files", "host-a", "session-a"] });
+		EventSourceStub.instances[0].dispatch("ready");
+		vi.advanceTimersByTime(150);
+		vi.mocked(queryClient.invalidateQueries).mockClear();
+		vi.advanceTimersByTime(2_150);
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalled();
+		stop();
+		expect(EventSourceStub.instances[0].closed).toBe(true);
+	});
+
+	it("isolates equal session IDs on remote A and B and closes only the disconnected host", () => {
+		vi.useFakeTimers();
+		baseUrlForHostMock.mockImplementation((hostId: string) => `http://127.0.0.1:4000/${hostId}`);
+		const queryClient = fakeQueryClient();
+		const stopA = subscribeWorkspaceFileChanges("same", queryClient, "host-a");
+		const stopB = subscribeWorkspaceFileChanges("same", queryClient, "host-b");
+		expect(EventSourceStub.instances.map((source) => source.url)).toEqual([
+			"http://127.0.0.1:4000/host-a/api/v1/sessions/same/workspace/events",
+			"http://127.0.0.1:4000/host-b/api/v1/sessions/same/workspace/events",
+		]);
+		vi.advanceTimersByTime(150);
+		vi.mocked(queryClient.invalidateQueries).mockClear();
+		EventSourceStub.instances[0].dispatch("workspace_changed");
+		vi.advanceTimersByTime(150);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-files", "host-a", "same"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["remote-workspace-file-paths", "host-a", "same"] });
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["session-workspace-files", "host-b", "same"] });
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["remote-workspace-file-paths", "host-b", "same"] });
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["session-workspace-files", "same"] });
+		baseUrlForHostMock.mockImplementation((hostId: string) => hostId === "host-a" ? undefined : `http://127.0.0.1:4000/${hostId}`);
+		for (const listener of hostListeners) listener();
+		expect(EventSourceStub.instances[0].closed).toBe(true);
+		expect(EventSourceStub.instances[1].closed).toBe(false);
+		expect(getWorkspaceFileConnectionState("same", "host-a")).toBe("degraded");
+		stopA();
+		stopB();
+	});
+
+	it("shares one daemon stream until the final Files view unmounts", () => {
+		const queryClient = fakeQueryClient();
+		const unsubscribeRail = subscribeWorkspaceFileChanges("session/a", queryClient);
+		const unsubscribeMaximized = subscribeWorkspaceFileChanges("session/a", queryClient);
+
+		expect(EventSourceStub.instances).toHaveLength(1);
+		expect(EventSourceStub.instances[0].url).toBe(
+			"http://127.0.0.1:3001/api/v1/sessions/session%2Fa/workspace/events",
+		);
+
+		unsubscribeRail();
+		expect(EventSourceStub.instances[0].closed).toBe(false);
+		unsubscribeMaximized();
+		expect(EventSourceStub.instances[0].closed).toBe(true);
+		expect(unsubscribeBaseUrlMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("coalesces filesystem events and invalidates the list plus visible details", () => {
+		vi.useFakeTimers();
+		const queryClient = fakeQueryClient();
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-1", queryClient);
+		const source = EventSourceStub.instances[0];
+
+		source.dispatch("workspace_changed");
+		source.dispatch("workspace_changed");
+		vi.advanceTimersByTime(149);
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+
+		expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(11);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["workspace-file-paths", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-files", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-history", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-branches", "sess-1"] });
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["file-annotation-source", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-file", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-file-revision", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-diffs", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["files-review-end-of-file", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["files-preview-end-of-file", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-search", "sess-1"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-tree", "sess-1"] });
+		unsubscribe();
+	});
+
+	it("always refreshes content while deduplicating manifest inventory versions", () => {
+		vi.useFakeTimers();
+		const queryClient = fakeQueryClient();
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-version", queryClient);
+		const source = EventSourceStub.instances[0];
+
+		source.dispatch("workspace_changed", JSON.stringify({ kind: "dirty", refreshing: true }));
+		vi.advanceTimersByTime(INVALIDATE_TEST_WINDOW_MS);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(7);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-diffs", "sess-version"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["files-review-end-of-file", "sess-version"] });
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["session-workspace-files", "sess-version"] });
+		vi.mocked(queryClient.invalidateQueries).mockClear();
+
+		const completed = JSON.stringify({ kind: "version", workspaceVersion: "v2" });
+		source.dispatch("workspace_changed", completed);
+		vi.advanceTimersByTime(INVALIDATE_TEST_WINDOW_MS);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(11);
+
+		vi.mocked(queryClient.invalidateQueries).mockClear();
+		source.dispatch("workspace_changed", completed);
+		vi.advanceTimersByTime(INVALIDATE_TEST_WINDOW_MS);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(7);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-file", "sess-version"] });
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-diffs", "sess-version"] });
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["session-workspace-files", "sess-version"] });
+		unsubscribe();
+	});
+
+	it("does not refetch a manifest version already in the shared cache", () => {
+		vi.useFakeTimers();
+		const queryClient = fakeQueryClient();
+		vi.mocked(queryClient.getQueryData).mockReturnValue({ workspaceVersion: "v2" });
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-current", queryClient);
+		EventSourceStub.instances[0].dispatch("workspace_changed", JSON.stringify({ kind: "version", workspaceVersion: "v2" }));
+		vi.advanceTimersByTime(INVALIDATE_TEST_WINDOW_MS);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(7);
+		expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["session-workspace-file-revision", "sess-current"] });
+		expect(queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["session-workspace-files", "sess-current"] });
+		unsubscribe();
+	});
+
+	it("does not postpone invalidation while workspace events continue", () => {
+		vi.useFakeTimers();
+		const queryClient = fakeQueryClient();
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-continuous", queryClient);
+		const source = EventSourceStub.instances[0];
+
+		source.dispatch("workspace_changed");
+		vi.advanceTimersByTime(100);
+		source.dispatch("workspace_changed");
+		vi.advanceTimersByTime(50);
+
+		expect(queryClient.invalidateQueries).toHaveBeenCalledTimes(11);
+		unsubscribe();
+	});
+
+	it("keeps one retry pending when another connect trigger arrives", () => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		EventSourceStub.throwNext = true;
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-retry", fakeQueryClient());
+
+		expect(EventSourceStub.instances).toHaveLength(0);
+		baseUrlListener?.();
+		expect(EventSourceStub.instances).toHaveLength(0);
+
+		// Backoff, not a flat 5s: the first retry is the initial step scaled by
+		// the mocked jitter (see sse-backoff.ts).
+		const firstRetryMs = computeSseRetryDelayMs(1, () => 0.5);
+		vi.advanceTimersByTime(firstRetryMs - 1);
+		expect(EventSourceStub.instances).toHaveLength(0);
+		vi.advanceTimersByTime(1);
+		expect(EventSourceStub.instances).toHaveLength(1);
+		unsubscribe();
+	});
+
+	it("waits longer after each consecutive failure instead of a flat interval", () => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-growth", fakeQueryClient());
+
+		// Fail the stream repeatedly and record the gap the retry actually waited.
+		const waits: number[] = [];
+		for (let failure = 1; failure <= 4; failure += 1) {
+			const source = EventSourceStub.instances.at(-1)!;
+			source.readyState = 2;
+			source.onerror?.();
+
+			const before = EventSourceStub.instances.length;
+			const scheduled = computeSseRetryDelayMs(failure, () => 0.5);
+			// One tick short of the scheduled delay, nothing has reconnected yet.
+			vi.advanceTimersByTime(scheduled - 1);
+			expect(EventSourceStub.instances).toHaveLength(before);
+			vi.advanceTimersByTime(1);
+			expect(EventSourceStub.instances).toHaveLength(before + 1);
+			waits.push(scheduled);
+		}
+
+		// This is the regression: on the old flat interval every wait was 5s.
+		expect(waits).toEqual([...waits].sort((a, b) => a - b));
+		expect(new Set(waits).size).toBe(waits.length);
+		expect(waits.at(-1)!).toBeGreaterThan(waits[0]);
+		unsubscribe();
+	});
+
+	it("does not let the browser's own retries inflate the scheduled delay", () => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-native", fakeQueryClient());
+
+		// readyState CONNECTING means the browser is retrying by itself; those
+		// errors drive the degraded label but are not rebuilds we scheduled, so
+		// they must not advance the backoff exponent.
+		const source = EventSourceStub.instances.at(-1)!;
+		for (let i = 0; i < 10; i += 1) {
+			source.readyState = 0;
+			source.onerror?.();
+		}
+		expect(EventSourceStub.instances).toHaveLength(1);
+
+		// The first failure we actually schedule a retry for must still wait the
+		// initial delay, not the 60s ceiling.
+		source.readyState = 2;
+		source.onerror?.();
+		const firstRetryMs = computeSseRetryDelayMs(1, () => 0.5);
+		vi.advanceTimersByTime(firstRetryMs - 1);
+		expect(EventSourceStub.instances).toHaveLength(1);
+		vi.advanceTimersByTime(1);
+		expect(EventSourceStub.instances).toHaveLength(2);
+		unsubscribe();
+	});
+
+	it("drops back to the initial delay once the stream opens again", () => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-reset", fakeQueryClient());
+
+		// Three failures, so the delay has grown well past the initial step.
+		for (let failure = 1; failure <= 3; failure += 1) {
+			const source = EventSourceStub.instances.at(-1)!;
+			source.readyState = 2;
+			source.onerror?.();
+			vi.advanceTimersByTime(computeSseRetryDelayMs(failure, () => 0.5));
+		}
+
+		// A successful open must clear the accumulated failures.
+		const recovered = EventSourceStub.instances.at(-1)!;
+		recovered.readyState = 1;
+		recovered.onopen?.();
+
+		recovered.readyState = 2;
+		recovered.onerror?.();
+		const before = EventSourceStub.instances.length;
+		const firstRetryMs = computeSseRetryDelayMs(1, () => 0.5);
+		vi.advanceTimersByTime(firstRetryMs - 1);
+		expect(EventSourceStub.instances).toHaveLength(before);
+		vi.advanceTimersByTime(1);
+		expect(EventSourceStub.instances).toHaveLength(before + 1);
+		unsubscribe();
+	});
+
+	it("reports degraded after three completed connection failures", () => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-degraded", fakeQueryClient());
+
+		for (let failure = 0; failure < 3; failure += 1) {
+			const source = EventSourceStub.instances.at(-1)!;
+			source.readyState = 2;
+			source.onerror?.();
+			// Each retry waits longer than the last, so advance by the delay this
+			// failure count actually schedules rather than a fixed 5s.
+			if (failure < 2) vi.advanceTimersByTime(computeSseRetryDelayMs(failure + 1, () => 0.5));
+		}
+
+		expect(getWorkspaceFileConnectionState("sess-degraded")).toBe("degraded");
+		unsubscribe();
+	});
+
+	it("degrades after repeated native reconnect failures and recovers on open", () => {
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-native-retry", fakeQueryClient());
+		const source = EventSourceStub.instances[0];
+
+		source.onopen?.();
+		expect(getWorkspaceFileConnectionState("sess-native-retry")).toBe("connected");
+
+		source.readyState = 0;
+		for (let failure = 0; failure < 3; failure += 1) {
+			source.onerror?.();
+			expect(getWorkspaceFileConnectionState("sess-native-retry")).toBe(failure < 2 ? "connecting" : "degraded");
+		}
+
+		source.onopen?.();
+		expect(getWorkspaceFileConnectionState("sess-native-retry")).toBe("connected");
+		unsubscribe();
+	});
+
+	it("uses degraded polling when EventSource is unavailable", () => {
+		delete (globalThis as unknown as { EventSource?: unknown }).EventSource;
+
+		const unsubscribe = subscribeWorkspaceFileChanges("sess-no-eventsource", fakeQueryClient());
+
+		expect(getWorkspaceFileConnectionState("sess-no-eventsource")).toBe("degraded");
+		unsubscribe();
+	});
+});

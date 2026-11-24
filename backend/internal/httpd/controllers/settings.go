@@ -1,0 +1,230 @@
+package controllers
+
+import (
+	"context"
+	"errors"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
+	settingssvc "github.com/aoagents/agent-orchestrator/backend/internal/service/settings"
+)
+
+// SettingsService is the controller-facing preferences contract.
+type SettingsService interface {
+	Get(ctx context.Context) (settingssvc.Snapshot, error)
+	SetDefaultSessionMode(ctx context.Context, mode domain.SessionMode) (settingssvc.Snapshot, error)
+	SetHarnessDefault(ctx context.Context, agent domain.AgentHarness, value domain.HarnessDefault) (settingssvc.Snapshot, error)
+	SetChatHibernationEnabled(ctx context.Context, enabled bool) (settingssvc.Snapshot, error)
+	SetVersionRefresh(ctx context.Context, enabled bool) (settingssvc.Snapshot, error)
+	SetComputerUse(ctx context.Context, enabled bool) (settingssvc.Snapshot, error)
+	SetSessionRetentionDays(ctx context.Context, days int) (settingssvc.Snapshot, error)
+	ChatHarnesses(candidates []domain.AgentHarness) []domain.AgentHarness
+	Offering() settingssvc.Offering
+}
+
+// SettingsController owns the daemon-owned preference routes.
+//
+// These are daemon-owned rather than renderer-owned on purpose: desktop, mobile,
+// and the CLI all resolve the same value, so a preference held in one client would
+// disagree with the others.
+type SettingsController struct {
+	Svc SettingsService
+}
+
+// Register mounts the settings routes.
+func (c *SettingsController) Register(r chi.Router) {
+	r.Get("/settings", c.get)
+	r.Patch("/settings/session-interface", c.setSessionInterface)
+	r.Patch("/settings/chat-hibernation", c.setChatHibernation)
+	r.Patch("/settings/version-refresh", c.setVersionRefresh)
+	r.Patch("/settings/computer-use", c.setComputerUse)
+	r.Patch("/settings/session-retention", c.setSessionRetention)
+	r.Patch("/settings/harness-defaults/{agent}", c.setHarnessDefault)
+}
+
+func (c *SettingsController) get(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "GET", "/api/v1/settings")
+		return
+	}
+	snapshot, err := c.Svc.Get(r.Context())
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, c.response(snapshot))
+}
+
+func (c *SettingsController) setSessionInterface(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "PATCH", "/api/v1/settings/session-interface")
+		return
+	}
+	var req UpdateSessionInterfaceRequest
+	if !decodeConversationBody(w, r, &req) {
+		return
+	}
+
+	// Parsed strictly: an unrecognized value is rejected rather than collapsing to
+	// a default the caller did not ask for.
+	mode, err := domain.ParseSessionMode(req.DefaultSessionMode)
+	if err != nil || mode == "" {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation",
+			"SESSION_MODE_INVALID", `defaultSessionMode must be "chat" or "tui"`, nil)
+		return
+	}
+
+	snapshot, err := c.Svc.SetDefaultSessionMode(r.Context(), mode)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, c.response(snapshot))
+}
+
+func (c *SettingsController) setChatHibernation(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "PATCH", "/api/v1/settings/chat-hibernation")
+		return
+	}
+	var req UpdateChatHibernationRequest
+	if !decodeConversationBody(w, r, &req) {
+		return
+	}
+	if req.Enabled == nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation",
+			"CHAT_HIBERNATION_INVALID", "enabled must be true or false", nil)
+		return
+	}
+	snapshot, err := c.Svc.SetChatHibernationEnabled(r.Context(), *req.Enabled)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, c.response(snapshot))
+}
+
+func (c *SettingsController) setVersionRefresh(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "PATCH", "/api/v1/settings/version-refresh")
+		return
+	}
+	var req UpdateVersionRefreshRequest
+	if !decodeConversationBody(w, r, &req) {
+		return
+	}
+	if req.Enabled == nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation",
+			"VERSION_REFRESH_INVALID", "enabled must be true or false", nil)
+		return
+	}
+	snapshot, err := c.Svc.SetVersionRefresh(r.Context(), *req.Enabled)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, c.response(snapshot))
+}
+
+func (c *SettingsController) setComputerUse(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "PATCH", "/api/v1/settings/computer-use")
+		return
+	}
+	var req UpdateComputerUseRequest
+	if !decodeConversationBody(w, r, &req) {
+		return
+	}
+	if req.Enabled == nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation",
+			"COMPUTER_USE_INVALID", "enabled must be true or false", nil)
+		return
+	}
+	snapshot, err := c.Svc.SetComputerUse(r.Context(), *req.Enabled)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, c.response(snapshot))
+}
+
+func (c *SettingsController) setSessionRetention(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "PATCH", "/api/v1/settings/session-retention")
+		return
+	}
+	var req UpdateSessionRetentionRequest
+	if !decodeConversationBody(w, r, &req) {
+		return
+	}
+	if req.Days == nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation",
+			"SESSION_RETENTION_INVALID", "days is required; use 0 to keep archived sessions", nil)
+		return
+	}
+	snapshot, err := c.Svc.SetSessionRetentionDays(r.Context(), *req.Days)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, c.response(snapshot))
+}
+
+func (c *SettingsController) response(snapshot settingssvc.Snapshot) SettingsResponse {
+	// Reported so the client can warn that choosing chat narrows which agents are
+	// available, instead of letting the user discover it at spawn time.
+	chatHarnesses := c.Svc.ChatHarnesses(domain.AllHarnesses)
+	names := make([]string, 0, len(chatHarnesses))
+	for _, harness := range chatHarnesses {
+		names = append(names, string(harness))
+	}
+	offering := c.Svc.Offering()
+	return SettingsResponse{
+		DefaultSessionMode:     string(snapshot.DefaultSessionMode),
+		HarnessDefaults:        snapshot.HarnessDefaults,
+		ChatHarnesses:          names,
+		Client:                 offering.Client,
+		LocalEnabled:           offering.LocalEnabled,
+		ChatHibernationEnabled: snapshot.ChatHibernationEnabled,
+		VersionRefresh:         snapshot.VersionRefresh,
+		ComputerUse:            snapshot.ComputerUse,
+		SessionRetentionDays:   snapshot.SessionRetentionDays,
+		CloudEnabled:           offering.CloudEnabled(),
+		CloudControlPlaneURL:   offering.CloudControlPlaneURL,
+		TrackerIntakeEnabled:   offering.TrackerIntakeEnabled,
+	}
+}
+
+func (c *SettingsController) setHarnessDefault(w http.ResponseWriter, r *http.Request) {
+	if c.Svc == nil {
+		apispec.NotImplemented(w, r, "PATCH", "/api/v1/settings/harness-defaults/{agent}")
+		return
+	}
+	var req UpdateHarnessDefaultRequest
+	if !decodeConversationBody(w, r, &req) {
+		return
+	}
+	if req.DisabledModels == nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "HARNESS_DEFAULT_INVALID", "disabledModels is required; use an empty list to offer every model", nil)
+		return
+	}
+	agent := domain.AgentHarness(chi.URLParam(r, "agent"))
+	snapshot, err := c.Svc.SetHarnessDefault(r.Context(), agent, domain.HarnessDefault{DisabledModels: *req.DisabledModels})
+	if errors.Is(err, settingssvc.ErrUnknownHarness) {
+		envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "HARNESS_NOT_FOUND", err.Error(), nil)
+		return
+	}
+	if errors.Is(err, settingssvc.ErrInvalidHarnessDefault) {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "HARNESS_DEFAULT_INVALID", err.Error(), nil)
+		return
+	}
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, c.response(snapshot))
+}

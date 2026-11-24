@@ -1,0 +1,1471 @@
+import { artifactFilePath, artifactFilesPath, parseArtifacts, sortArtifacts, type SessionArtifact } from "./artifacts";
+import { resolveArtifactReference } from "./artifactPageInliner";
+import { parseVersion, parseVersionSummaries, type ArtifactVersion, type ArtifactVersionSummary } from "./artifactVersions";
+import type { ArchiveSummary } from "./archive/archiveSummary";
+import { authHeaders, httpBase, normalizeServerHost, type ServerConfig } from "./config";
+import type { DesktopTelemetryIdentity } from "./telemetry/telemetry";
+import { cachedInstallId, getInstallId } from "./installId";
+import { captureMobileApiError, httpCategory } from "./sentry";
+import { UnreachableError } from "./connectionError";
+import type { AttentionLevel } from "./theme";
+
+// ---- Types (subset of AO's DashboardSession we use on the phone) ------------
+
+export type SessionMode = "chat" | "tui";
+
+export type DashboardPR = {
+	number: number;
+	url: string;
+	title?: string;
+	owner?: string;
+	repo?: string;
+	branch?: string;
+	baseBranch?: string;
+	isDraft?: boolean;
+	state?: "open" | "merged" | "closed";
+	additions?: number;
+	deletions?: number;
+	changedFiles?: number;
+	ciStatus?: "pending" | "passing" | "failing" | "none";
+	reviewDecision?: "approved" | "changes_requested" | "pending" | "none";
+	mergeability?: {
+		state?: "unknown" | "mergeable" | "conflicting" | "blocked" | "unstable";
+		mergeable?: boolean;
+		ciPassing?: boolean;
+		approved?: boolean;
+		noConflicts?: boolean;
+		blockers?: string[];
+	};
+	unresolvedThreads?: number;
+};
+
+/**
+ * Where the daemon placed a session in its delivery lifecycle, derived
+ * server-side from durable facts and independently of `status`.
+ *
+ * Mirrors the desktop contract (backend/pkg/contract/kanban.go, surfaced to the
+ * renderer as KANBAN_COLUMNS). The daemon has always sent this; mobile simply
+ * discarded it and re-derived its own grouping, which is how the two boards
+ * came to disagree about the same session.
+ */
+export const KANBAN_COLUMNS = ["building", "validating", "needs_review", "ready", "archive"] as const;
+export type KanbanColumn = (typeof KANBAN_COLUMNS)[number];
+
+export function isKanbanColumn(value: string | null | undefined): value is KanbanColumn {
+	return !!value && (KANBAN_COLUMNS as readonly string[]).includes(value);
+}
+
+export type SessionProvisionStep = {
+	id: "fetch" | "worktree" | "setup" | "agent";
+	status: "pending" | "running" | "done";
+	startedAt?: string;
+	endedAt?: string;
+};
+
+export type DashboardSession = {
+	id: string;
+	projectId: string;
+	/** Opaque daemon runtime handle used only for terminal mux operations. */
+	terminalHandleId?: string;
+	status: string | null;
+	/** The daemon's own board placement. Absent on a daemon too old to send it. */
+	kanbanColumn?: KanbanColumn | null;
+	/**
+	 * The daemon's phrase for what is happening inside that column — richer than
+	 * `status` ("Awaiting PR", "Fixing CI failures"), and already localized on the
+	 * wire so clients print it without a mapping table.
+	 */
+	displayStatus?: string | null;
+	attentionLevel?: AttentionLevel | string | null;
+	activity?: string | null;
+	// Which agent CLI drives this session (claude-code, codex, …). Parsed off the
+	// wire but discarded until the orchestrator tab needed it for brand marks.
+	harness?: string | null;
+	reviewerHarness?: string | null;
+	reviewerConfig?: ReviewerAgentConfig;
+	/** Controller currently committed for this AO session. */
+	mode: SessionMode;
+	branch: string | null;
+	issueId: string | null;
+	issueUrl?: string | null;
+	issueLabel?: string | null;
+	issueTitle: string | null;
+	userPrompt: string | null;
+	displayName: string | null;
+	summary: string | null;
+	createdAt: string;
+	lastActivityAt: string;
+	/**
+	 * When something a person would notice last happened (activity-state change,
+	 * PR lifecycle or CI change, review). Absent from daemons that predate it;
+	 * read it through `eventAtOf`, which falls back.
+	 */
+	lastEventAt?: string;
+	pr?: DashboardPR | null;
+	prs?: DashboardPR[];
+	metadata?: Record<string, string>;
+	// Browser-preview target the daemon detected/served for this session (e.g. a
+	// dist/index.html entrypoint). Consumed by the in-app browser.
+	previewUrl?: string | null;
+	// Whether the runtime is dead. The board archives on this rather than on a
+	// finished status: a merged session whose agent is still running belongs on
+	// the board, only a terminated one belongs in the archive.
+	isTerminated?: boolean;
+	provisionState?: "provisioning" | "ready" | "failed";
+	provisionError?: string;
+	/** The daemon's start-up stages while a Chat session provisions. Absent from older daemons. */
+	provisionSteps?: SessionProvisionStep[];
+	/** Set while the task's generated branch name is on the way; keep `branch` private meanwhile. */
+	branchNaming?: boolean;
+	/** worker or orchestrator. Absent from rows built before the daemon named kinds. */
+	kind?: string;
+	/** When the stored row last changed. The archive is ordered by it, as on desktop. */
+	updatedAt?: string;
+	isPinned?: boolean;
+	pinnedAt?: string | null;
+	/** Automatically review each new pull-request head. */
+	autoReviewEnabled?: boolean;
+	/** Automatically deliver completed review feedback to the worker. */
+	autoInjectReview?: boolean;
+	/** Automatically deliver failing CI checks to the worker. */
+	autoInjectCI?: boolean;
+	/** Files in the session's artifact directory, newest first. */
+	artifacts?: SessionArtifact[];
+};
+
+export type OrchestratorLink = {
+	id: string;
+	projectId: string;
+	/** Opaque daemon runtime handle used only for terminal mux operations. */
+	terminalHandleId?: string;
+	projectName: string;
+	status?: string | null;
+	activity?: string | null;
+	/** Agent CLI driving this orchestrator — drives its brand mark. */
+	harness?: string | null;
+	mode: SessionMode;
+	updatedAt?: string | null;
+	runtimeState?: string | null;
+	hasRuntime?: boolean;
+	isTerminal?: boolean;
+	isRestorable?: boolean;
+};
+
+export type ProjectInfo = {
+	id: string;
+	name: string;
+	kind?: "single_repo" | "workspace" | "scratch";
+	sessionPrefix?: string;
+};
+
+export type ProjectDetail = ProjectInfo & {
+	agent?: string;
+	config?: {
+		agentConfig?: { model?: string };
+		worker?: { agent?: string; agentConfig?: { model?: string } };
+		reviewers?: { harness?: string }[];
+	};
+};
+
+export type DashboardStats = {
+	totalSessions?: number;
+	workingSessions?: number;
+	openPRs?: number;
+	needsReview?: number;
+};
+
+export type SessionsResponse = {
+	sessions: DashboardSession[];
+	orchestrators: OrchestratorLink[];
+	orchestratorId: string | null;
+	stats: DashboardStats;
+	// Returned here so callers don't fetch /projects a second time — getSessions
+	// already needs it to label orchestrators.
+	//
+	// Null when the /projects request itself failed, which is NOT the same fact
+	// as an empty list: the board judges a saved project filter against this, so
+	// folding a failure into [] told it every project was gone (#5058 review).
+	projects: ProjectInfo[] | null;
+	/**
+	 * The archive's size, when the daemon pages it: `sessions` then holds live
+	 * workers only and archived ones are fetched with getArchivedSessions. Null on
+	 * (or absent on) a daemon that predates paging, whose `sessions` still carries
+	 * the archive.
+	 */
+	archive?: ArchiveSummary | null;
+};
+
+
+export type { ArchiveSummary } from "./archive/archiveSummary";
+
+/** One page of a machine's archive, in the daemon's order (pinned, then most recently updated). */
+export type ArchivePage = { sessions: DashboardSession[]; nextCursor: string | null };
+
+/** Archived workers fetched per page when Archive is opened. */
+export const ARCHIVE_PAGE_SIZE = 50;
+
+// Machines whose daemon answered the live-only poll without an archive summary.
+// They predate paging, so they are polled for the full list as before. Checked
+// again now and then, so a daemon upgraded under a running app is picked up.
+const legacyArchiveHosts = new Map<string, number>();
+const LEGACY_ARCHIVE_RECHECK_MS = 15 * 60_000;
+
+/** Forget which machines answered like an older daemon. For tests. */
+export function resetArchivePagingProbes(): void {
+	legacyArchiveHosts.clear();
+}
+
+function archiveHostKey(cfg: ServerConfig): string {
+	return cfg.hostId ?? `${cfg.host}:${cfg.httpPort}`;
+}
+
+function wireArchiveSummary(raw: unknown): ArchiveSummary | null {
+	if (!raw || typeof raw !== "object") return null;
+	const { total, byProject } = raw as { total?: unknown; byProject?: unknown };
+	if (typeof total !== "number") return null;
+	const counts: Record<string, number> = {};
+	if (byProject && typeof byProject === "object") {
+		for (const [project, count] of Object.entries(byProject)) if (typeof count === "number") counts[project] = count;
+	}
+	return { total, byProject: counts };
+}
+
+// ---- Wire types (this repo's Go daemon, /api/v1/*) --------------------------
+//
+// The app UI speaks AO's OG "DashboardSession" shape; this daemon speaks a
+// leaner read model. The maps below translate the daemon's SessionView/PR facts
+// into the shapes the screens expect, so the rest of the app is unchanged.
+
+const API = "/api/v1";
+
+type WirePR = {
+	url: string;
+	number: number;
+	state?: string; // draft | open | merged | closed
+	ci?: string; // unknown | pending | passing | failing
+	review?: string; // none | approved | changes_requested | review_required
+	mergeability?: "unknown" | "mergeable" | "conflicting" | "blocked" | "unstable";
+	reviewComments?: boolean;
+};
+
+type WireSession = {
+	id: string;
+	// Absent for a standalone agent session: the daemon marks the field
+	// omitempty and a standalone session has no project to name.
+	projectId?: string;
+	terminalHandleId?: string;
+	issueId?: string;
+	kind?: string; // worker | orchestrator
+	harness?: string;
+	reviewerHarness?: string;
+	reviewerConfig?: ReviewerAgentConfig;
+	mode?: SessionMode;
+	displayName?: string;
+	activity?: unknown;
+	isTerminated?: boolean;
+	provisionState?: "provisioning" | "ready" | "failed";
+	provisionError?: string;
+	provisionSteps?: SessionProvisionStep[];
+	branchNaming?: boolean;
+	status?: string | null;
+	kanbanColumn?: string | null;
+	displayStatus?: string | null;
+	branch?: string;
+	createdAt?: string;
+	updatedAt?: string;
+	lastEventAt?: string;
+	previewUrl?: string;
+	isPinned?: boolean;
+	pinnedAt?: string | null;
+	autoReviewEnabled?: boolean;
+	autoInjectReview?: boolean;
+	autoInjectCI?: boolean;
+	prs?: WirePR[];
+	/** SessionArtifactView[]; read through parseArtifacts. */
+	artifactFiles?: unknown;
+};
+
+type WireProject = {
+	id: string;
+	name: string;
+	kind?: string;
+	sessionPrefix?: string;
+};
+
+function mapProjectKind(kind?: string): ProjectInfo["kind"] {
+	switch (kind) {
+		case "single_repo":
+		case "workspace":
+		case "scratch":
+			return kind;
+		default:
+			return undefined;
+	}
+}
+
+function mapPR(pr: WirePR): DashboardPR {
+	const ci = pr.ci === "passing" || pr.ci === "failing" || pr.ci === "pending" ? pr.ci : "none";
+	const mergeability = pr.mergeability ?? "unknown";
+	const review =
+		pr.review === "approved"
+			? "approved"
+			: pr.review === "changes_requested"
+				? "changes_requested"
+				: pr.review === "review_required"
+					? "pending"
+					: "none";
+	const state = pr.state === "merged" ? "merged" : pr.state === "closed" ? "closed" : "open";
+	return {
+		number: pr.number,
+		url: pr.url,
+		state,
+		isDraft: pr.state === "draft",
+		ciStatus: ci,
+		reviewDecision: review,
+		mergeability: { state: mergeability, mergeable: mergeability === "mergeable" },
+		unresolvedThreads: pr.reviewComments ? 1 : 0,
+	};
+}
+
+function activityString(a: unknown): string | null {
+	if (typeof a === "string") return a || null;
+	if (a && typeof a === "object" && "state" in a && typeof (a as { state: unknown }).state === "string") {
+		return (a as { state: string }).state || null;
+	}
+	return null;
+}
+
+function activityLastAt(a: unknown): string | undefined {
+	if (!a || typeof a !== "object" || !("lastActivityAt" in a)) return undefined;
+	const value = (a as { lastActivityAt: unknown }).lastActivityAt;
+	return typeof value === "string" && value ? value : undefined;
+}
+
+function mapSession(s: WireSession): DashboardSession {
+	const prs = (s.prs ?? []).map(mapPR);
+	return {
+		id: s.id,
+		// "" rather than undefined: every consumer treats the id as a string, and
+		// `shortLabel(undefined)` threw inside render and took the whole board down.
+		projectId: s.projectId ?? "",
+		terminalHandleId: s.terminalHandleId,
+		status: s.status ?? null,
+		kanbanColumn: isKanbanColumn(s.kanbanColumn) ? s.kanbanColumn : null,
+		displayStatus: s.displayStatus?.trim() || null,
+		activity: activityString(s.activity),
+		harness: s.harness ?? null,
+		reviewerHarness: s.reviewerHarness ?? null,
+		reviewerConfig: s.reviewerConfig,
+		mode: s.mode === "chat" ? "chat" : "tui",
+		branch: s.branch ?? null,
+		issueId: s.issueId ?? null,
+		issueTitle: null,
+		userPrompt: null,
+		displayName: s.displayName ?? null,
+		summary: null,
+		createdAt: s.createdAt ?? "",
+		lastActivityAt: activityLastAt(s.activity) ?? s.updatedAt ?? s.createdAt ?? "",
+		lastEventAt: s.lastEventAt || undefined,
+		pr: prs[0] ?? null,
+		prs,
+		previewUrl: s.previewUrl ?? null,
+		isTerminated: !!s.isTerminated,
+		provisionState: s.provisionState,
+		provisionError: s.provisionError,
+		provisionSteps: s.provisionSteps?.length ? s.provisionSteps : undefined,
+		branchNaming: !!s.branchNaming,
+		isPinned: !!s.isPinned,
+		pinnedAt: s.pinnedAt ?? null,
+		kind: s.kind || undefined,
+		updatedAt: s.updatedAt || undefined,
+		autoReviewEnabled: !!s.autoReviewEnabled,
+		autoInjectReview: s.autoInjectReview ?? true,
+		autoInjectCI: s.autoInjectCI ?? true,
+		artifacts: sortArtifacts(parseArtifacts(s.artifactFiles)),
+	};
+}
+
+function mapOrchestrator(s: WireSession, projectName: string): OrchestratorLink {
+	return {
+		id: s.id,
+		projectId: s.projectId ?? "",
+		terminalHandleId: s.terminalHandleId,
+		projectName,
+		status: s.status ?? null,
+		activity: activityString(s.activity),
+		harness: s.harness ?? null,
+		mode: s.mode === "chat" ? "chat" : "tui",
+		updatedAt: s.updatedAt ?? null,
+		hasRuntime: !s.isTerminated,
+		isTerminal: !!s.isTerminated,
+		isRestorable: !!s.isTerminated,
+	};
+}
+
+// ---- Low-level fetch with friendly errors ----------------------------------
+
+const REQUEST_TIMEOUT_MS = 12000;
+const DISCONNECT_REQUEST_TIMEOUT_MS = 2000;
+// The daemon gives attachment uploads 10 minutes; allow time for its response.
+// A cold agent resume spawns the chat host and reloads the transcript; the
+// daemon allows the driver 60s for that and cancels it if the client gives up.
+export const RESUME_REQUEST_TIMEOUT_MS = 70_000;
+export const ATTACHMENT_REQUEST_TIMEOUT_MS = 11 * 60_000;
+
+// The server answered, but with an error status. Distinct from the errors fetch
+// itself throws (DNS/refused/timeout), which mean the server was never reached —
+// a difference callers must be able to act on, since "wrong password" and "your
+// server is unreachable" need very different advice. The message keeps the
+// `${status} ${statusText}` prefix that call sites already match on.
+export class ApiError extends Error {
+	constructor(
+		readonly status: number,
+		message: string,
+		// The daemon's machine-readable error code (e.g. SESSION_AWAITING_DECISION).
+		// Carried separately from `message` so callers can branch on the exact
+		// condition instead of pattern-matching human-facing prose.
+		readonly code?: string,
+		// Correlates a client-visible failure with daemon logs. The daemon's error
+		// envelope guarantees this field, so mobile must not discard it.
+		readonly requestId?: string,
+		// The daemon's human-readable message alone, without the status prefix.
+		// Screens render this (via userFacingError), never `message`.
+		readonly detail?: string,
+	) {
+		super(message);
+		this.name = "ApiError";
+	}
+}
+
+async function req(cfg: ServerConfig, path: string, init?: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
+	const url = `${httpBase(cfg)}${path}`;
+	// Without a timeout a sleeping/unreachable host (common over Tailscale) hangs
+	// the call for the OS TCP timeout (~75-120s), freezing Kill/send and the poll.
+	const controller = new AbortController();
+	const abortError = () => Object.assign(new Error("Request cancelled"), { name: "AbortError" });
+	if (init?.signal?.aborted) throw abortError();
+	const cancel = () => controller.abort();
+	init?.signal?.addEventListener("abort", cancel);
+	let rejectAbort!: () => void;
+	const aborted = new Promise<never>((_resolve, reject) => {
+		rejectAbort = () => reject(abortError());
+		controller.signal.addEventListener("abort", rejectAbort);
+	});
+	const timer = setTimeout(cancel, timeoutMs);
+	let received: Response | undefined;
+	let bodyText = "";
+	try {
+		const installId = cachedInstallId();
+		await Promise.race([aborted, (async () => {
+			received = await fetch(url, {
+				...init,
+				signal: controller.signal,
+				headers: {
+					...authHeaders(cfg),
+					"Content-Type": "application/json",
+					...(installId ? { "X-AO-Install-Id": installId } : {}),
+					...(init?.headers ?? {}),
+				},
+			});
+			// This boundary serves finite JSON responses, not SSE or downloads.
+			// Finish loading here so writes with no body consumer also release their
+			// timer, and /sessions cannot fan out while its body is still stalled.
+			bodyText = await received.text();
+		})()]);
+	} catch (e) {
+		// Leaving a screen/host is not a connectivity failure. The poll owner
+		// invalidates its result before cancelling the shared request lifecycle.
+		if (init?.signal?.aborted) throw abortError();
+		if (received && !received.ok) {
+			// Headers already prove an auth/contract failure even if its optional
+			// error envelope stalls. Never turn a 401 into a retryable timeout.
+		} else if ((e as { name?: string })?.name === "AbortError") {
+			// Timed out reaching the host (commonly a sleeping Tailscale peer).
+			captureMobileApiError(path, "timeout");
+			throw new UnreachableError("timeout", { cause: e });
+		} else {
+			captureMobileApiError(path, "offline");
+			throw new UnreachableError("offline", { cause: e });
+		}
+	} finally {
+		clearTimeout(timer);
+		init?.signal?.removeEventListener("abort", cancel);
+		controller.signal.removeEventListener("abort", rejectAbort);
+	}
+	const res = received!;
+	if (!res.ok) {
+		// The daemon returns a locked JSON envelope: { error, code, message, requestId }.
+		let detail = "";
+		let code: string | undefined;
+		let requestId: string | undefined;
+		try {
+			const body = JSON.parse(bodyText);
+			detail = body?.message ?? body?.error ?? "";
+			code = typeof body?.code === "string" ? body.code : undefined;
+			requestId = typeof body?.requestId === "string" ? body.requestId : undefined;
+		} catch {
+			/* ignore */
+		}
+		// Server answered with an error: classify by status + daemon code, and tag
+		// the requestId so a mobile event pivots to the daemon's own capture.
+		captureMobileApiError(path, httpCategory(res.status), res.status, code, requestId);
+		throw new ApiError(
+			res.status,
+			`${res.status} ${res.statusText}${detail ? ` - ${detail}` : ""}`,
+			code,
+			requestId,
+			detail || undefined,
+		);
+	}
+	// Keep the existing Response interface for callers; the network body is
+	// already complete. Empty-response statuses cannot carry a Response body.
+	return new Response([204, 205, 304].includes(res.status) ? null : bodyText, {
+		status: res.status, statusText: res.statusText, headers: res.headers,
+	});
+}
+
+/** Shared authenticated JSON request boundary for focused mobile feature modules. */
+export function apiRequest(cfg: ServerConfig, path: string, init?: RequestInit, timeoutMs?: number): Promise<Response> {
+	return req(cfg, path, init, timeoutMs);
+}
+
+// ---- Reads ------------------------------------------------------------------
+
+export async function getProjects(cfg: ServerConfig, init?: Pick<RequestInit, "signal">): Promise<ProjectInfo[]> {
+	const res = await req(cfg, `${API}/projects`, init);
+	const data = await res.json();
+	const projects = Array.isArray(data?.projects) ? data.projects : [];
+	return projects.map((p: WireProject) => ({
+		id: p.id,
+		name: p.name,
+		kind: mapProjectKind(p.kind),
+		sessionPrefix: p.sessionPrefix,
+	}));
+}
+
+export async function getProject(cfg: ServerConfig, id: string): Promise<ProjectDetail> {
+	const res = await req(cfg, `${API}/projects/${encodeURIComponent(id)}`);
+	const data = await res.json();
+	return (data?.project ?? data) as ProjectDetail;
+}
+
+export async function getSessions(cfg: ServerConfig, _projectId?: string, init?: Pick<RequestInit, "signal">): Promise<SessionsResponse> {
+	// The daemon exposes sessions and orchestrators as two lists. Fetch both,
+	// keep worker sessions for the board, and map orchestrators for their screen.
+	//
+	// /sessions is probed FIRST, alone, rather than fanning out in one Promise.all.
+	// The daemon locks a device out for a minute after 5 failed auths, so a stale
+	// password used to cost 4 failures per poll tick (this call's three requests
+	// plus the caller's own /projects) — enough to arm the lockout in one or two
+	// ticks and make the user's next action, typically scanning a fresh pairing
+	// code, fail with 429 before the new password was ever checked. Probing first
+	// caps a bad-credential tick at a single failed attempt.
+	//
+	// The poll asks for live workers only, with the archive's size: the archive is
+	// most of a long-running machine's sessions, and over a tunnel the poll runs
+	// every two seconds. A daemon that predates paging leaves the summary out;
+	// that machine is then polled for everything, as before.
+	const hostKey = archiveHostKey(cfg);
+	const legacySince = legacyArchiveHosts.get(hostKey);
+	const tryPaged = legacySince === undefined || Date.now() - legacySince > LEGACY_ARCHIVE_RECHECK_MS;
+	let sessRes = await req(cfg, tryPaged ? `${API}/sessions?active=true&kind=worker` : `${API}/sessions`, init);
+	let sessData = await sessRes.json();
+	let archive = tryPaged ? wireArchiveSummary(sessData?.archived) : null;
+	if (tryPaged) {
+		if (archive) legacyArchiveHosts.delete(hostKey);
+		else {
+			legacyArchiveHosts.set(hostKey, Date.now());
+			// A daemon older still ignores `active` and has already sent everything,
+			// archived rows included; only one that filtered must be asked again.
+			const ignoredFilter = Array.isArray(sessData?.sessions) && sessData.sessions.some((s: WireSession) => s.isTerminated);
+			if (!ignoredFilter) {
+				sessRes = await req(cfg, `${API}/sessions`, init);
+				sessData = await sessRes.json();
+			}
+		}
+	}
+	// A failed /projects is reported as null rather than [] so a caller can tell
+	// "this daemon has no projects" from "we could not ask". It stays caught: an
+	// older daemon, or one blip on that one route, must not knock the board
+	// offline when /sessions answered fine.
+	const [orchRes, projects] = await Promise.all([
+		req(cfg, `${API}/orchestrators`, init),
+		getProjects(cfg, init).catch(() => null),
+	]);
+	const orchData = await orchRes.json();
+	const nameOf = new Map((projects ?? []).map((p) => [p.id, p.name]));
+
+	const rawSessions: WireSession[] = Array.isArray(sessData?.sessions) ? sessData.sessions : [];
+	const rawOrchestrators: WireSession[] = Array.isArray(orchData?.sessions) ? orchData.sessions : [];
+
+	const sessions = rawSessions.filter((s) => s.kind !== "orchestrator").map(mapSession);
+
+	// The daemon returns EVERY orchestrator session per project (one per past
+	// kill/respawn), so pick a single one per project - preferring the live
+	// (non-terminated) one, else the most recent. Otherwise the screen would
+	// grab a stale terminated orchestrator and show "Restart" while a live one
+	// is actually running.
+	const bestByProject = new Map<string, WireSession>();
+	for (const s of rawOrchestrators) {
+		// An orchestrator belongs to a project by definition; one without is not
+		// something this screen can show or restart.
+		if (!s.projectId) continue;
+		const cur = bestByProject.get(s.projectId);
+		// Keep a live orchestrator once found; otherwise take the later entry
+		// (the daemon lists them oldest to newest).
+		if (!cur || cur.isTerminated) bestByProject.set(s.projectId, s);
+	}
+	const orchestrators = [...bestByProject.values()].map((s) =>
+		mapOrchestrator(s, nameOf.get(s.projectId ?? "") ?? s.projectId ?? ""),
+	);
+
+	return { sessions, orchestrators, orchestratorId: null, stats: {}, projects, archive };
+}
+
+/**
+ * One page of a machine's archived workers. Only for a daemon whose poll
+ * reported an archive summary (see getSessions); an older one carries its
+ * archive in the poll itself.
+ */
+export async function getArchivedSessions(
+	cfg: ServerConfig,
+	options: { cursor?: string | null; projectId?: string; limit?: number } = {},
+	init?: Pick<RequestInit, "signal">,
+): Promise<ArchivePage> {
+	const query = new URLSearchParams({ active: "false", kind: "worker", limit: String(options.limit ?? ARCHIVE_PAGE_SIZE) });
+	if (options.cursor) query.set("cursor", options.cursor);
+	if (options.projectId) query.set("project", options.projectId);
+	const res = await req(cfg, `${API}/sessions?${query}`, init);
+	const data = await res.json();
+	const raw: WireSession[] = Array.isArray(data?.sessions) ? data.sessions : [];
+	return {
+		// The daemon has already filtered these; kept defensively so a row that is
+		// live by the time it lands can never be drawn as archived.
+		sessions: raw.filter((s) => s.kind !== "orchestrator" && s.isTerminated).map(mapSession),
+		nextCursor: typeof data?.nextCursor === "string" && data.nextCursor ? data.nextCursor : null,
+	};
+}
+
+// ---- Preview (in-app browser) ----------------------------------------------
+
+// Load the session's selected app preview, never a discovered repository file.
+// Build static URLs from our configured base so TLS tunnels stay on HTTPS.
+/**
+ * The daemon's preview-files route for a workspace path, each segment escaped.
+ * Shared by the preview button and chat attachment images so the route shape
+ * lives in one place.
+ */
+export function previewFilePath(sessionId: string, path: string): string {
+	return `${API}/sessions/${encodeURIComponent(sessionId)}/preview/files/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+/** The daemon's route for a file in a session's artifact folder, each segment escaped. */
+export function previewArtifactPath(sessionId: string, entry: string): string {
+	return `${API}/sessions/${encodeURIComponent(sessionId)}/preview/artifacts/${entry.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+export async function getPreview(cfg: ServerConfig, id: string): Promise<{ entry: string; url: string; authenticated: boolean } | null> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/preview`);
+	const data = await res.json();
+	const entry = typeof data?.entry === "string" ? data.entry.trim() : "";
+	if (entry) {
+		const path = data?.source === "artifact" ? previewArtifactPath(id, entry) : previewFilePath(id, entry);
+		const url = `${httpBase(cfg)}${path}`;
+		return { entry, url, authenticated: true };
+	}
+	const external = mobileReachablePreviewURL(typeof data?.previewUrl === "string" ? data.previewUrl : undefined, cfg.host);
+	return external ? { entry: external.hostname, url: external.href, authenticated: false } : null;
+}
+
+// ---- Artifacts --------------------------------------------------------------
+
+/** Full URL of one artifact's bytes, for a WebView or Image with auth headers. */
+/** The URL a WebView loads one artifact from by itself, with the preview cookie (see artifactFilePath). */
+export function artifactFileUrl(cfg: ServerConfig, sessionId: string, path: string): string | undefined {
+	const route = artifactFilePath(sessionId, path);
+	return route ? `${httpBase(cfg)}${route}` : undefined;
+}
+
+/** The URL the app reads one artifact's bytes from, with the Bearer header (see artifactFilesPath). */
+export function artifactBytesUrl(cfg: ServerConfig, sessionId: string, path: string): string | undefined {
+	const route = artifactFilesPath(sessionId, path);
+	return route ? `${httpBase(cfg)}${route}` : undefined;
+}
+
+/**
+ * An authenticated image source for one artifact file. `version` (its modified
+ * time) busts the image cache when the agent rewrites the file. Pass it through
+ * `imageSourceForPlatform` (lib/imageSource.ts): React Native's Android Image
+ * forwards headers only for an array source.
+ */
+export function artifactImageSource(cfg: ServerConfig, sessionId: string, path: string, version?: string): { uri: string; headers: Record<string, string> } | undefined {
+	const url = artifactBytesUrl(cfg, sessionId, path);
+	if (!url) return undefined;
+	return { uri: version ? `${url}?v=${encodeURIComponent(version)}` : url, headers: authHeaders(cfg) };
+}
+
+/**
+ * What an image a markdown artifact names should load: a file of the artifact
+ * folder (beside the document, or by its absolute path into the folder, as an
+ * HTML page may name it), with the connection's credential, or a web image as
+ * it is, with none. Undefined when it names neither. `versionOf` gives a
+ * listed file's modified time, so a regenerated image is not served from the
+ * image cache.
+ */
+export function artifactMarkdownImageSource(cfg: ServerConfig, sessionId: string, documentPath: string, url: string, versionOf?: (path: string) => string | undefined): { uri: string; headers?: Record<string, string> } | undefined {
+	const trimmed = url.trim();
+	if (/^(https?:|data:)/i.test(trimmed)) return { uri: trimmed };
+	const path = resolveArtifactReference(documentPath, trimmed, sessionId);
+	return path ? artifactImageSource(cfg, sessionId, path, versionOf?.(path)) : undefined;
+}
+
+/**
+ * One artifact's contents as text. The caller decides whether it is really
+ * text. A page is read raw from the preview route: the artifact-files route
+ * would write AO's bootstrap into it.
+ */
+export async function getArtifactText(cfg: ServerConfig, sessionId: string, path: string, init?: Pick<RequestInit, "signal">): Promise<string> {
+	const route = /\.html?$/i.test(path) ? artifactFilePath(sessionId, path, { raw: true }) : artifactFilesPath(sessionId, path);
+	if (!route) throw new Error("This artifact's path can't be opened.");
+	const res = await req(cfg, route, init);
+	return res.text();
+}
+
+/** An HTML artifact as a page, with AO's theme bootstrap written in (see artifactFilesPath). */
+export async function getArtifactPage(cfg: ServerConfig, sessionId: string, path: string, init?: Pick<RequestInit, "signal">): Promise<string> {
+	const route = artifactFilesPath(sessionId, path);
+	if (!route) throw new Error("This artifact's path can't be opened.");
+	const res = await req(cfg, route, init);
+	return res.text();
+}
+
+/** Deletes one listed artifact file; returns the session with its refreshed list. */
+export async function deleteArtifact(cfg: ServerConfig, sessionId: string, path: string): Promise<DashboardSession> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/artifact-files?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+	const data = await res.json();
+	return mapSession(data?.session ?? data);
+}
+
+function artifactVersionsPath(sessionId: string): string {
+	return `${API}/sessions/${encodeURIComponent(sessionId)}/artifact-versions`;
+}
+
+/** One file's kept versions, newest first; the first is current. Only reads. */
+export async function listArtifactVersions(cfg: ServerConfig, sessionId: string, path: string, init?: Pick<RequestInit, "signal">): Promise<ArtifactVersionSummary[]> {
+	const res = await req(cfg, `${artifactVersionsPath(sessionId)}?path=${encodeURIComponent(path)}`, init);
+	const data = await res.json();
+	return parseVersionSummaries(data?.versions);
+}
+
+/**
+ * Records an edit of the file the daemon has not picked up yet, then lists the
+ * file's versions like listArtifactVersions. The daemon waits for the file to
+ * settle first, so this can take a couple of seconds.
+ */
+export async function syncArtifactVersions(cfg: ServerConfig, sessionId: string, path: string, init?: Pick<RequestInit, "signal">): Promise<ArtifactVersionSummary[]> {
+	const res = await req(cfg, `${artifactVersionsPath(sessionId)}/sync`, { ...init, method: "POST", body: JSON.stringify({ path }) });
+	const data = await res.json();
+	return parseVersionSummaries(data?.versions);
+}
+
+/** One version's text. A saved version never changes. */
+export async function getArtifactVersion(cfg: ServerConfig, sessionId: string, path: string, version: number, init?: Pick<RequestInit, "signal">): Promise<ArtifactVersion> {
+	const res = await req(cfg, `${artifactVersionsPath(sessionId)}/${version}?path=${encodeURIComponent(path)}`, init);
+	const parsed = parseVersion(await res.json());
+	if (!parsed) throw new Error("This version couldn't be read.");
+	return parsed;
+}
+
+/**
+ * Rewrites the file with an earlier version. The content it replaces is kept
+ * as a version first, so the restore itself can be undone.
+ */
+export async function restoreArtifactVersion(cfg: ServerConfig, sessionId: string, path: string, version: number): Promise<void> {
+	await req(cfg, `${artifactVersionsPath(sessionId)}/restore`, { method: "POST", body: JSON.stringify({ path, version }) });
+}
+
+/** Rewrite host-loopback previews for the phone without ever forwarding AO auth. */
+export function mobileReachablePreviewURL(raw: string | undefined, aoHost: string): URL | undefined {
+	if (!raw) return undefined;
+	try {
+		const url = new URL(raw);
+		if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+		if (["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)) {
+			const host = normalizeServerHost(aoHost);
+			if (!host) return undefined;
+			url.hostname = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+		}
+		return url;
+	} catch {
+		return undefined;
+	}
+}
+
+// ---- Agent catalog ----------------------------------------------------------
+
+export type AgentInfo = {
+	id: string;
+	label: string;
+	authStatus?: "authorized" | "unauthorized" | "unknown" | "configured";
+};
+
+export type AgentCatalog = {
+	supported: AgentInfo[];
+	installed: AgentInfo[];
+	authorized: AgentInfo[];
+};
+
+export type AgentModelInfo = { id: string; label: string; isDefault?: boolean; provider?: string };
+export type AgentModelCatalog = {
+	agentId: string;
+	selectionMode: "catalog" | "text" | "mode";
+	allowCustom: boolean;
+	models: AgentModelInfo[];
+	source: string;
+	stale: boolean;
+	fetchedAt: string;
+	validatedAt?: string;
+	refreshRecommended?: boolean;
+	refreshState?: "idle" | "queued" | "refreshing" | "error";
+	warning?: string;
+};
+
+export type AOSettings = {
+	defaultSessionMode: SessionMode;
+	chatHarnesses: string[];
+};
+
+export async function getSettings(cfg: ServerConfig): Promise<AOSettings> {
+	const res = await req(cfg, `${API}/settings`);
+	const data = await res.json();
+	return {
+		defaultSessionMode: data?.defaultSessionMode === "tui" ? "tui" : "chat",
+		chatHarnesses: Array.isArray(data?.chatHarnesses) ? data.chatHarnesses.filter((value: unknown): value is string => typeof value === "string") : [],
+	};
+}
+
+/**
+ * The paired desktop's telemetry identity and opt-out. Older daemons without the
+ * route answer 404 (ApiError); callers treat any failure as "no identity" and
+ * keep the phone anonymous.
+ */
+export async function getTelemetryIdentity(cfg: ServerConfig): Promise<DesktopTelemetryIdentity> {
+	const res = await req(cfg, `${API}/telemetry/identity`);
+	const data = await res.json();
+	const str = (value: unknown) => (typeof value === "string" && value !== "" ? value : undefined);
+	return {
+		distinctId: str(data?.distinctId),
+		installId: str(data?.installId),
+		cloudUserId: str(data?.cloudUserId),
+		githubLogin: str(data?.githubLogin),
+		optedOut: data?.optedOut === true,
+	};
+}
+
+export async function getAgents(cfg: ServerConfig): Promise<AgentCatalog> {
+	const res = await req(cfg, `${API}/agents`);
+	const data = await res.json();
+	return {
+		supported: Array.isArray(data?.supported) ? data.supported : [],
+		installed: Array.isArray(data?.installed) ? data.installed : [],
+		authorized: Array.isArray(data?.authorized) ? data.authorized : [],
+	};
+}
+
+export async function refreshAgents(cfg: ServerConfig): Promise<AgentCatalog> {
+	const res = await req(cfg, `${API}/agents/refresh`, { method: "POST" });
+	const data = await res.json();
+	return {
+		supported: Array.isArray(data?.supported) ? data.supported : [],
+		installed: Array.isArray(data?.installed) ? data.installed : [],
+		authorized: Array.isArray(data?.authorized) ? data.authorized : [],
+	};
+}
+
+// The daemon answers an agent it has never discovered with an empty catalog
+// marked refreshing while discovery runs in the background, rather than making
+// the picker wait. Re-read until the discovered list arrives.
+const MODEL_CATALOG_REFRESH_POLL_MS = 1_500;
+
+function pollDelay(signal: AbortSignal | undefined): Promise<void> {
+	return new Promise((resolve) => {
+		const finish = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", finish);
+			resolve();
+		};
+		const timer = setTimeout(finish, MODEL_CATALOG_REFRESH_POLL_MS);
+		signal?.addEventListener("abort", finish, { once: true });
+		if (signal?.aborted) finish();
+	});
+}
+
+/**
+ * Loads an agent's model catalog, re-reading while the daemon is still
+ * discovering it. There is no attempt cap: the daemon bounds discovery (a
+ * readiness wait, then discovery's own timeout) and then saves a result, so a
+ * cold load ends with models or an error. `signal` stops polling when the view
+ * that asked closes.
+ */
+export async function getAgentModels(cfg: ServerConfig, agent: string, projectId?: string, signal?: AbortSignal): Promise<AgentModelCatalog> {
+	const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+	for (;;) {
+		const res = await req(cfg, `${API}/agents/${encodeURIComponent(agent)}/models${query}`);
+		const catalog = await res.json() as AgentModelCatalog;
+		const discovering = catalog?.refreshState === "refreshing" && !catalog.models?.length;
+		if (!discovering || signal?.aborted) return catalog;
+		await pollDelay(signal);
+		if (signal?.aborted) return catalog;
+	}
+}
+
+export async function refreshAgentModels(cfg: ServerConfig, agent: string, projectId?: string): Promise<AgentModelCatalog> {
+	const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+	const res = await req(cfg, `${API}/agents/${encodeURIComponent(agent)}/models/refresh${query}`, { method: "POST" });
+	return await res.json() as AgentModelCatalog;
+}
+
+// ---- Push notifications -----------------------------------------------------
+
+// Register (idempotent upsert) this device's Expo push token with the daemon so
+// its dispatcher can deliver OS push notifications. Keyed daemon-side by install ID.
+export async function registerPushDevice(
+	cfg: ServerConfig,
+	device: { token: string; platform?: string; deviceName?: string; hostName?: string },
+): Promise<void> {
+	const installId = await getInstallId();
+	await req(cfg, `${API}/push/devices`, {
+		method: "POST",
+		body: JSON.stringify({ ...device, installId }),
+	});
+}
+
+// Announce this device's identity to the daemon with no push token, so the
+// desktop roster shows a paired phone the moment it connects — independent of
+// notification permission. Posts to the same /push/devices route as
+// registerPushDevice, just without a `token` field; the daemon upserts by
+// installId, so a later registerForPush call attaches the token to this same
+// row instead of creating a second one.
+export async function announceDevice(
+	cfg: ServerConfig,
+	device: { installId: string; platform?: string; deviceName?: string },
+): Promise<void> {
+	await req(cfg, `${API}/push/devices`, {
+		method: "POST",
+		body: JSON.stringify(device),
+	});
+}
+
+// Unregister this device's push token (best-effort on disconnect/unpair). The
+// token's [ ] brackets must be URL-encoded for the path segment.
+export async function unregisterPushDevice(cfg: ServerConfig, token: string): Promise<void> {
+	await req(cfg, `${API}/push/devices/${encodeURIComponent(token)}`, { method: "DELETE" });
+}
+
+// Tell a daemon this phone is no longer paired with it, so it drops the device
+// from its roster entirely. Distinct from unregisterPushDevice, which only
+// detaches the push token and leaves the phone listed as notifications-off —
+// correct when the user switches notifications off, wrong when they disconnect,
+// which would leave the old desktop showing a phone that has moved on.
+//
+// Prefers the install id and falls back to the token so the call still works
+// from a build that predates install ids.
+export async function unpairFromDaemon(cfg: ServerConfig, id: string): Promise<void> {
+	await req(cfg, `${API}/push/pairings/${encodeURIComponent(id)}`, { method: "DELETE" }, DISCONNECT_REQUEST_TIMEOUT_MS);
+}
+
+// Mark a notification read (best-effort on notification tap) so unread counts
+// stay consistent with the web dashboard.
+export async function markNotificationRead(cfg: ServerConfig, id: string): Promise<void> {
+	await req(cfg, `${API}/notifications/${encodeURIComponent(id)}`, {
+		method: "PATCH",
+		body: JSON.stringify({ status: "read" }),
+	});
+}
+
+export async function clearNotification(cfg: ServerConfig, id: string): Promise<void> {
+	try {
+		await req(cfg, `${API}/notifications/${encodeURIComponent(id)}`, { method: "DELETE" });
+	} catch (cause) {
+		// Another client may have cleared the same row already.
+		if (!(cause instanceof ApiError) || cause.status !== 404 || cause.code !== "NOTIFICATION_NOT_FOUND") throw cause;
+	}
+}
+
+// Clears the machine's whole history, not just the rows the screen has loaded.
+export async function clearAllNotifications(cfg: ServerConfig): Promise<void> {
+	await req(cfg, `${API}/notifications`, { method: "DELETE" });
+}
+
+// ---- Notification history ---------------------------------------------------
+
+export type NotificationType =
+	| "needs_input"
+	| "ready_to_merge"
+	| "pr_merged"
+	| "pr_closed_unmerged"
+	| "review_completed"
+	| "review_changes_requested";
+
+export type NotificationRecord = {
+	id: string;
+	sessionId: string;
+	projectId: string;
+	prUrl: string;
+	type: NotificationType | string;
+	title: string;
+	body: string;
+	status: "unread" | "read" | string;
+	createdAt: string;
+};
+
+export type NotificationPage = {
+	notifications: NotificationRecord[];
+	nextCursor?: string;
+	unreadCount: number;
+};
+
+// History behind the Settings → Notifications row. Push only ever surfaces the
+// notifications that arrive while the phone is reachable; this is the durable
+// record the daemon keeps either way.
+export async function getNotifications(
+	cfg: ServerConfig,
+	opts: { status?: "unread" | "all"; limit?: number; cursor?: string } = {},
+	init?: Pick<RequestInit, "signal">,
+): Promise<NotificationPage> {
+	const qs = new URLSearchParams();
+	if (opts.status) qs.set("status", opts.status);
+	if (opts.limit) qs.set("limit", String(opts.limit));
+	if (opts.cursor) qs.set("cursor", opts.cursor);
+	const suffix = qs.toString() ? `?${qs}` : "";
+	const res = await req(cfg, `${API}/notifications${suffix}`, init);
+	const data = await res.json();
+	return {
+		notifications: Array.isArray(data?.notifications) ? data.notifications : [],
+		nextCursor: typeof data?.nextCursor === "string" && data.nextCursor ? data.nextCursor : undefined,
+		unreadCount: typeof data?.unreadCount === "number" ? data.unreadCount : 0,
+	};
+}
+
+// With ids, only those rows are marked, so unread rows on pages the screen has
+// not loaded yet stay unread. Without ids, every unread row on the machine is.
+export async function markAllNotificationsRead(cfg: ServerConfig, ids?: string[]): Promise<void> {
+	await req(cfg, `${API}/notifications/read-all`, {
+		method: "POST",
+		...(ids && ids.length > 0 ? { body: JSON.stringify({ ids }) } : {}),
+	});
+}
+
+// ---- Pull request detail ----------------------------------------------------
+
+// The rich per-PR view, from GET /sessions/{id}/pr. The board poll (GET
+// /sessions) carries only PR *facts* — number, state, ci, review, mergeability —
+// with no title, author, branches or diff stats, which is why the PR list can
+// only show what a session already knows. This is the endpoint that has the
+// rest, so it is fetched on demand when a PR is opened rather than on every
+// 8s poll. Shape mirrors SessionPRSummary in
+// backend/internal/httpd/controllers/dto.go.
+
+export type PRFailingCheck = { name: string; status?: string; conclusion?: string; url?: string };
+export type PRConflictFile = { path: string; url?: string };
+export type PRReviewCommentLink = {
+	url?: string;
+	reviewId?: string;
+	file?: string;
+	line?: number;
+	body?: string;
+	autoInjectReview: boolean;
+};
+
+export type PRUnresolvedReviewer = {
+	reviewerId: string;
+	count: number;
+	links: PRReviewCommentLink[];
+	reviewUrl?: string;
+	isBot?: boolean;
+};
+
+export type PRReviewEntry = {
+	reviewerId: string;
+	verdict: "none" | "approved" | "changes_requested" | "review_required";
+	body?: string;
+	reviewUrl?: string;
+	submittedAt: string;
+	isBot?: boolean;
+	autoInjectReview: boolean;
+};
+
+export type SessionPRSummary = {
+	url: string;
+	htmlUrl?: string;
+	number: number;
+	title: string;
+	state: "draft" | "open" | "merged" | "closed";
+	repo: string;
+	author: string;
+	/** The head commit the merge is fenced to, so a newer push is never merged unseen. */
+	headSha?: string;
+	sourceBranch: string;
+	targetBranch: string;
+	additions: number;
+	deletions: number;
+	changedFiles: number;
+	ci: { state: "unknown" | "pending" | "passing" | "failing"; failingChecks: PRFailingCheck[] };
+	review: {
+		decision: "none" | "approved" | "changes_requested" | "review_required";
+		hasUnresolvedHumanComments: boolean;
+		unresolvedBy: PRUnresolvedReviewer[];
+		resolvedBy?: PRUnresolvedReviewer[];
+		reviews?: PRReviewEntry[];
+	};
+	mergeability: {
+		state: "unknown" | "mergeable" | "conflicting" | "blocked" | "unstable";
+		reasons: string[];
+		prUrl?: string;
+		conflictFiles?: PRConflictFile[];
+	};
+	updatedAt?: string;
+};
+
+/** Squash-merges a session PR the way desktop does, fenced to the head commit on screen. */
+export async function mergeSessionPR(cfg: ServerConfig, pr: Pick<SessionPRSummary, "number" | "url" | "headSha">): Promise<void> {
+	if (!pr.headSha) throw new Error(`PR #${pr.number} has no head commit yet; refresh and try again.`);
+	await req(cfg, `${API}/prs/${encodeURIComponent(String(pr.number))}/merge`, {
+		method: "POST",
+		body: JSON.stringify({ prUrl: pr.url, expectedHeadSha: pr.headSha }),
+	});
+}
+
+export async function getSessionPR(cfg: ServerConfig, sessionId: string): Promise<SessionPRSummary[]> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/pr`);
+	const data = await res.json();
+	return Array.isArray(data?.prs) ? data.prs : [];
+}
+
+// ---- AO review detail ------------------------------------------------------
+
+export type ReviewRun = {
+	id: string;
+	reviewId: string;
+	sessionId: string;
+	batchId: string;
+	harness: string;
+	triggerSource: "manual" | "auto";
+	prUrl: string;
+	targetSha: string;
+	status: "running" | "complete" | "delivered" | "failed" | "cancelled";
+	verdict: "" | "approved" | "changes_requested";
+	body: string;
+	githubReviewId: string;
+	createdAt: string;
+	deliveredAt?: string | null;
+	autoInjectReview: boolean;
+};
+
+export type PRReviewState = {
+	prUrl: string;
+	prNumber: number;
+	title: string;
+	targetSha: string;
+	status: "needs_review" | "running" | "up_to_date" | "changes_requested" | "ineligible";
+	latestRun?: ReviewRun;
+	previousRun?: ReviewRun;
+};
+
+export type ReviewerSurface = {
+	mode: "chat" | "tui";
+	reviewId: string;
+	harness: string;
+	handleId?: string;
+	controllerError?: string;
+};
+
+export type SessionReviews = {
+	reviewerHandleId: string;
+	reviewerHarness?: string;
+	reviewerActivityState?: "active" | "idle" | "waiting_input" | "blocked" | "exited";
+	reviewerSurface?: ReviewerSurface;
+	reviews: PRReviewState[];
+	runs: ReviewRun[];
+};
+
+export type ReviewerAgentConfig = {
+	effort?: string;
+	mode?: string;
+	model?: string;
+	permissions?: string;
+};
+
+export async function getSessionReviews(cfg: ServerConfig, sessionId: string): Promise<SessionReviews> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/reviews`);
+	const data = await res.json();
+	return {
+		reviewerHandleId: typeof data?.reviewerHandleId === "string" ? data.reviewerHandleId : "",
+		reviewerHarness: typeof data?.reviewerHarness === "string" ? data.reviewerHarness : undefined,
+		reviewerActivityState: data?.reviewerActivityState,
+		reviewerSurface: data?.reviewerSurface,
+		reviews: Array.isArray(data?.reviews) ? data.reviews : [],
+		runs: Array.isArray(data?.runs) ? data.runs : [],
+	};
+}
+
+export async function triggerSessionReview(cfg: ServerConfig, sessionId: string): Promise<SessionReviews & { created: boolean }> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/reviews/trigger`, { method: "POST" });
+	const data = await res.json();
+	return { ...mapSessionReviews(data), created: data?.created === true };
+}
+
+export async function cancelSessionReview(cfg: ServerConfig, sessionId: string): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/reviews/cancel`, { method: "POST" });
+}
+
+export async function restoreSessionReviewer(cfg: ServerConfig, sessionId: string): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/reviews/restore`, { method: "POST" });
+}
+
+export async function killSessionReviewer(cfg: ServerConfig, sessionId: string): Promise<SessionReviews> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/reviews/kill`, { method: "POST" });
+	return mapSessionReviews(await res.json());
+}
+
+export async function switchSessionReviewer(
+	cfg: ServerConfig,
+	sessionId: string,
+	harness?: string,
+	agentConfig?: ReviewerAgentConfig,
+): Promise<SessionReviews> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/reviews/switch`, {
+		method: "POST",
+		body: JSON.stringify({
+			...(harness ? { harness } : {}),
+			...(agentConfig ? { agentConfig } : {}),
+		}),
+	});
+	return mapSessionReviews(await res.json());
+}
+
+function mapSessionReviews(data: any): SessionReviews {
+	return {
+		reviewerHandleId: typeof data?.reviewerHandleId === "string" ? data.reviewerHandleId : "",
+		reviewerHarness: typeof data?.reviewerHarness === "string" ? data.reviewerHarness : undefined,
+		reviewerActivityState: data?.reviewerActivityState,
+		reviewerSurface: data?.reviewerSurface,
+		reviews: Array.isArray(data?.reviews) ? data.reviews : [],
+		runs: Array.isArray(data?.runs) ? data.runs : [],
+	};
+}
+
+export async function requestSessionRereview(
+	cfg: ServerConfig,
+	sessionId: string,
+	pullRequestUrl: string,
+	reviewerId: string,
+): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/reviews/rerequest`, {
+		method: "POST",
+		body: JSON.stringify({ pullRequestUrl, reviewerId }),
+	});
+}
+
+export async function resolveSessionReviewComment(
+	cfg: ServerConfig,
+	sessionId: string,
+	pullRequestUrl: string,
+	commentUrl: string,
+): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(sessionId)}/reviews/comments/resolve`, {
+		method: "POST",
+		body: JSON.stringify({ pullRequestUrl, commentUrl }),
+	});
+}
+
+// ---- Writes / actions -------------------------------------------------------
+
+export async function killSession(cfg: ServerConfig, id: string): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/kill`, { method: "POST" });
+}
+
+/** Rename the worker shown on the board without changing its conversation history. */
+export async function renameSession(cfg: ServerConfig, id: string, displayName: string): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(id)}`, {
+		method: "PATCH",
+		body: JSON.stringify({ displayName }),
+	});
+}
+
+export async function pinSession(cfg: ServerConfig, id: string): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/pin`, { method: "POST" });
+}
+
+export async function unpinSession(cfg: ServerConfig, id: string): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/pin`, { method: "DELETE" });
+}
+
+/** Automatically launch a review whenever this session's PR head changes. */
+export async function setSessionAutoReview(cfg: ServerConfig, id: string, enabled: boolean): Promise<DashboardSession> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/auto-review`, {
+		method: "PUT",
+		body: JSON.stringify({ enabled }),
+	});
+	const data = await res.json();
+	return mapSession(data?.session ?? data);
+}
+
+/** Automatically send completed AO and GitHub review feedback to the worker. */
+export async function setSessionAutoInjectReview(cfg: ServerConfig, id: string, autoInjectReview: boolean): Promise<DashboardSession> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/auto-inject-review`, {
+		method: "PATCH",
+		body: JSON.stringify({ autoInjectReview }),
+	});
+	const data = await res.json();
+	return mapSession(data?.session ?? data);
+}
+
+/** Automatically send failing CI checks to the worker. */
+export async function setSessionAutoInjectCI(cfg: ServerConfig, id: string, autoInjectCI: boolean): Promise<DashboardSession> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/auto-inject-ci`, {
+		method: "PATCH",
+		body: JSON.stringify({ autoInjectCI }),
+	});
+	const data = await res.json();
+	return mapSession(data?.session ?? data);
+}
+
+export async function restoreSession(cfg: ServerConfig, id: string): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/restore`, { method: "POST" });
+}
+
+/** Restart a stopped agent/controller without restoring a terminated AO session. */
+export async function resumeSessionAgent(cfg: ServerConfig, id: string): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/resume-agent`, { method: "POST" }, RESUME_REQUEST_TIMEOUT_MS);
+}
+
+/**
+ * Without `userAuthored`, the daemon treats the text as AO coordination (an
+ * `ao send` from another session) and types it into the agent wrapped in an
+ * `<ao-session-delivery>` envelope. Anything the user chose to send (typed text,
+ * or a review they forwarded) must set it, the way desktop does, so the agent
+ * sees it as a plain user prompt.
+ */
+export async function sendMessage(cfg: ServerConfig, id: string, message: string, options?: { userAuthored?: boolean }): Promise<void> {
+	await req(cfg, `${API}/sessions/${encodeURIComponent(id)}/send`, {
+		method: "POST",
+		body: JSON.stringify(options?.userAuthored ? { message, userAuthored: true } : { message }),
+	});
+}
+
+export async function spawnSession(
+	cfg: ServerConfig,
+	opts: { projectId?: string; prompt?: string; issueId?: string; harness?: string; model?: string; mode?: SessionMode; attachments?: SpawnAttachmentInput[]; clientRequestId?: string },
+): Promise<DashboardSession> {
+	const res = await req(cfg, `${API}/sessions`, {
+		method: "POST",
+		headers: opts.attachments?.length ? { "X-AO-Attachment-Upload": "1" } : undefined,
+		body: JSON.stringify({
+			projectId: opts.projectId,
+			prompt: opts.prompt,
+			issueId: opts.issueId,
+			// The daemon needs an agent harness unless the project configures a
+			// default worker.agent; the spawn screen lets the user pick one.
+			harness: opts.harness || undefined,
+			model: opts.model || undefined,
+			// Mobile is Chat-first. Callers may deliberately request TUI for a harness
+			// that cannot expose a structured controller, but omission must never make
+			// the phone depend on a desktop preference it cannot see.
+			mode: opts.mode ?? "chat",
+			kind: "worker",
+			attachments: opts.attachments?.length ? opts.attachments : undefined,
+			clientRequestId: opts.clientRequestId,
+		}),
+	}, opts.attachments?.length ? ATTACHMENT_REQUEST_TIMEOUT_MS : undefined);
+	const data = await res.json();
+	return mapSession(data?.session ?? data);
+}
+
+export type SpawnAttachmentInput = {
+	mimeType: string;
+	data: string;
+};
+
+export async function getSession(cfg: ServerConfig, id: string): Promise<DashboardSession> {
+	const res = await req(cfg, `${API}/sessions/${encodeURIComponent(id)}`);
+	const data = await res.json();
+	return mapSession(data?.session ?? data);
+}
+
+export async function delegateTask(
+	cfg: ServerConfig,
+	opts: { projectId: string; brief: string; agent?: string; model?: string; mode: SessionMode; attachments?: SpawnAttachmentInput[]; clientRequestId?: string },
+): Promise<DashboardSession> {
+	const res = await req(cfg, `${API}/orchestrators/delegate`, {
+		method: "POST",
+		headers: opts.attachments?.length ? { "X-AO-Attachment-Upload": "1" } : undefined,
+		body: JSON.stringify({
+			projectId: opts.projectId,
+			brief: opts.brief,
+			agent: opts.agent || undefined,
+			model: opts.model || undefined,
+			mode: opts.mode,
+			attachments: opts.attachments?.length ? opts.attachments : undefined,
+			clientRequestId: opts.clientRequestId,
+		}),
+	}, opts.attachments?.length ? ATTACHMENT_REQUEST_TIMEOUT_MS : undefined);
+	const data = await res.json();
+	if (!data?.workerId) throw new Error("Your machine didn't return the new worker. Refresh the board to check whether it started.");
+	return getSession(cfg, data.workerId);
+}
+
+export async function launchOrchestrator(
+	cfg: ServerConfig,
+	projectId: string,
+	clean = false,
+	mode: SessionMode = "chat",
+): Promise<OrchestratorLink> {
+	const res = await req(cfg, `${API}/orchestrators`, {
+		method: "POST",
+		body: JSON.stringify({ projectId, clean, mode }),
+	});
+	const data = await res.json();
+	const o = data?.orchestrator ?? {};
+	return {
+		id: o.id,
+		projectId: o.projectId ?? projectId,
+		projectName: o.projectName ?? projectId,
+		// Legacy mobile presentation field: here this means "the orchestrator is
+		// active", not that a Chat session owns a tmux runtime handle.
+		hasRuntime: true,
+		isTerminal: false,
+		mode: o.mode === "tui" ? "tui" : o.mode === "chat" ? "chat" : mode,
+	};
+}
+
+export async function mergePR(cfg: ServerConfig, pr: DashboardPR): Promise<void> {
+	await req(cfg, `${API}/prs/${pr.number}/merge`, { method: "POST" });
+}
+
+// Quick reachability probe for the Settings "Test connection" button.
+export async function pingServer(cfg: ServerConfig): Promise<number> {
+	const res = await req(cfg, `${API}/sessions`);
+	const data = await res.json();
+	return Array.isArray(data?.sessions) ? data.sessions.length : 0;
+}
+
+// ---- Derived helpers --------------------------------------------------------
+
+// Derived status helpers live in sessionStatus.ts so pure modules can import
+// them; re-exported here because call sites reach for them via api.
+export { attentionOf, isTerminalStatus, sessionTitle } from "./sessionStatus";
+
+// Project ids carry a generated hash suffix (`my-app_98d163a851`), which is
+// wider than a phone card. Middle-truncate: a plain tail-cut would drop the hash
+// and make two projects sharing a base name render identically, so keep the head
+// (the readable part) AND the tail (the part that disambiguates).
+const MAX_LABEL = 20;
+
+export function shortLabel(value: string, max = MAX_LABEL): string {
+	if (value.length <= max) return value;
+	const keep = max - 1; // room for the ellipsis
+	const head = Math.ceil(keep / 2);
+	const tail = Math.floor(keep / 2);
+	return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
+}

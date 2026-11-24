@@ -1,0 +1,19 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What went wrong?
+      description: Tell us what you did and what went wrong. Add a screenshot if you can.
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        Optional: Ask your coding agent to use the [bug-triage skill](https://github.com/OrchestratorInc/agent-orchestrator/blob/main/.agents/skills/bug-triage/SKILL.md) to help investigate the problem.
+
+        Need help? Ask us on [Discord](https://discord.com/invite/UZv7JjxbwG).

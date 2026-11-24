@@ -1,0 +1,579 @@
+-- name: NextSessionNum :one
+SELECT COALESCE(MAX(num), 0) + 1 AS next FROM sessions WHERE project_id = ?;
+
+-- name: NextStandaloneSessionNum :one
+SELECT COALESCE(MAX(num), 0) + 1 AS next FROM sessions WHERE project_id IS NULL;
+
+-- name: SessionIDExists :one
+SELECT COUNT(*) > 0 FROM sessions WHERE id = ?;
+
+-- name: InsertSession :exec
+INSERT INTO sessions (
+    id, project_id, num, issue_id, kind, harness, reviewer_harness, reviewer_agent_config, auto_review_enabled, display_name,
+    activity_state, activity_last_at, first_signal_at, is_terminated,
+    branch, workspace_path, workspace_repo_path, diff_base_sha, diff_base_ref, runtime_handle_id,
+    runtime_launch_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
+    latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
+    conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
+    conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
+    native_transcript_path,
+    preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
+    artifact_dir, session_output_type,
+    session_mode, provider_conversation_id, controller_generation, model, effort, session_permissions,
+    requested_output,
+    created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
+    provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed,
+    client_request_id, client_request_hash
+) VALUES (
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?
+);
+
+-- name: GetClientRequestSession :one
+SELECT id, client_request_hash, client_request_committed FROM sessions WHERE client_request_id = ?;
+
+-- name: CommitClientRequestSession :execrows
+UPDATE sessions SET client_request_committed = 1 WHERE id = ? AND client_request_id <> '';
+
+-- name: UpdateSession :exec
+-- The title has narrow writers only, and a renamed task's temporary branch is
+-- never written back, so a write from an older read cannot undo either.
+UPDATE sessions SET
+    issue_id = ?, kind = ?, harness = ?, reviewer_harness = ?, reviewer_agent_config = ?, auto_review_enabled = ?,
+    activity_state = ?, activity_last_at = ?, first_signal_at = ?, is_terminated = ?,
+    branch = CASE WHEN temporary_branch <> '' AND temporary_branch = ? THEN branch ELSE ? END, workspace_path = ?, workspace_repo_path = ?, diff_base_sha = ?, diff_base_ref = ?, runtime_handle_id = ?,
+    runtime_launch_id = ?, agent_session_id = ?, agent_session_id_launch_id = ?, native_identity_observed_at = ?, prompt = ?,
+    latest_user_prompt = ?, latest_user_prompt_at = ?, latest_assistant_update = ?, latest_assistant_update_at = ?,
+    conversation_checkpoint_state = ?, conversation_checkpoint_generation = ?, conversation_checkpoint_native_id = ?,
+    conversation_checkpoint_unsettled = ?, conversation_checkpoint_turn_id = ?, native_checkpoint_evidence = ?,
+    native_transcript_path = ?,
+    preview_url = ?, preview_revision = ?, terminate_on_pr_merge = ?,
+    cleanup_generation = ?, browser_capability_verifier = ?,
+    provider_conversation_id = ?, controller_generation = ?, model = ?, effort = ?, updated_at = ?,
+    is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?,
+    automation_launch_completed = ?
+WHERE id = ?;
+
+-- name: UpdateSessionModel :execrows
+UPDATE sessions
+SET model = sqlc.arg(model)
+WHERE id = sqlc.arg(id);
+
+-- name: SetSessionHibernated :execrows
+-- Revision fencing keeps an idle decision from overwriting a later send,
+-- controller change, or lifecycle write. Generic updates leave this fact alone.
+UPDATE sessions
+SET hibernated_at = sqlc.narg(hibernated_at)
+WHERE id = sqlc.arg(id) AND revision = sqlc.arg(expected_revision);
+
+-- name: MarkHarnessSessionsStale :execrows
+-- Marks the live launches of a harness an update just replaced. A launch that
+-- was already marked keeps when it first went stale; the version moves on.
+UPDATE sessions
+SET stale_binary_since = CASE
+        WHEN stale_binary_since IS NOT NULL AND stale_binary_launch =
+            (CASE WHEN session_mode = 'chat' THEN controller_generation ELSE runtime_launch_id END)
+        THEN stale_binary_since ELSE sqlc.arg(since) END,
+    stale_binary_version = sqlc.arg(version),
+    stale_binary_launch = CASE WHEN session_mode = 'chat' THEN controller_generation ELSE runtime_launch_id END,
+    stale_binary_switch_failed_at = NULL
+WHERE harness = sqlc.arg(harness) AND is_terminated = 0 AND is_task_preparation = 0
+    AND hibernated_at IS NULL AND activity_state <> 'exited';
+
+-- name: SetSessionVersionSwitchFailed :execrows
+-- Records that the move to the new release failed for the launch that tried it.
+UPDATE sessions
+SET stale_binary_switch_failed_at = sqlc.arg(failed_at),
+    stale_binary_since = COALESCE(stale_binary_since, sqlc.arg(failed_at)),
+    stale_binary_version = sqlc.arg(version),
+    stale_binary_launch = CASE WHEN session_mode = 'chat' THEN controller_generation ELSE runtime_launch_id END
+WHERE id = sqlc.arg(id);
+
+-- name: ListVersionRefreshChatCandidates :many
+-- Idle Chat sessions whose current launch still runs a replaced release.
+-- Orchestrators are included: a move restarts them right away.
+SELECT id FROM sessions
+WHERE session_mode = 'chat' AND is_terminated = 0 AND is_task_preparation = 0
+    AND provision_state IN ('', 'ready') AND hibernated_at IS NULL
+    AND activity_state = 'idle' AND activity_last_at IS NOT NULL
+    AND activity_last_at <= sqlc.arg(idle_before)
+    AND trim(provider_conversation_id) <> ''
+    AND stale_binary_since IS NOT NULL AND stale_binary_switch_failed_at IS NULL
+    AND stale_binary_launch = controller_generation;
+
+-- name: ListVersionRefreshTerminalCandidates :many
+-- Idle terminal sessions whose current launch still runs a replaced release
+-- and can be resumed natively.
+SELECT id FROM sessions
+WHERE session_mode = 'tui' AND is_terminated = 0 AND is_task_preparation = 0
+    AND kind <> 'orchestrator'
+    AND activity_state = 'idle' AND activity_last_at IS NOT NULL
+    AND activity_last_at <= sqlc.arg(idle_before)
+    AND trim(agent_session_id) <> '' AND trim(runtime_handle_id) <> ''
+    AND stale_binary_since IS NOT NULL AND stale_binary_switch_failed_at IS NULL
+    AND stale_binary_launch = runtime_launch_id;
+
+-- name: CountStaleBinarySessions :many
+-- Live launches still on a replaced release, per harness.
+SELECT harness, COUNT(*) AS sessions FROM sessions
+WHERE is_terminated = 0 AND hibernated_at IS NULL AND activity_state <> 'exited'
+    AND stale_binary_since IS NOT NULL
+    AND stale_binary_launch = (CASE WHEN session_mode = 'chat' THEN controller_generation ELSE runtime_launch_id END)
+GROUP BY harness;
+
+-- name: SetSessionRuntimeReleased :execrows
+-- Narrow write for an agent exit that keeps its session: names only the
+-- released launch, and only while that launch is still the session's own.
+UPDATE sessions
+SET runtime_released_launch_id = sqlc.arg(launch_id)
+WHERE id = sqlc.arg(id) AND runtime_launch_id = sqlc.arg(launch_id);
+
+-- name: UpdateSessionArtifactOutput :execrows
+-- Narrow write for lifecycle.Manager.ReconcileSessionOutputType: touches only
+-- the two output-derivation columns. A full read-then-UpdateSession write here
+-- would replay a stale SessionRecord over is_terminated, activity, runtime
+-- identity, and preview state committed by another writer between the read
+-- and this write (e.g. a session that terminated mid-reconcile could be
+-- resurrected). This statement cannot clobber those fields because it never
+-- names them.
+UPDATE sessions
+SET artifact_dir = sqlc.arg(artifact_dir), session_output_type = sqlc.arg(session_output_type)
+WHERE id = sqlc.arg(id);
+
+-- name: UpdateBrowserCapabilityVerifier :execrows
+-- Rotate only the browser credential for the exact controller owner observed by
+-- the launcher. This must not replay a stale SessionRecord over newer lifecycle,
+-- activity, termination, provider ownership, or user-visible recency facts.
+UPDATE sessions SET
+    browser_capability_verifier = sqlc.arg(browser_capability_verifier)
+WHERE id = sqlc.arg(id)
+  AND harness = sqlc.arg(expected_harness)
+  AND session_mode = sqlc.arg(expected_session_mode)
+  AND is_terminated = sqlc.arg(expected_is_terminated)
+  AND runtime_launch_id = sqlc.arg(expected_runtime_launch_id)
+  AND agent_session_id = sqlc.arg(expected_agent_session_id)
+  AND agent_session_id_launch_id = sqlc.arg(expected_agent_session_id_launch_id)
+  AND provider_conversation_id = sqlc.arg(expected_provider_conversation_id)
+  AND controller_generation = sqlc.arg(expected_controller_generation);
+
+-- name: ReplaceUnpersistedChatProvider :execrows
+-- Move a Chat from a provider id the provider never persisted to the fresh id
+-- it started instead. Guarded on the old id so a newer owner is never replaced.
+UPDATE sessions SET
+    provider_conversation_id = sqlc.arg(provider_conversation_id)
+WHERE id = sqlc.arg(id)
+  AND session_mode = 'chat'
+  AND provider_conversation_id = sqlc.arg(expected_provider_conversation_id);
+
+-- name: RecordSessionLatestUserPrompt :execrows
+UPDATE sessions SET
+    latest_user_prompt = sqlc.arg(latest_user_prompt),
+    latest_user_prompt_at = sqlc.arg(updated_at),
+    latest_assistant_update = '',
+    conversation_checkpoint_state = 'legacy',
+    conversation_checkpoint_generation = '',
+    conversation_checkpoint_native_id = '',
+    conversation_checkpoint_turn_id = '',
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id)
+  AND is_terminated = 0
+  AND updated_at <= sqlc.arg(updated_at);
+
+-- name: RecordSessionHumanMessage :execrows
+-- Chat message insertion already owns controller/idempotency fencing. Compare
+-- against the dedicated fact timestamp here so unrelated lifecycle writes do
+-- not suppress a newer human message.
+UPDATE sessions SET
+    latest_user_prompt = sqlc.arg(latest_user_prompt),
+    latest_user_prompt_at = sqlc.arg(latest_user_prompt_at),
+    latest_assistant_update = '',
+    conversation_checkpoint_state = 'legacy',
+    conversation_checkpoint_generation = '',
+    conversation_checkpoint_native_id = '',
+    conversation_checkpoint_turn_id = '',
+    updated_at = MAX(updated_at, sqlc.arg(latest_user_prompt_at))
+WHERE id = sqlc.arg(id)
+  AND is_terminated = 0
+  AND (latest_user_prompt_at IS NULL OR latest_user_prompt_at <= sqlc.arg(latest_user_prompt_at));
+
+-- name: ClaimChatControllerGeneration :execrows
+-- A Chat controller claims ownership before its event goroutine starts. Provider
+-- projections compare against this value in the same transaction as their write,
+-- so an older controller cannot mutate a session after a replacement takes over.
+-- Ownership changes are not activity and must not advance the board's recency.
+UPDATE sessions
+SET controller_generation = ?
+WHERE id = ? AND session_mode = 'chat';
+
+-- name: ActivateConversationBranchSession :execrows
+-- The branch and its native-history checkpoint have the same owner. A fork or
+-- branch activation cannot retain the previous native conversation's hook facts.
+UPDATE sessions
+SET updated_at = sqlc.arg(updated_at),
+    latest_user_prompt = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN latest_user_prompt ELSE '' END,
+    latest_assistant_update = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN latest_assistant_update ELSE '' END,
+    latest_assistant_update_at = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN latest_assistant_update_at ELSE NULL END,
+    conversation_checkpoint_state = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN conversation_checkpoint_state ELSE 'empty' END,
+    conversation_checkpoint_generation = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN conversation_checkpoint_generation ELSE '' END,
+    conversation_checkpoint_native_id = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN conversation_checkpoint_native_id ELSE '' END,
+    conversation_checkpoint_turn_id = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN conversation_checkpoint_turn_id ELSE '' END,
+    conversation_checkpoint_unsettled = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN conversation_checkpoint_unsettled ELSE 0 END,
+    native_checkpoint_evidence = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN native_checkpoint_evidence ELSE '' END,
+    native_transcript_path = CASE WHEN provider_conversation_id = sqlc.arg(provider_conversation_id) THEN native_transcript_path ELSE '' END,
+    agent_session_id = sqlc.arg(provider_conversation_id),
+    agent_session_id_launch_id = '',
+    native_identity_observed_at = sqlc.arg(updated_at),
+    provider_conversation_id = sqlc.arg(provider_conversation_id),
+    controller_generation = sqlc.arg(controller_generation)
+WHERE id = sqlc.arg(id) AND session_mode = 'chat' AND is_terminated = 0;
+
+-- name: CommitSessionControllerEpoch :execrows
+-- Lifecycle Manager owns this controller-epoch fact. The source-mode CAS keeps
+-- a stale transition from replacing a newer controller, while clearing every
+-- process-specific handle prevents either interface from inheriting the
+-- other's writer identity.
+UPDATE sessions
+SET session_mode = sqlc.arg(target_mode),
+    runtime_handle_id = '',
+    runtime_launch_id = '',
+    agent_session_id = sqlc.arg(agent_session_id),
+    agent_session_id_launch_id = '',
+    provider_conversation_id = sqlc.arg(provider_conversation_id),
+    controller_generation = '',
+    latest_user_prompt = CASE WHEN sqlc.arg(target_mode) = 'tui' THEN '' ELSE latest_user_prompt END,
+    latest_assistant_update = CASE WHEN sqlc.arg(target_mode) = 'tui' THEN '' ELSE latest_assistant_update END,
+    conversation_checkpoint_state = CASE WHEN sqlc.arg(target_mode) = 'tui' THEN 'empty' ELSE conversation_checkpoint_state END,
+    conversation_checkpoint_generation = CASE WHEN sqlc.arg(target_mode) = 'tui' THEN '' ELSE conversation_checkpoint_generation END,
+    conversation_checkpoint_native_id = CASE WHEN sqlc.arg(target_mode) = 'tui' THEN '' ELSE conversation_checkpoint_native_id END,
+    conversation_checkpoint_unsettled = CASE WHEN sqlc.arg(target_mode) = 'tui' THEN 0 ELSE conversation_checkpoint_unsettled END,
+    conversation_checkpoint_turn_id = CASE WHEN sqlc.arg(target_mode) = 'tui' THEN '' ELSE conversation_checkpoint_turn_id END,
+    native_checkpoint_evidence = CASE WHEN sqlc.arg(target_mode) = 'tui' THEN '' ELSE native_checkpoint_evidence END,
+    activity_state = 'idle',
+    activity_last_at = sqlc.arg(activity_last_at),
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id) AND session_mode = sqlc.arg(source_mode) AND is_terminated = 0;
+
+-- name: RestoreSessionControllerEpoch :execrows
+-- Rollback owns the same controller/activity facts but retains the source replay
+-- checkpoint: the failed target never accepted it, so a later strict retry must
+-- prove the same checkpoint again.
+UPDATE sessions
+SET session_mode = sqlc.arg(target_mode),
+    runtime_handle_id = '',
+    runtime_launch_id = '',
+    agent_session_id = sqlc.arg(agent_session_id),
+    agent_session_id_launch_id = '',
+    provider_conversation_id = sqlc.arg(provider_conversation_id),
+    controller_generation = '',
+    activity_state = 'idle',
+    activity_last_at = sqlc.arg(activity_last_at),
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id) AND session_mode = sqlc.arg(source_mode) AND is_terminated = 0;
+
+-- name: GetSession :one
+SELECT id, project_id, num, issue_id, kind, harness,
+    activity_state, activity_last_at, is_terminated, branch, workspace_path,
+    runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
+    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    preview_revision, cleanup_generation, runtime_launch_id,
+    workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
+    reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
+    session_mode, provider_conversation_id, controller_generation, browser_capability_verifier,
+    artifact_dir, session_output_type,
+    latest_user_prompt, latest_user_prompt_at, latest_interaction_at, latest_assistant_update, latest_assistant_update_at,
+    conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
+    conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    requested_output,
+    provision_state, provision_error, provision_steps, branch_state, branch_naming, temporary_branch, is_task_preparation, automation_run_id, automation_launch_completed,
+    claude_activity_facts, codex_activity_facts,
+    hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
+    client_request_id, client_request_hash, client_request_committed,
+    runtime_released_launch_id
+FROM sessions WHERE id = ?;
+
+-- name: GetSessionByAutomationRunID :one
+SELECT id, project_id, num, issue_id, kind, harness,
+    activity_state, activity_last_at, is_terminated, branch, workspace_path,
+    runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
+    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    preview_revision, cleanup_generation, runtime_launch_id,
+    workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
+    reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
+    session_mode, provider_conversation_id, controller_generation, browser_capability_verifier,
+    artifact_dir, session_output_type,
+    latest_user_prompt, latest_user_prompt_at, latest_interaction_at, latest_assistant_update, latest_assistant_update_at,
+    conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
+    conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    requested_output,
+    provision_state, provision_error, provision_steps, branch_state, branch_naming, temporary_branch, is_task_preparation, automation_run_id, automation_launch_completed,
+    claude_activity_facts, codex_activity_facts,
+    hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
+    client_request_id, client_request_hash, client_request_committed,
+    runtime_released_launch_id
+FROM sessions WHERE automation_run_id = ?;
+
+-- name: ListSessionsByProject :many
+SELECT id, project_id, num, issue_id, kind, harness,
+    activity_state, activity_last_at, is_terminated, branch, workspace_path,
+    runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
+    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    preview_revision, cleanup_generation, runtime_launch_id,
+    workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
+    reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
+    session_mode, provider_conversation_id, controller_generation, browser_capability_verifier,
+    artifact_dir, session_output_type,
+    latest_user_prompt, latest_user_prompt_at, latest_interaction_at, latest_assistant_update, latest_assistant_update_at,
+    conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
+    conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    requested_output,
+    provision_state, provision_error, provision_steps, branch_state, branch_naming, temporary_branch, is_task_preparation, automation_run_id, automation_launch_completed,
+    claude_activity_facts, codex_activity_facts,
+    hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
+    client_request_id, client_request_hash, client_request_committed,
+    runtime_released_launch_id
+FROM sessions WHERE project_id IS ? ORDER BY num;
+
+-- name: ListAllSessions :many
+SELECT id, project_id, num, issue_id, kind, harness,
+    activity_state, activity_last_at, is_terminated, branch, workspace_path,
+    runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
+    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    preview_revision, cleanup_generation, runtime_launch_id,
+    workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
+    reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
+    session_mode, provider_conversation_id, controller_generation, browser_capability_verifier,
+    artifact_dir, session_output_type,
+    latest_user_prompt, latest_user_prompt_at, latest_interaction_at, latest_assistant_update, latest_assistant_update_at,
+    conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
+    conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, effort, session_permissions,
+    requested_output,
+    provision_state, provision_error, provision_steps, branch_state, branch_naming, temporary_branch, is_task_preparation, automation_run_id, automation_launch_completed,
+    claude_activity_facts, codex_activity_facts,
+    hibernated_at, stale_binary_since, stale_binary_version, stale_binary_launch, stale_binary_switch_failed_at,
+    client_request_id, client_request_hash, client_request_committed,
+    runtime_released_launch_id
+FROM sessions ORDER BY project_id, num;
+
+-- name: ListChatHibernationCandidates :many
+SELECT id FROM sessions
+WHERE session_mode = 'chat' AND is_terminated = 0 AND is_task_preparation = 0
+    AND kind <> 'orchestrator'
+    AND provision_state IN ('', 'ready') AND hibernated_at IS NULL
+    AND activity_state = 'idle' AND activity_last_at IS NOT NULL
+    AND trim(provider_conversation_id) <> ''
+ORDER BY id;
+
+-- name: ListReleasedArchivedSessions :many
+-- Archived sessions retention may delete: the worktree is released for the
+-- current generation, or there never was one. A row archived before
+-- terminated_at existed counts from its last update. Sessions in another
+-- session's conversation history are left out, as DeleteTerminatedSession
+-- refuses them, so retention does not retry them on every pass.
+SELECT s.id, s.terminated_at, s.updated_at FROM sessions s
+WHERE s.is_terminated = 1 AND s.is_task_preparation = 0
+    AND (s.workspace_path = '' OR EXISTS (
+        SELECT 1 FROM session_cleanup_facts f
+        WHERE f.session_id = s.id AND f.session_generation = s.cleanup_generation
+            AND f.workspace_disposition IN ('removed', 'not_applicable')
+    ))
+    AND s.id NOT IN (
+        SELECT t.handled_by_session_id FROM conversation_turns t
+        JOIN conversations c ON c.id = t.conversation_id
+        WHERE c.session_id IS NULL OR c.session_id <> t.handled_by_session_id
+    )
+    AND s.id NOT IN (
+        SELECT c.current_session_id FROM conversations c
+        WHERE c.current_session_id IS NOT NULL
+            AND (c.session_id IS NULL OR c.session_id <> c.current_session_id)
+    )
+ORDER BY s.id;
+
+-- name: ListTurnFailureCandidates :many
+-- Terminal sessions of one harness that are in a turn and have a native
+-- transcript to check. Only the columns the failed-turn observer reads.
+SELECT id, harness, activity_state, activity_last_at, latest_user_prompt_at, revision,
+    runtime_launch_id, native_transcript_path
+FROM sessions
+WHERE harness = sqlc.arg(harness) AND is_terminated = 0 AND session_mode = 'tui'
+    AND activity_state IN ('active', 'waiting_input', 'blocked')
+    AND native_transcript_path <> ''
+ORDER BY id;
+
+-- name: PromoteTaskPreparation :execrows
+-- Claim the hidden row without touching branch/workspace facts that may be
+-- published concurrently by speculative worktree creation.
+UPDATE sessions SET
+    issue_id = sqlc.arg(issue_id),
+    kind = sqlc.arg(kind),
+    harness = sqlc.arg(harness),
+    auto_review_enabled = sqlc.arg(auto_review_enabled),
+    display_name = sqlc.arg(display_name),
+    activity_state = sqlc.arg(activity_state),
+    activity_last_at = sqlc.arg(activity_last_at),
+    is_terminated = 0,
+    session_mode = sqlc.arg(session_mode),
+    model = sqlc.arg(model),
+    effort = sqlc.arg(effort),
+    session_permissions = sqlc.arg(session_permissions),
+    requested_output = sqlc.arg(requested_output),
+    created_at = sqlc.arg(created_at),
+    updated_at = sqlc.arg(updated_at),
+    auto_inject_review = sqlc.arg(auto_inject_review),
+    auto_inject_ci = sqlc.arg(auto_inject_ci),
+    provision_state = sqlc.arg(provision_state),
+    provision_error = '',
+    client_request_id = sqlc.arg(client_request_id),
+    client_request_hash = sqlc.arg(client_request_hash),
+    is_task_preparation = 0
+WHERE id = sqlc.arg(id) AND is_task_preparation = 1;
+
+-- name: RenameSession :execrows
+UPDATE sessions SET display_name = ?, updated_at = ? WHERE id = ?;
+
+-- name: RenameSessionIfDisplayName :execrows
+UPDATE sessions
+SET display_name = sqlc.arg(display_name), updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id)
+  AND display_name = sqlc.arg(current_display_name)
+  AND is_terminated = 0;
+
+-- name: SetSessionPreviewURL :execrows
+-- preview_revision is bumped on every call (even when preview_url is unchanged)
+-- so a repeated `ao preview <same-url>` still trips the sessions_cdc_update
+-- trigger and the desktop browser panel re-navigates / refreshes.
+UPDATE sessions SET preview_url = ?, preview_revision = preview_revision + 1, updated_at = ? WHERE id = ?;
+
+-- name: SetSessionTerminateOnPRMerge :execrows
+UPDATE sessions SET terminate_on_pr_merge = ?, updated_at = ? WHERE id = ?;
+
+-- name: SetSessionAutoInjectReview :execrows
+UPDATE sessions SET auto_inject_review = ?, updated_at = ? WHERE id = ?;
+
+-- name: SetSessionAutoInjectCI :execrows
+UPDATE sessions SET auto_inject_ci = ?, updated_at = ? WHERE id = ?;
+
+-- name: SetSessionPinned :execrows
+UPDATE sessions SET is_pinned = ?, pinned_at = ?, updated_at = ? WHERE id = ?;
+
+-- name: SetSessionReviewerConfig :execrows
+UPDATE sessions SET reviewer_harness = ?, reviewer_agent_config = ?, updated_at = ? WHERE id = ?;
+
+-- name: SetSessionAutoReview :execrows
+UPDATE sessions SET auto_review_enabled = ?, updated_at = ? WHERE id = ?;
+
+-- name: SetSessionProvisionedWorkspace :execrows
+-- Publish the worktree the moment it exists, rather than waiting for the
+-- controller commit at the end of an asynchronous start. Until this lands the
+-- row claims no workspace, so every workspace-scoped read answers
+-- SESSION_WORKSPACE_NOT_FOUND for the whole start, long enough for the
+-- desktop's bounded readiness poll to give up on a session that is fine.
+-- A failed start may still receive a late partial worktree from a claimed
+-- preparation. Retain that path for safe cleanup, but never overwrite a live
+-- workspace or publish onto a terminated session still provisioning.
+UPDATE sessions SET
+    branch = sqlc.arg(branch),
+    workspace_path = sqlc.arg(workspace_path),
+    workspace_repo_path = sqlc.arg(workspace_repo_path),
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id)
+  AND ((provision_state = 'provisioning' AND is_terminated = 0)
+    OR (provision_state = 'failed' AND (workspace_path = '' OR workspace_path = sqlc.arg(workspace_path))));
+
+-- name: SetSessionTaskBranch :execrows
+-- Background task naming renames only the branch; the checkout never moves.
+-- It applies only while the row still carries the temporary branch it renamed,
+-- keeps that branch once replaced so no later write restores it, and ends
+-- branch naming.
+UPDATE sessions SET
+    branch = sqlc.arg(branch),
+    temporary_branch = CASE WHEN sqlc.arg(branch) <> sqlc.arg(expected_branch)
+        THEN sqlc.arg(expected_branch) ELSE temporary_branch END,
+    branch_naming = FALSE,
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id) AND branch = sqlc.arg(expected_branch);
+
+-- name: SetSessionBranchNaming :exec
+-- Narrow: whether a task's generated branch name is still on the way.
+UPDATE sessions SET branch_naming = sqlc.arg(branch_naming)
+WHERE id = sqlc.arg(id) AND branch_naming <> sqlc.arg(branch_naming);
+
+-- name: ClearSessionBranchNaming :exec
+-- No branch naming survives a daemon restart.
+UPDATE sessions SET branch_naming = FALSE WHERE branch_naming;
+
+-- name: SetTaskPreparationBase :execrows
+-- Only the still-hidden reservation may receive its immutable branch base.
+-- The preparation worker can finish after promotion, so a full row update
+-- here would overwrite the visible session's harness and display fields.
+UPDATE sessions SET
+    diff_base_sha = sqlc.arg(diff_base_sha),
+    diff_base_ref = sqlc.arg(diff_base_ref)
+WHERE id = sqlc.arg(id)
+  AND is_task_preparation = 1
+  AND provision_state = 'provisioning'
+  AND is_terminated = 0;
+
+-- name: SetSessionProvisionState :execrows
+-- Publish start-up progress for an asynchronous Chat spawn. Deliberately narrow:
+-- it must not replay any other fact of a row the background start is racing with
+-- (the controller commit writes the same row from its own goroutine).
+UPDATE sessions SET
+    provision_state = sqlc.arg(provision_state),
+    provision_error = sqlc.arg(provision_error),
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id);
+
+-- name: SetSessionProvisionSteps :execrows
+-- Publish an asynchronous Chat start's checklist. As narrow as
+-- SetSessionProvisionState, for the same reason: the controller commit writes
+-- the rest of the row from its own goroutine.
+UPDATE sessions SET
+    provision_steps = sqlc.arg(provision_steps),
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id);
+
+-- name: SetSessionBranchState :execrows
+-- Narrow write for the branch-state reconcile: it names only branch_state, so a
+-- stale read can never replay other session columns. updated_at is left
+-- alone because an observed git fact is not user-visible recency.
+UPDATE sessions SET
+    branch_state = sqlc.arg(branch_state)
+WHERE id = sqlc.arg(id);
+
+-- name: SessionIsSeed :one
+-- SessionIsSeed reports whether the session id matches a row still in seed
+-- state (see DeleteSeedSession for the conditions). Callers probe with this
+-- before touching change_log so that DeleteSession is a true no-op for live
+-- sessions instead of silently destroying their CDC events. Returns 0 when
+-- the row does not exist OR has progressed past seed state.
+SELECT EXISTS(
+    SELECT 1 FROM sessions
+    WHERE id = ?
+      AND is_terminated = 0
+      AND workspace_path = ''
+      AND runtime_handle_id = ''
+      AND agent_session_id = ''
+      AND prompt = ''
+      AND latest_user_prompt = ''
+      AND latest_user_prompt_at IS NULL
+      AND latest_assistant_update = ''
+      AND native_transcript_path = ''
+) AS is_seed;
+
+-- NOTE: the `DELETE FROM sessions WHERE id = ? AND <seed-state predicates>`
+-- statement is intentionally NOT a sqlc query — same sqlc 1.31 SQLite-parser
+-- bug as documented in queries/changelog.sql: trailing string literals (and
+-- placeholders) on the RHS of `=` in a DELETE get silently stripped, so the
+-- generated SQL ends up mid-clause and the row count is meaningless. The
+-- store runs that DELETE directly via tx.ExecContext inside
+-- Store.DeleteSession, inside the same transaction as the SessionIsSeed
+-- probe and the raw change_log cleanup.

@@ -1,0 +1,582 @@
+package controllers_test
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	usagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/usage"
+)
+
+type fakeActivityRecorder struct {
+	gotID     domain.SessionID
+	gotSignal ports.ActivitySignal
+	calls     int
+	err       error
+}
+
+type fakeUsageHookRecorder struct {
+	gotID     domain.SessionID
+	gotSignal usagesvc.HookSignal
+	calls     int
+	err       error
+}
+
+type fakeNativeSessionResolver struct {
+	id    string
+	ok    bool
+	err   error
+	got   ports.NativeSessionResolveConfig
+	calls int
+}
+
+func (f *fakeNativeSessionResolver) ResolveNativeSessionID(_ context.Context, cfg ports.NativeSessionResolveConfig) (string, bool, error) {
+	f.calls++
+	f.got = cfg
+	return f.id, f.ok, f.err
+}
+
+func (f *fakeUsageHookRecorder) RecordHook(_ context.Context, id domain.SessionID, signal usagesvc.HookSignal) error {
+	f.calls++
+	f.gotID = id
+	f.gotSignal = signal
+	return f.err
+}
+
+func (f *fakeActivityRecorder) ApplyActivitySignal(_ context.Context, id domain.SessionID, s ports.ActivitySignal) error {
+	f.calls++
+	f.gotID = id
+	f.gotSignal = s
+	return f.err
+}
+
+func newActivityTestServer(t *testing.T, rec *fakeActivityRecorder) *httptest.Server {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	deps := httpd.APIDeps{}
+	if rec != nil {
+		deps.Activity = rec
+	}
+	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil, deps, httpd.ControlDeps{}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestSessionsAPI_ActivityForwardsUsageMetadataWithoutChangingActivity(t *testing.T) {
+	usage := &fakeUsageHookRecorder{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil, httpd.APIDeps{UsageHooks: usage}, httpd.ControlDeps{}))
+	t.Cleanup(srv.Close)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{
+		"event":"subagent-stop",
+		"agentSessionId":"native-1",
+		"usage":{
+			"harness":"claude-code",
+			"providerId":"zai",
+			"transcriptPath":"/tmp/main.jsonl",
+			"modelId":"claude-sonnet",
+			"subagentId":"sub-1",
+			"subagentTranscriptPath":"/tmp/sub.jsonl"
+		}
+	}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if usage.calls != 1 || usage.gotID != "ao-1" {
+		t.Fatalf("usage calls=%d id=%q", usage.calls, usage.gotID)
+	}
+	if usage.gotSignal.NativeSessionID != "native-1" ||
+		usage.gotSignal.Harness != domain.HarnessClaudeCode ||
+		usage.gotSignal.ProviderHint != "zai" ||
+		usage.gotSignal.SubagentTranscriptPath != "/tmp/sub.jsonl" {
+		t.Fatalf("usage signal = %+v", usage.gotSignal)
+	}
+}
+
+func TestSessionsAPI_ActivityContentionRemainsRetryableAndRecordsUsage(t *testing.T) {
+	activity := &fakeActivityRecorder{err: ports.ErrActivityProjectionContention}
+	usage := &fakeUsageHookRecorder{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, log, nil,
+		httpd.APIDeps{Activity: activity, UsageHooks: usage}, httpd.ControlDeps{}))
+	t.Cleanup(srv.Close)
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"idle","event":"stop","agentSessionId":"native-1","launchId":"launch-1","usage":{"harness":"claude-code","transcriptPath":"/tmp/main.jsonl"}}`)
+	if status != http.StatusServiceUnavailable || !strings.Contains(string(body), "ACTIVITY_PROJECTION_BUSY") {
+		t.Fatalf("contention should be explicitly retryable: %d %s", status, body)
+	}
+	if usage.calls != 1 || usage.gotSignal.TranscriptPath != "/tmp/main.jsonl" {
+		t.Fatalf("projection contention discarded independent usage signal: %+v", usage)
+	}
+}
+
+func TestSessionsAPI_CodewhaleLifecycleMapsRootEvents(t *testing.T) {
+	tests := []struct {
+		kind      string
+		wantState domain.ActivityState
+		wantEvent string
+		valid     bool
+	}{
+		{"session.started", "", "session-start", false},
+		{"turn.started", domain.ActivityActive, "user-prompt-submit", true},
+		{"turn.completed", domain.ActivityWaitingInput, "stop", true},
+		{"turn.failed", domain.ActivityWaitingInput, "stop", true},
+		{"turn.interrupted", domain.ActivityWaitingInput, "stop", true},
+		{"turn.stalled", domain.ActivityWaitingInput, "stop", true},
+		{"session.ended", domain.ActivityExited, "session-end", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.kind, func(t *testing.T) {
+			recorder := &fakeActivityRecorder{}
+			srv := newActivityTestServer(t, recorder)
+			body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity/codewhale?launchId=launch-7", `{
+				"at":"2026-09-24T10:00:00Z",
+				"event":{"schema_version":1,"seq":3,"event":"native-name","kind":"`+tc.kind+`","thread_id":"sess_native-1","turn_id":"turn-2","timestamp":"2026-09-24T10:00:01Z"}
+			}`)
+			if status != http.StatusOK {
+				t.Fatalf("status=%d body=%s", status, body)
+			}
+			got := recorder.gotSignal
+			if recorder.calls != 1 || got.State != tc.wantState || got.Valid != tc.valid || got.Event != tc.wantEvent || got.AgentSessionID != "" || got.LaunchID != "launch-7" || got.ProviderTurnID != "turn-2" {
+				t.Fatalf("signal = %+v, calls=%d", got, recorder.calls)
+			}
+			if !got.Timestamp.Equal(time.Date(2026, 9, 24, 10, 0, 1, 0, time.UTC)) {
+				t.Fatalf("timestamp = %v", got.Timestamp)
+			}
+		})
+	}
+}
+
+func TestSessionsAPI_CodewhaleLifecycleCapturesSavedConversationIDForRestore(t *testing.T) {
+	const savedSessionID = "0e9dfb74-4a65-4067-964f-152e432cccb6"
+	recorder := &fakeActivityRecorder{}
+	resolver := &fakeNativeSessionResolver{id: savedSessionID, ok: true}
+	dataDir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(
+		config.Config{DataDir: dataDir},
+		log,
+		nil,
+		httpd.APIDeps{Activity: recorder, NativeSessions: resolver},
+		httpd.ControlDeps{},
+	))
+	t.Cleanup(srv.Close)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity/codewhale?launchId=launch-7", `{
+		"event":{"schema_version":1,"kind":"turn.completed","thread_id":"sess_beec7292","turn_id":"3e380029-07a3-4585-b301-e9d86913bb53"}
+	}`)
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%s", status, body)
+	}
+	if resolver.calls != 1 || resolver.got.DataDir != dataDir || resolver.got.SessionID != "ao-1" || resolver.got.LaunchID != "launch-7" {
+		t.Fatalf("resolver calls=%d config=%+v", resolver.calls, resolver.got)
+	}
+	if recorder.gotSignal.AgentSessionID != savedSessionID {
+		t.Fatalf("AgentSessionID=%q, want saved UUID; hook thread id must not be persisted", recorder.gotSignal.AgentSessionID)
+	}
+}
+
+func TestSessionsAPI_CodewhaleLifecycleIgnoresSubagents(t *testing.T) {
+	recorder := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, recorder)
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity/codewhale?launchId=launch-7",
+		`{"event":{"schema_version":1,"kind":"subagent.spawned","thread_id":"sess_native-1"}}`)
+	if status != http.StatusOK || recorder.calls != 0 {
+		t.Fatalf("status=%d calls=%d body=%s", status, recorder.calls, body)
+	}
+}
+
+func TestSessionsAPI_CodewhaleLifecycleRequiresGenerationAndSchema(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		body string
+	}{
+		{"missing launch", "/api/v1/sessions/ao-1/activity/codewhale", `{"event":{"schema_version":1,"kind":"turn.started","thread_id":"sess_1"}}`},
+		{"wrong schema", "/api/v1/sessions/ao-1/activity/codewhale?launchId=launch-1", `{"event":{"schema_version":2,"kind":"turn.started","thread_id":"sess_1"}}`},
+		{"missing thread", "/api/v1/sessions/ao-1/activity/codewhale?launchId=launch-1", `{"event":{"schema_version":1,"kind":"turn.started"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := &fakeActivityRecorder{}
+			srv := newActivityTestServer(t, recorder)
+			_, status, _ := doRequest(t, srv, "POST", tc.url, tc.body)
+			if status != http.StatusBadRequest || recorder.calls != 0 {
+				t.Fatalf("status=%d calls=%d", status, recorder.calls)
+			}
+		})
+	}
+}
+
+func TestSessionsAPI_ActivitySanitizesAndBoundsUsageMetadata(t *testing.T) {
+	usage := &fakeUsageHookRecorder{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(
+		config.Config{},
+		log,
+		nil,
+		httpd.APIDeps{UsageHooks: usage},
+		httpd.ControlDeps{},
+	))
+	t.Cleanup(srv.Close)
+
+	overlongPath := "/tmp/" + strings.Repeat("x", 4096) + ".jsonl"
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{
+		"event":"subagent-stop",
+		"agentSessionId":"native-1",
+		"usage":{
+			"harness":"claude-\u001bcode",
+			"transcriptPath":"/tmp/\u001bmain.jsonl",
+			"modelId":"claude-\u001bsonnet",
+			"subagentId":"sub-\u001b1",
+			"subagentTranscriptPath":"`+overlongPath+`"
+		}
+	}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if usage.calls != 1 {
+		t.Fatalf("usage calls=%d, want 1", usage.calls)
+	}
+	if usage.gotSignal.Harness != domain.HarnessClaudeCode ||
+		usage.gotSignal.TranscriptPath != "/tmp/main.jsonl" ||
+		usage.gotSignal.ModelID != "claude-sonnet" ||
+		usage.gotSignal.SubagentID != "sub-1" ||
+		usage.gotSignal.SubagentTranscriptPath != "" {
+		t.Fatalf("sanitized usage signal = %+v", usage.gotSignal)
+	}
+}
+
+func TestSessionsAPI_UsageOnlyUnknownSessionReturnsNotFound(t *testing.T) {
+	usage := &fakeUsageHookRecorder{err: usagesvc.ErrUsageSessionNotFound}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(
+		config.Config{},
+		log,
+		nil,
+		httpd.APIDeps{UsageHooks: usage},
+		httpd.ControlDeps{},
+	))
+	t.Cleanup(srv.Close)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/missing/activity",
+		`{"event":"session-start","agentSessionId":"native-1"}`)
+	if status != http.StatusNotFound {
+		t.Fatalf("activity = %d, want 404; body=%s", status, body)
+	}
+}
+
+func TestSessionsAPI_ActivityForwardsMetadataOnlySessionStartToUsage(t *testing.T) {
+	usage := &fakeUsageHookRecorder{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(
+		config.Config{},
+		log,
+		nil,
+		httpd.APIDeps{UsageHooks: usage},
+		httpd.ControlDeps{},
+	))
+	t.Cleanup(srv.Close)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"event":"session-start","agentSessionId":"codex-native-1","launchId":"launch-7"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if usage.calls != 1 || usage.gotID != "ao-1" {
+		t.Fatalf("usage calls=%d id=%q", usage.calls, usage.gotID)
+	}
+	if usage.gotSignal.Event != "session-start" ||
+		usage.gotSignal.NativeSessionID != "codex-native-1" ||
+		usage.gotSignal.LaunchID != "launch-7" ||
+		usage.gotSignal.Harness != "" {
+		t.Fatalf("usage signal = %+v", usage.gotSignal)
+	}
+}
+
+func TestSessionsAPI_ActivityUsageFailureDoesNotRejectAgentSignal(t *testing.T) {
+	usage := &fakeUsageHookRecorder{err: errors.New("usage storage unavailable")}
+	activity := &fakeActivityRecorder{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(
+		config.Config{},
+		log,
+		nil,
+		httpd.APIDeps{Activity: activity, UsageHooks: usage},
+		httpd.ControlDeps{},
+	))
+	t.Cleanup(srv.Close)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"idle","event":"session-end","agentSessionId":"native-1"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if activity.calls != 1 || usage.calls != 1 {
+		t.Fatalf("activity calls=%d usage calls=%d, want 1/1", activity.calls, usage.calls)
+	}
+}
+
+func TestSessionsAPI_ActivityForwardsOrdinaryEventWithoutUsageMetadata(t *testing.T) {
+	activity := &fakeActivityRecorder{}
+	usage := &fakeUsageHookRecorder{}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(httpd.NewRouterWithControl(
+		config.Config{},
+		log,
+		nil,
+		httpd.APIDeps{Activity: activity, UsageHooks: usage},
+		httpd.ControlDeps{},
+	))
+	t.Cleanup(srv.Close)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"active","event":"post-tool-use","agentSessionId":"codex-native-1","launchId":"launch-1"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if activity.calls != 1 || usage.calls != 1 {
+		t.Fatalf("activity calls=%d usage calls=%d, want 1/1", activity.calls, usage.calls)
+	}
+	if usage.gotSignal.Event != "post-tool-use" ||
+		usage.gotSignal.LaunchID != "launch-1" ||
+		usage.gotSignal.NativeSessionID != "codex-native-1" ||
+		usage.gotSignal.Harness != "" {
+		t.Fatalf("usage signal = %+v", usage.gotSignal)
+	}
+}
+
+func TestSessionsAPI_ActivityAppliesSignal(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{"state":"waiting_input"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	var resp struct {
+		OK        bool   `json:"ok"`
+		SessionID string `json:"sessionId"`
+		State     string `json:"state"`
+	}
+	mustJSON(t, body, &resp)
+	if !resp.OK || resp.SessionID != "ao-1" || resp.State != "waiting_input" {
+		t.Fatalf("activity response = %#v", resp)
+	}
+	if rec.calls != 1 || rec.gotID != "ao-1" {
+		t.Fatalf("recorder calls=%d id=%q", rec.calls, rec.gotID)
+	}
+	if !rec.gotSignal.Valid || rec.gotSignal.State != domain.ActivityWaitingInput {
+		t.Fatalf("recorder signal = %#v", rec.gotSignal)
+	}
+}
+
+func TestSessionsAPI_ActivityAcceptsBlocked(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{"state":"blocked"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if !rec.gotSignal.Valid || rec.gotSignal.State != domain.ActivityBlocked {
+		t.Fatalf("recorder signal = %#v", rec.gotSignal)
+	}
+}
+
+func TestSessionsAPI_ActivityForwardsClaudeSubagentFacts(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"idle","event":"stop","agentSessionId":"native-1","launchId":"launch-1","runningSubagentIds":["child-1","child-2"]}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if rec.gotSignal.RunningSubagentIDs == nil || len(*rec.gotSignal.RunningSubagentIDs) != 2 {
+		t.Fatalf("running children = %+v", rec.gotSignal.RunningSubagentIDs)
+	}
+	body, status, _ = doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"event":"subagent-stop","subagentId":"child-1","launchId":"launch-1"}`)
+	if status != http.StatusOK || rec.gotSignal.SubagentID != "child-1" || rec.gotSignal.Valid {
+		t.Fatalf("child completion: status=%d body=%s signal=%+v", status, body, rec.gotSignal)
+	}
+}
+
+func TestSessionsAPI_ActivityThreadsCorrelationFields(t *testing.T) {
+	// The optional correlation fields ride into the signal (sanitized); a
+	// body without them (old CLIs) keeps producing a plain state-only signal,
+	// which the other tests in this file pin.
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"active","event":"post-tool-use","toolName":"Bash","toolUseId":"toolu_42","launchId":"launch-7"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	want := ports.ActivitySignal{Valid: true, State: domain.ActivityActive, Event: "post-tool-use", ToolName: "Bash", ToolUseID: "toolu_42", LaunchID: "launch-7"}
+	if rec.gotSignal != want {
+		t.Fatalf("recorder signal = %#v, want %#v", rec.gotSignal, want)
+	}
+}
+
+func TestSessionsAPI_ActivityThreadsConversationCheckpointOrigin(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"active","event":"user-prompt-submit","conversationCheckpointOrigin":"coordination","coordinationId":"report-batch:abc123","providerTurnId":"native-turn"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if rec.gotSignal.ConversationCheckpointOrigin != domain.ConversationCheckpointOriginCoordination {
+		t.Fatalf("checkpoint origin = %q, want coordination", rec.gotSignal.ConversationCheckpointOrigin)
+	}
+	if rec.gotSignal.ProviderTurnID != "native-turn" {
+		t.Fatalf("provider turn = %q", rec.gotSignal.ProviderTurnID)
+	}
+	if rec.gotSignal.CoordinationID != "report-batch:abc123" {
+		t.Fatalf("coordination id = %q", rec.gotSignal.CoordinationID)
+	}
+}
+
+func TestSessionsAPI_ActivityRejectsUnknownConversationCheckpointOrigin(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"active","event":"user-prompt-submit","conversationCheckpointOrigin":"provider"}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("activity = %d, want 400; body=%s", status, body)
+	}
+	if !strings.Contains(string(body), `"code":"INVALID_CONVERSATION_CHECKPOINT_ORIGIN"`) {
+		t.Fatalf("body = %s, want stable checkpoint-origin error code", body)
+	}
+}
+
+func TestSessionsAPI_ActivityAcceptsMetadataOnlyAgentSessionID(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"event":"session-start","agentSessionId":"native-session-1"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	want := ports.ActivitySignal{Event: "session-start", AgentSessionID: "native-session-1"}
+	if rec.gotSignal != want {
+		t.Fatalf("recorder signal = %#v, want %#v", rec.gotSignal, want)
+	}
+}
+
+func TestSessionsAPI_ActivityThreadsAgentSessionIDWithState(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"idle","event":"stop","agentSessionId":"native-session-1","observedAt":"2026-09-13T00:00:00Z"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	want := ports.ActivitySignal{Valid: true, State: domain.ActivityIdle, Event: "stop", AgentSessionID: "native-session-1", Timestamp: time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)}
+	if rec.gotSignal != want {
+		t.Fatalf("recorder signal = %#v, want %#v", rec.gotSignal, want)
+	}
+}
+
+func TestSessionsAPI_ActivityCapsOverlongCorrelationFields(t *testing.T) {
+	// Overlong values are dropped, not truncated: a truncated id could never
+	// match its pre/post counterpart, so an empty value (fail-safe: no
+	// correlated clear) is strictly better.
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	long := make([]byte, 300)
+	for i := range long {
+		long[i] = 'a'
+	}
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"state":"active","event":"post-tool-use","toolUseId":"`+string(long)+`"}`)
+	if status != http.StatusOK {
+		t.Fatalf("activity = %d, want 200; body=%s", status, body)
+	}
+	if rec.gotSignal.ToolUseID != "" {
+		t.Fatalf("overlong toolUseId not dropped: %q", rec.gotSignal.ToolUseID)
+	}
+	if rec.gotSignal.Event != "post-tool-use" {
+		t.Fatalf("in-bounds event dropped: %#v", rec.gotSignal)
+	}
+}
+
+func TestSessionsAPI_ActivityRejectsUnknownState(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{"state":"napping"}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_ACTIVITY_STATE")
+	if rec.calls != 0 {
+		t.Fatalf("recorder should not be called for an invalid state; calls=%d", rec.calls)
+	}
+}
+
+func TestSessionsAPI_ActivityRejectsEmptyMetadataOnlyRequest(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{"event":"session-start"}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "ACTIVITY_OR_SESSION_ID_REQUIRED")
+	if rec.calls != 0 {
+		t.Fatalf("recorder should not be called for an empty metadata request; calls=%d", rec.calls)
+	}
+}
+
+func TestSessionsAPI_ActivityRejectsOverlongMetadataOnlySessionID(t *testing.T) {
+	rec := &fakeActivityRecorder{}
+	srv := newActivityTestServer(t, rec)
+	longID := strings.Repeat("a", 300)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity",
+		`{"event":"session-start","agentSessionId":"`+longID+`"}`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "ACTIVITY_OR_SESSION_ID_REQUIRED")
+	if rec.calls != 0 {
+		t.Fatalf("recorder should not be called for an overlong session id; calls=%d", rec.calls)
+	}
+}
+
+func TestSessionsAPI_ActivityRejectsBadJSON(t *testing.T) {
+	srv := newActivityTestServer(t, &fakeActivityRecorder{})
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{`)
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_JSON")
+}
+
+func TestSessionsAPI_ActivityMissingSessionIs404(t *testing.T) {
+	srv := newActivityTestServer(t, &fakeActivityRecorder{err: ports.ErrSessionNotFound})
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/missing/activity", `{"state":"idle"}`)
+	assertErrorCode(t, body, status, http.StatusNotFound, "SESSION_NOT_FOUND")
+}
+
+func TestSessionsAPI_ActivityRecorderErrorIs500(t *testing.T) {
+	srv := newActivityTestServer(t, &fakeActivityRecorder{err: errors.New("boom")})
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{"state":"exited"}`)
+	assertErrorCode(t, body, status, http.StatusInternalServerError, "INTERNAL_ERROR")
+}
+
+func TestSessionsAPI_ActivityWithoutRecorderIs501(t *testing.T) {
+	srv := newActivityTestServer(t, nil)
+
+	body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions/ao-1/activity", `{"state":"idle"}`)
+	assertErrorCode(t, body, status, http.StatusNotImplemented, "NOT_IMPLEMENTED")
+}

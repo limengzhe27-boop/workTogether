@@ -1,212 +1,36 @@
 # WorkTogether
 
-> **原生客户端新版正在独立验证**：以 Agent Orchestrator 为底座的项目群聊、同伴工具和自主认领实现见 [新版启动与边界](docs/ao-local-app.md)。原生版已验证 Codex + DeepSeek 收发、双向同伴消息和只读任务交叉验收（[证据](docs/experiments/native-room-flow-verification.json)），不代表任意编码任务无人值守交付。以下正文仍描述原 Python/Web 应用；两者未合并，旧数据库保持原样。
+WorkTogether 是面向本地项目的多 Agent 桌面工作台。每位成员保有独立的客户端会话，同一项目中的成员可以并行接收消息、相互交接、认领任务和交叉验收。
 
-本地多 Agent 任务对话与协同研发原型，包含调度核心、命令行及 React 网页工作台。
+## 快速使用
 
-接手开发请先看 [未完成项](docs/next-steps.md)。当前 [HTTP 契约](docs/contracts/v1.md)
-与 [群聊契约](docs/contracts/chat-v1.md) 已按实现对齐，并用路由覆盖测试防止遗漏；
-这不代表所有真实模型权限或无人值守场景已经验收。
+1. 打开本地 Git 项目，进入项目群聊。
+2. 从输入框旁的「＋」添加 Agent。一个项目可以有多个同类会话。
+3. 发送新消息，按成员查看回复、执行记录和审批。需要看完整上下文时可打开原生会话。
+4. 在团队任务里查看负责人、产物和验收结论。候选分支的测试结果与任务验收分别记录。
 
-当前支持有限轮规划讨论、方案审批、自动开发与验收调度（每轮最多 6 次调用、最多两次修复）、任务内消息和保守的异常恢复。隔离临时项目已完成一次真实 Codex 编写文件 → Antigravity 只读文件验收的端到端试运行；第一次验收因终端权限被拒绝，改用只读文件工具后才通过。需要运行测试命令的真实项目仍可能受权限限制，尚不能声称全面无人值守。方案审批不会自动授予 Agent 的工具权限。
+使用各客户端自己的安装、登录与额度。具体工具和权限由当前客户端、模型和会话设置决定。任意编码任务的无人值守交付仍需要按项目验证。
 
-新团队任务还可在“详情”选择“授权团队连续执行”：一次明确授权后自动完成讨论、认领、定稿与执行/验收，总预算为成员数 × 2 + 15 次调用；不再要求定稿后逐步点击。普通讨论模式仍需审阅批准。自动作业只适用于当前需求与团队，暂停、新消息、失败或预算耗尽会停止。该入口已通过真实浏览器操作的模拟 Agent 闭环验收，不代表真实模型权限已验证。
+## 从源码运行
 
-新建任务页也可勾选“创建后授权团队讨论、分工并执行”，选择成员后一次提交启动流程；默认只创建、不调用模型。需求修订后可重新组队和授权，旧消息不会自动带入新需求。调用预算统计平台启动 Agent 的次数，不是对 Agent 内部模型请求或 Token 数量的硬上限。
+需要 Go（版本见 [go.mod](backend/go.mod)）、Node.js 24 和可用的 Git。macOS 打包还需要原生构建工具。依赖安装与开发环境详见 [开发指南](docs/development.md)。
 
-模型调用需要安装并登录相应 CLI；可通过 `--codex-executable` 和 `--antigravity-executable` 显式指定路径。启动时会自动探测，找不到才报缺失：
-
-- **Codex**：PATH 里没有 `codex` 时，会尝试 macOS 上 ChatGPT 桌面应用自带的 Codex CLI（`/Applications/ChatGPT.app/Contents/Resources/codex-cli/…`）。有 ChatGPT 订阅并登录过，就能直接用，不必额外安装。显式传入的路径始终优先。
-- **Antigravity**：找不到 PATH 中的 `agy` 时，会使用本项目私有目录中的 Antigravity 1.2.8 可执行文件。
-
-自动探测不是安装或登录。工作台会显示启动时探测到的实际路径，找不到的 CLI 会在 Agent 卡片和对话成员上明确标注。当前流程以 [自动执行说明](docs/execution-v1.md) 为准。本地凭据、运行数据库和原始实验记录不随仓库发布。
-
-### 多 Agent 对话（当前边界）
-
-已加入本机 **DeepSeek Harness 0.2.0-rc.2** 后台适配器。在 Agent 管理页主动启用，再加入任务团队；它不同于 DeepSeek API 模板。已有隔离样例的真实读取与创建文件记录，见 [群聊验收记录](qa/group-room/acceptance.md)；这不代表任意项目、测试命令或三种真实模型的完整交叉验收均可用。[Harness 接入说明](docs/harness-adapter.md) 保留早期接入过程。
-
-新任务可先在右上角“团队”中选择成员并保存，随后点击“讨论方案”：成员并行提供首轮意见 → 协调者拆任务 → 成员并行申报可承担的步骤 → 独立方案复核 → 定稿。每位成员最多两次发言，再加三次规划调用；这不是无限群聊。协调者不再固定为 Codex，执行者与验收者也按适配器实际支持的能力选择。未指定负责人时优先匹配有效认领，其次平衡当前计划负载；最终分工及理由会显示在方案中，仍须用户批准后执行。
-
-并行不只用于只读讨论：群聊的讨论与分析阶段完全并行，写操作在项目内串行排队（见上）。代码修改与验收的项目级互斥、以及“方案批准后才自动执行”的开发通道保持不变；尚无隔离工作树，API Agent 不能改代码或执行测试，仅可在用户逐条授权后读取指定文件（见下）。CLI 配置“就绪”并不证明登录和权限可用——界面会依据启动时的探测结果明确标出本机找不到的 CLI。以上流程已通过模拟 CLI 的并行、互发消息、预算与写入串行回归，尚不是三种真实模型的端到端验收。协议见 [动态团队说明](docs/team-workflow.md)。
-
-每位 Agent 可在任务对话里提出最多三条结构化分工建议，也可以直接给同伴发消息（提问/派活/认领/汇报）。建议会进入后续规划上下文；跨 Agent 的消息会真实投递并触发下一轮，但仍受房间成员、能力、依赖与轮次预算校验，不能绕过你的方案批准去做计划内开发。
-
-### 项目群聊：多位 Agent 同时在场
-
-进入一个任务就是一个**群聊房间**。你可以只叫一位，也可以把 Codex、Antigravity、Harness 等一起拉进来：选中成员后发出的一句话会在**同一轮内并行广播**给所有人，每人一个独立会话进程，各自同时作答，且**第 1 轮互相看不到对方的回复**——这是真正的同时，不是排队。
-
-- **第 2 轮才互相回应**：勾选“轮次 2”后，第 1 轮全部完成后自动开第 2 轮，这时每位成员都拿到第 1 轮所有人的完整发言，可以同意、反对、追问或接手。
-- **Agent 之间可以直接说话**：Agent 的回复里可以带 `data.messages`，`intent` 为 `ask`（提问）/`assign`（派活）/`claim`（认领）/`report`（汇报）。平台校验目标在本房间内、能力与预算之后，生成一条真实的群消息（形如 `Codex → Antigravity · 提问`）并触发下一轮。你不需要替它们传话。
-- **有界，不会自己刷屏**：Agent 发起的往返默认最多 **2 轮**（会话配置可改）。超出后新的跨 Agent 消息进入“等待你确认”，界面显示“有 N 条…停在自动轮次上限”，点“让他们继续”才送达。随时可暂停。
-- **默认可以在项目里干活**：新建会话默认开启“可在项目里工作”，Agent 可直接读写你选中的项目。**同一时刻一个项目只有一个写入者**，并且只有**真正能写的适配器**才会拿到写权限：
-  - Codex（含克隆）——写入回合用 `workspace-write` 沙箱；
-  - DeepSeek Harness——写入回合把 `sandbox-policy` 设为 `workspace-write` 并限定 workspaceRoot，会话作用域与只读回合分开，避免续用一个只读会话去写；
-  - Antigravity——写入回合切换到 `--mode accept-edits`（无人在场，故需预授权工具请求），只读回合仍是 `--sandbox --mode plan`；
-  - OpenAI 兼容 Agent 没有文件系统权限，永远不会被授予写入回合。
-  多人讨论里优先由有编码能力的成员持有写入；**当某一轮只点名了一个可写成员（例如一条 `assign` 交接）时，由该成员持有**，因此非编码成员的 Agent 也能被派活并真的动手。其余成员并行只读。可在输入框下方随时关掉，回到纯只读讨论。
-- **看得到谁改了什么**：每一次会改动文件的回合（CODE/FIX，以及拿到写入的对话回合）都会在运行前后拍一次工作区快照，回复里直接标出「改了 N 个文件」并列出新增/修改/删除的路径；没有改动就不显示。即使某一轮没有写入授权却仍然改了文件，也会被记录并写入审计事件，而不是悄悄放过。快照只统计项目文件的大小、修改时间与开头若干 KB，不是内容仓库。
-- **状态可见**：每一轮都显示谁正在回复、谁在等待、谁持有项目写入。
-- 消息、会话、团队按任务隔离；不同任务之间不共享上下文。选用第三方云端 Agent 时，本任务需求、消息与必要上下文会发往其配置的接口，请勿放入不宜共享的敏感信息。
-
-**边界**：写入串行依赖平台内的调度，不是文件系统锁——你在编辑器里手动改同一个文件仍可能冲突；尚无隔离工作树与固定被测提交。API Agent 不能自主浏览全库、写文件或运行测试。
-
-**API 指定文件读取（默认关闭，模拟闭环已验证）**：选择 API 成员和项目文件后，勾选“允许 API 按需读取所选文件”，只授权本条消息。`list_files` 仅列清单，`read_file` 每次最多读 12000 字节；每位 API Agent 每次回复最多 4 次工具调用、5 次模型请求。它会把文件内容发给你配置的 API 服务，可能增加用量；请勿选择含秘密的文件。换文件/成员需重新勾选，派活不继承授权，暂停阻止后续读取和请求。不支持工具的接口会明确失败、不自动降级重试。现已用本机假 HTTP 服务跑通列文件→读取→回复，真实模型兼容性仍未验证；未启用任何云端 Agent。详见 [读取边界与证据](docs/contracts/chat-v1.md#api-限定读取工具第一阶段)。
-
-API 群聊同样在发送前复查房间范围和任务状态，清除唯一密钥导致成员不再就绪也会拦截尚未准入的请求。失败留有恢复入口、不自动重试；已经登记为运行中的 HTTP 请求不能撤回，暂停只阻止后续调用。该边界由模拟接口测试覆盖，不代表真实模型或本地工具能力已经验收。
-
-除内置 CLI 外，自定义 Agent 支持 **OpenAI 兼容的 `/chat/completions` 接口**，可规划、复核方案、对话和接受已批准计划中的只读分析工作（`work_kind: "analysis"`），也可**克隆本机 CLI**（`base_agent` 为 codex/antigravity/deepseek-harness）以获得对应的编码或验收能力。规划阶段收到讨论摘要与可用能力清单；分析产物必须经另一位具有验收能力的 Agent 验证才解锁依赖步骤。API Agent 默认只分析传入材料，仅用户群聊可额外授权上述只读工具；不能修改代码或运行测试，配置显示“就绪”也不代表接口已实际连通。任意 CLI 尚无统一调用协议，不能仅填写名字就接入。预置 DeepSeek API 模板**不是 DeepSeek Harness 本地接入**。密钥优先读取服务环境变量（例如 `DEEPSEEK_API_KEY`），其次读取状态库同目录的 `secrets.json`（可选，权限 600）；两者都不写入注册数据库。本机回环地址可无密钥。未就绪 Agent 不参与广播。启动命令里的 `--db` 放在子命令前后都生效。历史数据库若曾直接存过 API Key，建议轮换密钥；`secrets.json` 以明文保存，请勿提交到版本库。
-
-分工格式例子：`{"id":"research","title":"梳理接口边界","work_kind":"analysis","assignee":"deepseek-hermes","acceptance":["列出可核查的接口约束"],"depends_on":[]}`。后续编码步骤用 `"work_kind":"code"`、`"assignee":"codex"`，并在 `depends_on` 引用 `research`。Agent 可以提出分工，但平台会校验能力、依赖和就绪状态；你批准最终计划后才会运行工作项。一次自动执行仍有调用次数上限，且不会替你批准模型工具权限。
-
-设计来源、完整流转与尚未支持的边界见 [多 Agent 分工说明](docs/multi-agent-delegation.md)。
-
-Agent 管理页可由你主动点击“测试连接”：平台仅发送一条不含任务或代码的短请求，并检查是否返回可用的聊天响应；可能产生少量模型用量，不会在注册时自动触发。连接测试通过不等于分析能力、任务协议或实际开发流程已经验收。
-
-后台普通消息可跨任务并行处理（最多四个任务），单任务仍按序发言且同一会话不会同时启动两次。停用的 Agent 不再由旧规划流程继续派发；有在途或未完成职责时禁止停用。研发团队会在讨论前检查是否存在可执行工作与独立验收的组合，避免纯聊天接口团队花完讨论额度后才发现无法验收。
-
-同项目的旧聊天失败不会占用其他任务的 Agent 会话；旧失败不会自动重试。同任务的未知运行仍需先处理，代码修改与验收的项目级互斥也保持不变。消息处于排队状态时，页面会显示暂停、未解决的运行、前序消息或成员未就绪等具体原因。
-
-如果看到两个 DeepSeek 条目：`DeepSeek API（云端接口）` 是使用 API 的讨论/分析配置，`DeepSeek Harness（本机 CLI）` 才是本机应用接入。本机 CLI 不等于离线模型。早期 API 模板曾误叫 `DeepSeek Hermes`，启动时仅纠正已知默认名称，保留旧 ID `deepseek-hermes` 以兼容历史消息；不改密钥、接口和启用状态，也不覆盖用户自定义名称。
-
-通过注册表移除 API Agent 后，默认条目不会在重启时重新出现；仍可主动重新注册。显式选择取消待发消息时，只取消尚未启动、只发给该 Agent 的消息，保留历史和审计记录；运行中、多人消息或未完成工作会阻止移除，且整次操作回滚。被移除 Agent 的本机密钥会一并从 `secrets.json` 删除。
-
-对话中某个 Agent 回复中断时，消息会显示失败原因和两个显式入口：“重试该 Agent”重新入队当前发言，“跳过并继续下一位”记录一条跳过说明后推进到下一位成员。两者都不会自动重放，也不会因为超时或权限拒绝而自行继续。
-
-任务与项目可在“详情”与侧栏中重命名或删除；删除项目会级联清理其任务、消息与事件记录，存在未结束的模型进程时会拒绝删除。这些操作保留审计边界，不做静默级联以外的推测。
-
-自定义 API Agent 的讨论与只读分析分工已通过本机假服务的真实 HTTP 闭环测试：三位 Agent 在同一任务中依次回复，API Agent 接收前序摘要；批准计划后它完成分析，Antigravity 验收，依赖步骤再交给 Codex。测试使用模拟 CLI 和假 HTTP 响应，**尚未**用真实 DeepSeek/Ollama 服务完成端到端试运行。Antigravity 对需要命令行工具权限的验收仍可能被阻断。并行修改代码、Claude Code/ZCode 编码适配器及隔离 worktree 尚未实现。
-
-## 快速启动 Web 工作台
-
-Python 3.9+，运行 Web 工作台与调度核心无需安装第三方依赖（开箱即用）：
-
-```bash
-# 启动本地 Web 服务器（默认端口 8765，绑定 127.0.0.1）
-python3 -m worktogether web --port 8765 --db .collab/state.sqlite3
+```sh
+npm ci --prefix frontend
+npm ci --prefix packages/product-ui
+npm --prefix frontend run dev
 ```
 
-启动后在浏览器打开：**http://127.0.0.1:8765/**
+本机构建桌面应用可运行 `npm --prefix frontend run build`，产物在 `frontend/out/`。本地 macOS 安装使用 `WorkTogether Local.app`。
 
-### Web 工作台特性
-
-- 参照 Codex 工作界面的深色布局：顶部工作栏、窄工具栏、项目任务树、宽对话区；蓝色用户气泡和底部大圆角输入框。保留 WorkTogether 品牌和原协作功能，不复制无功能的语音、上传或系统窗控。
-- 项目侧栏可收起，任务支持当前项目内搜索；窄屏使用项目抽屉，并保留 Agent 设置入口。右上角“任务详情”切换视图时保留消息草稿，⌘/Ctrl + Enter 可发送。
-- Agent 回复支持 Markdown 标题、列表、链接、代码块和复制；不执行原始 HTML、不自动加载回复中的远程图片。输入框明确显示本次房间：选择的成员也是这条消息后续讨论/派活的范围，不能偷偷邀请未选成员；更换选择只影响新消息。
-- **项目上下文**：每次对话派发都会自动附带该项目的名称、路径、README 摘要（默认前 3000 字）和文件列表（默认前 120 个），因此只做对话的 Agent 也能回答“这个项目是做什么的”，而不是猜测。首页与任务详情都有“项目上下文”入口。
-- **项目记忆**：可在“项目上下文”里写入本项目长期约定（技术栈、命令、禁区），它会随每次对话发送；内容保存在本机数据库，不写入你的代码仓库。
-- **引用文件与写入授权**：可引用最多 10 个文件（单文件 12000 字节、总计 48000 字节）。新会话与缺少授权配置的旧会话默认只读；已有保存的开关值保留。手动开启后，新消息才能申请写入，每轮最多一位写者，仍受 CLI 沙箱约束。单条只读要求会沿委派链传递，不能由 Agent 扩权。
-- **撤销写入**：关闭开关会使旧消息的写授权失效，重新打开、重试或“让他们继续”都不会恢复；需开启后发送新消息。已登记但未启动的写进程会被阻止并保留恢复入口。已启动的进程不会强杀，关闭开关不代表已经终止它。
-- **变更查看与还原**：项目上下文里显示 Git 工作区未提交的改动清单与统一 diff，可逐文件还原（已跟踪文件恢复到 HEAD，未跟踪文件会被删除，需二次确认）。这不是版本隔离。
-- **Agent 档案**：可编辑内置与自定义 Agent 的名称、描述、系统提示；自定义 Agent 支持克隆本机 CLI（继承相应编码/验收能力）或接 OpenAI 兼容接口，并可选择把 API Key 存到本机 `secrets.json`（权限 600，环境变量优先，不写入注册数据库）。
-- **密钥权限提醒**：Agent 设置页检查密钥文件权限位、所有者与文件类型；权限不是 0600 或检查失败会提示，打开设置时每 5 秒复查。不展示密钥、不自动改权限；仍是明文存储，不检查 ACL，也不是系统钥匙串。
-- 顶部按阶段提供“讨论方案”→“审阅方案”→“开始执行”。这是正式计划通道；群聊则可在已有会话写入授权下派活和改文件，但聊天文字不代替正式计划的批准摘要。自动消息预算不是 Token 或费用硬上限，详见群聊契约。
-- “详情”集中放置手动交接、修改需求、暂停、连续执行授权、重试恢复、历史报告与日志；“Agent 设置”管理接入，高级 API 注册默认收起。当前阻塞仍有醒目处理入口。设计见 [DESIGN.md](DESIGN.md)。
-- 多项目和任务列表、任务内有限轮对话、规划、方案批准、后台自动执行以及状态轮询。
-- 手动模式可在页面派发下一项、复制 JSON 交接包、粘贴报告并由后端校验身份、版本和字段格式；验收权限受阻后可检查失败记录、显式重试，再改用手动交接。平台不能证明手填报告的证据真实存在，提交者必须自行核对。
-- 页面展示任务步骤、报告和事件；执行详情按提供方汇总真实返回的 Token 字段（不推算费用或节省比例），并展示运行记录。点击某次运行可按需查看指令、结果和日志；仅允许五种已知文件，较大文件只展示开头或末尾 512 KB，不自动加载完整日志。产物可能包含任务内容和本机路径。项目 Doctor 可通过命令行或项目详情 API 查看。
-- 暂停仅阻止后续派发，不会结束正在运行的模型；过期、未知运行和权限拒绝不会自动重放。
-- 在没有固定版本工作区之前，同一项目的代码修改与验收互斥；另一个任务占用项目时，界面会说明为什么暂不能派发。不同项目仍可独立推进。
-- 在 Git 项目的自动 CODE/FIX → VERIFY 流程中，平台会记录交付时 Git 可见文件的内容摘要，并在验收前、验收后及报告入库前检查是否变化；变化则阻止接受验收。这是漂移检测，**不是不可变版本隔离**：手动交接、非 Git 项目、Git 忽略文件、符号链接的外部目标及检查之间的竞态不在保护范围内。
-- 服务只绑定本地回环地址，运行产物接口限制文件名；自定义 API Agent 是否真的可连接、是否具有有效凭据，须在实际调用中确认。
-
----
-
-## 命令行与自动化
-
-核心与自测同样无需安装外部依赖：
-
-```bash
-# 查看帮助
-python3 -m worktogether --help
-
-# 运行模拟演示（明确标记 SIMULATED，不消耗模型 Token）
-python3 -m worktogether --db /tmp/worktogether-demo.sqlite3 demo
-
-# 运行全量测试套件（涵盖核心、运行时、验收及 HTTP Server）
-python3 -m unittest discover -s tests -v
+```sh
+go -C backend test ./internal/service/chat ./internal/service/session ./internal/storage/sqlite ./internal/httpd/...
+npm --prefix frontend run typecheck
+npm --prefix frontend test -- PeerRoom PeerTimeline PeerExecution PeerSettings PeerMemberPicker PeerTasks Sidebar CreateProjectFlow
 ```
 
-## 命令行操作
+旧 Python/Web 版保留在 [legacy-python-web](https://github.com/limengzhe27-boop/workTogether/tree/legacy-python-web)，当前桌面版在 `main`。
 
-```bash
-python3 -m worktogether project-add --name 我的项目 --path /absolute/project/path
-python3 -m worktogether task-add --project PROJECT_ID --title 优化进度 --requirement '刷新后恢复任务状态'
-python3 -m worktogether dispatch --task TASK_ID
-python3 -m worktogether handoff --task TASK_ID --dispatch DISPATCH_ID
-python3 -m worktogether template --task TASK_ID --dispatch DISPATCH_ID
-python3 -m worktogether submit --task TASK_ID --file /absolute/result.json
-python3 -m worktogether show --task TASK_ID
-```
+## 上游
 
-显式执行 Codex 派发：
-
-```bash
-python3 -m worktogether run --task TASK_ID --dispatch DISPATCH_ID --timeout 300
-python3 -m worktogether runs --task TASK_ID
-```
-
-任务控制命令：
-
-```bash
-python3 -m worktogether pause --task TASK_ID
-python3 -m worktogether resume --task TASK_ID
-python3 -m worktogether expire --task TASK_ID
-python3 -m worktogether retry --task TASK_ID --dispatch DISPATCH_ID
-python3 -m worktogether doctor --project PROJECT_ID
-```
-
-## 前端开发（可选）
-
-工作台内置预构建静态包（位于 `worktogether/static/`，使用时无需安装 Node 依赖）。若需基于 TypeScript / React 源码调试前端：
-
-```bash
-cd web
-npm install
-npm run dev
-```
-
-前端渲染与安全回归运行 `npm test`；发布前运行 `npm run build`，并一起提交更新的 `worktogether/static/`。本次 Codex 截图对齐的验证范围见 [界面验收记录](qa/ui-simplification/codex-reference.md)。
-
-## 离线隔离执行（实验性；尚未接入 Agent）
-
-已增加仅供显式调用的 macOS Python 执行器：把你选中的文件复制到临时目录，脚本只能修改副本；禁用网络和子进程，不回写项目。每次运行前用假文件验证越界读写、链接绕出、网络和子进程确实被拒；失败即 `BLOCKED`，**不会退回无沙箱执行**。不创建/迁移状态库，也不启动 Agent。
-
-```bash
-# 仅做离线隔离自检，不消耗模型额度
-python3 -m worktogether isolation-check
-
-# 显式选择一个 Python 测试入口及它需要的本地文件；不会自动复制整个项目
-python3 -m worktogether isolated-python --project-path /absolute/project \
-  --file test_example.py --file example.py --entry test_example.py --timeout 10
-```
-
-仅支持标准库和选中的 UTF-8 文件（最多 10 个、每个 ≤1 MiB），默认 10 秒、最多 30 秒，输出合计上限 64 KiB。系统库与专用 Python 运行时仍可读；不会传入宿主环境变量或额外文件句柄。该后端使用已弃用的 `sandbox-exec`，**不是 VM，也没有内存/总磁盘硬配额**，不适合恶意或重负载代码。自检不是完整安全证明；其它系统默认拒绝执行。
-
-本机已用实际 OS 沙箱和临时脚本验证运行、拒绝访问、资源限制及原文件不变；没有调用真实模型。API 写入/测试工具、工作区合并、完整依赖与多 Agent 隔离开发仍未接通。完整约束见 [隔离执行说明](docs/execution-v1.md#离线隔离执行第一阶段2026-10-12)。
-
-## 自动回归检查
-
-[GitHub Actions 工作流](.github/workflows/ci.yml) 已配置为在 push、pull request 或手动触发时检查：
-
-- Ubuntu 上的 Python 3.9 / 3.13 完整后端测试；用临时数据、模拟 CLI 和本机假 HTTP 服务，不调用真实模型。
-- Node 24 下按锁文件安装依赖、运行前端测试和生产构建；禁用依赖安装脚本。
-- 独立 macOS 作业强制运行原生隔离测试；Linux 后端作业跳过这组原生检查，不将模拟测试冒充 OS 沙箱验证。
-- 重建后的静态包与 Git 索引一致，包含新增、删除、修改、忽略文件及符号链接检查，防止漏提交新生成的资源。
-
-本地构建后，检查并暂存准备提交的静态包，再在仓库根目录运行 `python3 scripts/check_static.py`。该脚本只检查、不构建、不修改文件；必须先构建，不能单靠它判断源码是否同步。CI 的干净检出会以该次提交为基准检查。
-
-工作流仅申请只读仓库权限，不保留 Git 凭据、不配置模型密钥；官方 Actions 固定到提交版本，每个任务限时 10 分钟。CI 设置 `WT_REQUIRE_LOOPBACK_TESTS=1`，假 HTTP 测试无法绑定本机端口时直接失败；macOS 作业设置 `WT_REQUIRE_ISOLATION_TESTS=1`，不能跳过原生隔离检查。探测 macOS 本机 Harness 安装的测试在 Linux 可跳过。
-
-最新本地验证为后端 388 项（原生隔离/假 HTTP 均强制执行）、前端 18 项及构建通过（macOS / Python 3.9 / Node 26）。此前 CI 批次还验证了干净依赖安装后的构建一致性。**远端工作流尚未运行验证**，需推送后且仓库启用 Actions；未配置分支保护或自动发布，也未证明 CI 的 Linux/macOS / Python 3.13 / Node 24 组合的实际运行结果。
-
-## 开发交接与文档
-
-- 架构设计与 UI 决策：[DESIGN.md](DESIGN.md)
-- 接口契约：[docs/contracts/v1.md](docs/contracts/v1.md)
-- 运行时契约：[docs/contracts/runtime-v1.md](docs/contracts/runtime-v1.md)
-- Web 工作台交付报告：[docs/handoff-web-v1.md](docs/handoff-web-v1.md)
-- 项目上下文与工作台增强验收：[qa/project-context/acceptance.md](qa/project-context/acceptance.md)
-- 项目群聊验收：[qa/group-room/acceptance.md](qa/group-room/acceptance.md)
-- 界面验收记录：[qa/ui-simplification/codex-reference.md](qa/ui-simplification/codex-reference.md)
-- 演进路线：[docs/roadmap.md](docs/roadmap.md)
-- 未完成项与下一步清单（交接用）：[docs/next-steps.md](docs/next-steps.md)
+桌面版从 Agent Orchestrator 原生架构派生，初始基线为 `033d597032e448a0ea16c298350e36b099f74106`。保留上游的许可证和署名。详见 [架构说明](docs/architecture.md)、[上游仓库](https://github.com/OrchestratorInc/agent-orchestrator) 和 [许可证](LICENSE)。

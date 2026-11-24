@@ -1,0 +1,58 @@
+import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { useOnboardingStep } from "../lib/onboarding-telemetry";
+import { useShell } from "../lib/shell-context";
+import { CreateProjectFlow } from "./CreateProjectFlow";
+import { WelcomePanel } from "./WelcomePanel";
+import { useUiStore } from "../stores/ui-store";
+import { STANDALONE_WORKSPACE_ID } from "../types/workspace";
+
+// Board empty states: first-launch welcome (`BoardWelcome`) and project board
+// with no worker sessions yet (`ProjectBoardEmpty`).
+export function BoardWelcome() {
+	const { cloneProject, createProject, initializeProjectRepository } = useShell();
+	const requestNewTask = useUiStore((state) => state.requestNewTask);
+	const completeWelcome = useOnboardingStep("welcome", true);
+	// Adding the first project ends the welcome screen, which unmounts this
+	// component, so completion is reported from the handlers rather than an effect.
+	const done = <A extends unknown[]>(fn: (...args: A) => Promise<void>) => async (...args: A) => {
+		await fn(...args);
+		completeWelcome();
+	};
+	return (
+		<WelcomePanel>
+			<div
+				className="flex h-full min-h-0 items-center justify-center overflow-y-auto px-6 py-8"
+				data-testid="board-welcome"
+			>
+				<div className="flex w-full max-w-preview-content flex-col items-center gap-4">
+					<CreateProjectFlow
+						embedded
+						mode="choose"
+						onCloneProject={done(cloneProject)}
+						onCreateProject={done(createProject)}
+						onInitializeProject={done(initializeProjectRepository)}
+						onCreateStandaloneAgent={() => {
+							completeWelcome();
+							requestNewTask(STANDALONE_WORKSPACE_ID);
+						}}
+					/>
+				</div>
+			</div>
+		</WelcomePanel>
+	);
+}
+
+// The center owns the prominent actions while the header keeps quiet copies.
+export function ProjectBoardEmpty({ actions, showOrchestrator = true }: { actions: ReactNode; showOrchestrator?: boolean }) {
+	const { t } = useTranslation();
+	return (
+		<div className="flex h-full min-h-0 items-center justify-center overflow-y-auto" data-testid="project-board-empty">
+			<div className="flex w-full max-w-preview-content flex-col items-center pb-empty-offset-y text-center">
+				<h2 className="text-subtitle font-semibold tracking-tight text-foreground">{t(showOrchestrator ? "board.empty.title" : "board.empty.localTitle")}</h2>
+				<p className="mt-2 text-md-sm leading-relaxed text-muted-foreground">{t(showOrchestrator ? "board.empty.body" : "board.empty.localBody")}</p>
+				{actions}
+			</div>
+		</div>
+	);
+}

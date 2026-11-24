@@ -1,0 +1,35 @@
+{
+	"cli": {
+		"version": ">= 21.0.1",
+		"appVersionSource": "remote"
+	},
+	"build": {
+		"development": {
+			"env": { "SENTRY_DISABLE_AUTO_UPLOAD": "true" },
+			"developmentClient": true,
+			"distribution": "internal",
+			"android": {
+				"buildType": "apk"
+			}
+		},
+		"preview": {
+			"env": { "SENTRY_DISABLE_AUTO_UPLOAD": "true" },
+			"distribution": "internal",
+			"android": {
+				"buildType": "apk",
+				"env": {
+					"ORG_GRADLE_PROJECT_reactNativeArchitectures": "armeabi-v7a,arm64-v8a"
+				}
+			},
+			"channel": "preview"
+		},
+		"production": {
+			"env": { "SENTRY_DISABLE_AUTO_UPLOAD": "true" },
+			"autoIncrement": true,
+			"channel": "production"
+		}
+	},
+	"submit": {
+		"production": {}
+	}
+}
