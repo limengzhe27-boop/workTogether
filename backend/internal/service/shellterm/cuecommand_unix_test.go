@@ -193,7 +193,7 @@ func TestCueCommandPreservesNativeEvalEOFAndOptionBehavior(t *testing.T) {
 					defer cancel()
 					want := tc.want
 					if tc.name == "EOF backslash" {
-						// Older Bash drops the trailing slash and other shells
+						// Older Bash drops the trailing backslash and other shells
 						// may reject it or keep it. Check this shell's native
 						// behavior without sharing Cue's quoting logic.
 						native := exec.CommandContext(ctx, path, "-c", profile+`eval "true; $AO_TEST_CUE"`)
@@ -201,7 +201,7 @@ func TestCueCommandPreservesNativeEvalEOFAndOptionBehavior(t *testing.T) {
 						native.Env = append(os.Environ(), "AO_TEST_CUE="+tc.command)
 						var exit *exec.ExitError
 						output, err := native.CombinedOutput()
-						if ctx.Err() != nil || (err != nil && !errors.As(err, &exit)) {
+						if ctx.Err() != nil || (err != nil && (!errors.As(err, &exit) || !exit.Exited())) {
 							t.Fatalf("native eval: %v (%s)", err, output)
 						}
 						data, err := os.ReadFile(outputPath)

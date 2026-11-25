@@ -37,7 +37,6 @@ function findReleaseMutationViolations(workflows: WorkflowSource[]) {
 
 describe("desktop release workflows", () => {
   const workflowsDirectory = path.join(repositoryRoot, ".github", "workflows");
-  const artifactBuilder = path.join(workflowsDirectory, "build-artifacts.yml");
 
   async function readWorkflows() {
     const names = (await readdir(workflowsDirectory)).filter((name) =>
@@ -150,35 +149,11 @@ run: |
     expect(findReleaseMutationViolations(allowed)).toEqual([]);
   });
 
-  it("keeps the conductor artifact builder dispatchable and read-only", async () => {
-    const contents = await readFile(artifactBuilder, "utf8");
-
-    expect(contents).toContain("workflow_dispatch:");
-    expect(contents).toMatch(/permissions:\s*\n\s*contents:\s*read/);
-    expect(contents).not.toContain("contents: write");
-    expect(contents).not.toContain("${{ secrets.");
-    expect(contents).not.toMatch(
-      /(?:gh release|electron-forge publish|npm run publish)/,
-    );
-  });
-
-  it("requires the WorkOS client ID for unsigned artifacts", async () => {
-    const contents = await readFile(artifactBuilder, "utf8");
-
-    expect(contents).toContain(
-      "VITE_WORKOS_CLIENT_ID: ${{ vars.VITE_WORKOS_CLIENT_ID }}",
-    );
-    expect(contents).toContain(
-      "Repository variable VITE_WORKOS_CLIENT_ID is required",
-    );
-  });
-
-  it("takes Teams for stable builds only from the VITE_AO_TEAMS repository variable", async () => {
-    const contents = await readFile(artifactBuilder, "utf8");
-
-    expect(contents).toContain("VITE_AO_TEAMS: ${{ vars.VITE_AO_TEAMS }}");
-    // Never forced on in the workflow itself: stable gets Teams only when
-    // someone sets the variable.
-    expect(contents).not.toMatch(/VITE_AO_TEAMS:\s*["']?on\b/);
+  it("keeps the fork checks read-only and leaves desktop packaging local", async () => {
+    const ci = await readFile(path.join(workflowsDirectory, "ci.yml"), "utf8");
+    expect(ci).toMatch(/permissions:\s*\n\s*contents:\s*read/);
+    expect(ci).not.toMatch(/contents:\s*write|\$\{\{\s*secrets\./);
+    await expect(stat(path.join(workflowsDirectory, "build-artifacts.yml")))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 });

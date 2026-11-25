@@ -24,9 +24,9 @@ npm --prefix frontend run dev
 本机构建桌面应用可运行 `npm --prefix frontend run build`，产物在 `frontend/out/`。本地 macOS 安装使用 `WorkTogether Local.app`。
 
 ```sh
-go -C backend test ./internal/service/chat ./internal/service/session ./internal/storage/sqlite ./internal/httpd/...
+go -C backend test -p 4 ./...
 npm --prefix frontend run typecheck
-npm --prefix frontend test -- PeerRoom PeerTimeline PeerExecution PeerSettings PeerMemberPicker PeerTasks Sidebar CreateProjectFlow SessionsBoard shell-new-session-shortcut board-empty-states
+npm --prefix frontend test -- --maxWorkers=3
 ```
 
 旧 Python/Web 版保留在 [legacy-python-web](https://github.com/limengzhe27-boop/workTogether/tree/legacy-python-web)，当前桌面版在 `main`。
