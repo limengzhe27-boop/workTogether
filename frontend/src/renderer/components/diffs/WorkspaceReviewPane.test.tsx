@@ -394,28 +394,29 @@ describe("WorkspaceReviewPane", () => {
 			<QueryClientProvider client={client}><TooltipProvider><WorkspaceReviewPane annotation={annotation()} target={selected} filter={filter} scrollRequest={scrollRequest} sessionId="sess-1" split={false} /></TooltipProvider></QueryClientProvider>
 		);
 		const view = render(pane());
+		const nextFiles = () => within(screen.getByRole("navigation", { name: "Changed file pages" })).getByRole("button", { name: "Next files" });
 		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(4), { timeout: 10_000 });
 		expect(screen.getByText("Files 1–96 of 5123")).toBeInTheDocument();
 		expect(document.querySelectorAll('[role="checkbox"]')).toHaveLength(96);
 		expect(postMock.mock.calls.flatMap((call) => call[1].body.paths)).toEqual(files.slice(0, 96).map((file) => file.path));
-		await userEvent.click(screen.getByRole("button", { name: "Next files" }));
+		await userEvent.click(nextFiles());
 		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(8), { timeout: 10_000 });
 		expect(screen.getByText("Files 97–192 of 5123")).toBeInTheDocument();
 		expect(document.querySelectorAll('[role="checkbox"]')).toHaveLength(96);
-		expect(screen.queryByRole("checkbox", { name: "Mark file-0.ts as viewed" })).not.toBeInTheDocument();
+		expect(document.querySelector('[role="checkbox"][aria-label="Mark file-0.ts as viewed"]')).not.toBeInTheDocument();
 		view.rerender(pane("", { path: "file-5100.ts", key: 1 }));
 		await waitFor(() => expect(screen.getByText("Files 5089–5123 of 5123")).toBeInTheDocument());
 		await waitFor(() => expect(postMock).toHaveBeenCalledTimes(10), { timeout: 10_000 });
 		expect(postMock.mock.calls.slice(8).flatMap((call) => call[1].body.paths)).toEqual(files.slice(5088).map((file) => file.path));
 		expect(document.querySelectorAll('[role="checkbox"]')).toHaveLength(35);
-		expect(screen.getByRole("button", { name: "Next files" })).toBeDisabled();
+		expect(nextFiles()).toBeDisabled();
 		// Filtering a late page must show its first result immediately.
 		view.rerender(pane("file-4000.ts"));
 		expect(await screen.findByRole("checkbox", { name: "Mark file-4000.ts as viewed" })).toBeInTheDocument();
 		expect(document.querySelectorAll('[role="checkbox"]')).toHaveLength(1);
 		view.rerender(pane());
 		expect(screen.getByText("Files 1–96 of 5123")).toBeInTheDocument();
-		await userEvent.click(screen.getByRole("button", { name: "Next files" }));
+		await userEvent.click(nextFiles());
 		expect(screen.getByText("Files 97–192 of 5123")).toBeInTheDocument();
 		view.rerender(pane("", undefined, { ...target, selectionKey: "moved-pr-head" }));
 		expect(screen.getByText("Files 1–96 of 5123")).toBeInTheDocument();

@@ -1029,7 +1029,7 @@ describe("ProjectSettingsForm", () => {
 							worker: { agent: "codex" },
 							orchestrator: { agent: "claude-code" },
 							reviewers: [
-								{ harness: "codex", agentConfig: { permissions: "bypass-permissions" } },
+								{ harness: "codex", agentConfig: { model: "gpt-5-mini", permissions: "bypass-permissions" } },
 							],
 						},
 					},
@@ -1041,14 +1041,8 @@ describe("ProjectSettingsForm", () => {
 		renderSettings("proj-1", undefined, "agents");
 
 		const reviewer = await screen.findByRole("button", { name: "Reviewer agent" });
-		await userEvent.click(reviewer);
-		const codexOption = (await screen.findAllByRole("menuitem")).find((option) => option.textContent?.includes("Codex"));
-		expect(codexOption).toBeTruthy();
-		await userEvent.click(codexOption!);
-		await userEvent.click(await screen.findByRole("button", { name: "Reviewer model" }));
-		await userEvent.click(await screen.findByRole("menuitem", { name: /GPT-5 Mini/i }));
 		expect(reviewer).toHaveTextContent("Codex");
-		expect(screen.getByRole("button", { name: "Reviewer model" })).toHaveTextContent("GPT-5 Mini");
+		await waitFor(() => expect(screen.getByRole("button", { name: "Reviewer model" })).toHaveTextContent("GPT-5 Mini"));
 
 		await chooseOption(reviewer, "OpenCode");
 		expect(reviewer).toHaveTextContent("OpenCode");
@@ -1113,7 +1107,7 @@ describe("ProjectSettingsForm", () => {
 
 		renderSettings("proj-1", undefined, "agents");
 
-		expect(await screen.findAllByText("model refresh unavailable")).toHaveLength(3);
+		await waitFor(() => expect(screen.getAllByText("model refresh unavailable")).toHaveLength(3));
 		expect(screen.getByRole("button", { name: "Worker model" })).toHaveTextContent("Select model");
 	});
 

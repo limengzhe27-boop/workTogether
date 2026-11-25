@@ -18,7 +18,7 @@ jobs:
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
-      - run: go -C backend test ./internal/service/chat ./internal/service/project ./internal/service/session ./internal/storage/sqlite ./internal/peerpolicy ./internal/httpd/... ./internal/cli ./internal/adapters/chatdriver/...
+      - run: go -C backend test -p 4 ./...
 
   renderer:
     runs-on: ubuntu-latest
@@ -36,4 +36,4 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npm ci --prefix packages/product-ui
       - run: npm --prefix frontend run typecheck
-      - run: npm --prefix frontend test -- PeerRoom PeerTimeline PeerExecution PeerSettings PeerMemberPicker PeerTasks Sidebar CreateProjectFlow SessionsBoard shell-new-session-shortcut board-empty-states
+      - run: npm --prefix frontend test -- --maxWorkers=3

@@ -4,6 +4,7 @@ package shellterm
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -141,7 +142,7 @@ func TestCueCommandPreservesNativeEvalEOFAndOptionBehavior(t *testing.T) {
 		t.Run(shell, func(t *testing.T) {
 			path, err := exec.LookPath(shell)
 			if err != nil {
-				t.Fatal(err)
+				t.Skipf("%s unavailable: %v", shell, err)
 			}
 			for _, tc := range []struct {
 				name, command, want string
@@ -183,22 +184,37 @@ func TestCueCommandPreservesNativeEvalEOFAndOptionBehavior(t *testing.T) {
 						t.Fatal(err)
 					}
 					t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-					if err := os.WriteFile(filepath.Join(home, "output"), []byte("not executed"), 0o600); err != nil {
+					const untouched = "not executed"
+					outputPath := filepath.Join(home, "output")
+					if err := os.WriteFile(outputPath, []byte(untouched), 0o600); err != nil {
 						t.Fatal(err)
 					}
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
 					want := tc.want
 					if tc.name == "EOF backslash" {
-						if shell == "zsh" {
-							want = "foo"
+						// Older Bash drops the trailing slash and other shells
+						// may reject it or keep it. Check this shell's native
+						// behavior without sharing Cue's quoting logic.
+						native := exec.CommandContext(ctx, path, "-c", profile+`eval "true; $AO_TEST_CUE"`)
+						native.Dir = home
+						native.Env = append(os.Environ(), "AO_TEST_CUE="+tc.command)
+						var exit *exec.ExitError
+						output, err := native.CombinedOutput()
+						if ctx.Err() != nil || (err != nil && !errors.As(err, &exit)) {
+							t.Fatalf("native eval: %v (%s)", err, output)
 						}
-						if shell == "fish" {
-							want = "not executed"
+						data, err := os.ReadFile(outputPath)
+						if err != nil {
+							t.Fatal(err)
+						}
+						want = string(data)
+						if err := os.WriteFile(outputPath, []byte(untouched), 0o600); err != nil {
+							t.Fatal(err)
 						}
 					}
 					rt := &cuePTYRuntime{fakeShellRuntime: newFakeShellRuntime(), t: t}
 					svc := NewService(rt, &fakeShellTerminalStore{}, &fakeProjectRootLocator{roots: map[domain.ProjectID]string{"project": home}}, nil, filepath.Join(t.TempDir(), "Cue's 雪 data"), "test", testLogger())
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
 					if _, err := svc.RunCueCommand(ctx, RunCueCommandInput{ProjectID: "project", Command: tc.command}); err != nil {
 						t.Fatal(err)
 					}
@@ -208,7 +224,7 @@ func TestCueCommandPreservesNativeEvalEOFAndOptionBehavior(t *testing.T) {
 					for ctx.Err() == nil {
 						data, _ := os.ReadFile(filepath.Join(home, "checked"))
 						if string(data) == "checked" {
-							got, err := os.ReadFile(filepath.Join(home, "output"))
+							got, err := os.ReadFile(outputPath)
 							if err != nil || string(got) != want {
 								t.Fatalf("native %s output = %q, error = %v, want %q", shell, got, err, want)
 							}

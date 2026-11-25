@@ -183,7 +183,9 @@ describe("startup harness update notice", () => {
 	});
 
 	it("shows build dates for timestamped versions, which read as neighbouring releases when cut short", () => {
-		expect(friendlyVersion("0.0.1778087986-g7acd91", "en")).toMatch(/^May 6/);
+		const buildDate = new Date("2026-05-06T17:19:46Z");
+		const localDateLabel = new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(buildDate);
+		expect(friendlyVersion("0.0.1778087986-g7acd91", "en")).toContain(localDateLabel);
 		expect(friendlyVersion("2.1.292", "en")).toBe("v2.1.292");
 	});
 

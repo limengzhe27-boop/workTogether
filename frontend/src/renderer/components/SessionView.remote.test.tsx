@@ -778,7 +778,7 @@ it("opens a TUI reviewer terminal through Box B's mux handle", async () => {
 		const request = input instanceof Request ? input : new Request(input);
 		const path = new URL(request.url).pathname;
 		if (path.endsWith("/projects")) return Response.json({ projects: [{ id: "project-1", name: "Todo", path: "/remote" }] });
-		if (path.endsWith("/sessions")) return Response.json({ sessions: [{ id: "session-1", projectId: "project-1", harness: "codex", status: "working", mode: "tui", terminalHandleId: "worker-handle", prs: [{ url: "https://github.com/acme/todo/pull/7", number: 7, state: "open" }] }] });
+		if (path.endsWith("/sessions")) return Response.json({ sessions: [{ id: "session-1", projectId: "project-1", displayName: "Fix login", harness: "codex", status: "working", mode: "tui", terminalHandleId: "worker-handle", prs: [{ url: "https://github.com/acme/todo/pull/7", number: 7, state: "open" }] }] });
 		if (path.endsWith("/sessions/session-1/reviews")) return Response.json({ reviewerHandleId: "reviewer-handle", reviewerHarness: "codex", reviews: [], runs: [] });
 		return Response.json({});
 	}));
@@ -788,7 +788,7 @@ it("opens a TUI reviewer terminal through Box B's mux handle", async () => {
 	await userEvent.click(await screen.findByRole("tab", { name: "Reviewer" }));
 	expect(screen.getByTestId("remote-terminal-base")).toHaveAttribute("data-terminal-handle", "reviewer-handle");
 	expect(screen.getByTestId("remote-terminal-base")).toHaveTextContent("http://127.0.0.1:4001");
-	await userEvent.click(screen.getByRole("tab", { name: /session-1/ }));
+	await userEvent.click(screen.getByRole("tab", { name: /^Fix login\b/ }));
 	expect(screen.getByTestId("remote-terminal-base")).toHaveAttribute("data-terminal-handle", "worker-handle");
 });
 
