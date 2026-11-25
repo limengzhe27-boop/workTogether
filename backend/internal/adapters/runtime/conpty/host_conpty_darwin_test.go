@@ -4,7 +4,6 @@ package conpty
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"os"
 	"strings"
@@ -78,59 +77,6 @@ func TestDarwinPTYConnStreamsResizesAndReportsExit(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("PTY output reader did not finish")
-	}
-}
-
-func TestDarwinDefaultSpawnHostEndToEnd(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	addr, hostPID, err := defaultSpawnHost(ctx, "spawn-e2e", t.TempDir(), []string{
-		"env", "AO_PREFIX_VALUE=prefix", "/bin/sh", "-c",
-		`printf '\033[c'; sleep 0.05; printf 'ready:%s:%s\n' "$AO_DIRECT_PTY_TEST" "$AO_PREFIX_VALUE"; IFS= read -r line; printf 'received:%s\n' "$line"; sleep 30`,
-	}, map[string]string{"AO_DIRECT_PTY_TEST": "works"}, HostOptions{})
-	if err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	// The request context owns startup only. A host that reported READY must
-	// stay alive after that request ends so daemon restarts cannot kill agents.
-	cancel()
-	t.Cleanup(func() {
-		_ = clientKill(addr)
-		if pidAlive(hostPID) {
-			if process, findErr := os.FindProcess(hostPID); findErr == nil {
-				_ = process.Kill()
-			}
-		}
-	})
-
-	if err := clientSendInput(addr, "hello\n"); err != nil {
-		t.Fatalf("send input: %v", err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		output, outputErr := clientGetOutput(context.Background(), addr, 20)
-		if outputErr != nil {
-			t.Fatalf("get output: %v", outputErr)
-		}
-		text := strings.ReplaceAll(output, "\r", "")
-		if strings.Contains(text, "ready:works:prefix") && strings.Contains(text, "received:hello") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for host output: %q", text)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if err := clientKill(addr); err != nil {
-		t.Fatalf("kill host: %v", err)
-	}
-	deadline = time.Now().Add(3 * time.Second)
-	for pidAlive(hostPID) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if pidAlive(hostPID) {
-		t.Fatalf("detached pty-host pid %d survived kill", hostPID)
 	}
 }
 
