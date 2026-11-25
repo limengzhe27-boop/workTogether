@@ -40,7 +40,7 @@ describe("BrowserHistoryStore", () => {
 		const store = new BrowserHistoryStore({ stateDir });
 		const entries: BrowserHistoryEntry[] = Array.from({ length: 5_100 }, (_, index) => ({
 			url: `https://example.com/${index}/${"x".repeat(900)}`,
-			title: `Entry ${index}`,
+			title: `Entry ${index} ${"例".repeat(100)}`,
 			lastVisited: new Date(1_800_000_000_000 - index).toISOString(),
 			visitCount: 1,
 		}));
@@ -51,6 +51,12 @@ describe("BrowserHistoryStore", () => {
 		expect(metadata.size).toBeLessThanOrEqual(4 * 1024 * 1024);
 		expect(parsed.entries.length).toBe(outcome.imported);
 		expect(parsed.entries.length).toBeLessThanOrEqual(5_000);
+		expect(parsed.entries).toEqual(entries.slice(0, outcome.imported));
+		const withNextEntry = {
+			version: 1,
+			entries: [...parsed.entries, entries[outcome.imported]],
+		};
+		expect(Buffer.byteLength(`${JSON.stringify(withNextEntry)}\n`)).toBeGreaterThan(4 * 1024 * 1024);
 		expect(outcome.truncated).toBe(entries.length - outcome.imported);
 		expect(await store.suggest(profileId, "entry 5099")).toEqual([]);
 	});
