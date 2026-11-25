@@ -1,6 +1,7 @@
 import type { components } from "../../api/schema";
 import { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { ArrowLeft, Loader2, Plus, Search } from "lucide-react";
 import { apiErrorMessage, apiClient } from "../lib/api-client";
 import { AgentAvatar } from "./AgentAvatar";
@@ -18,6 +19,7 @@ export function PeerMemberPicker({ projectId, selectedCount, existingSessions = 
  onBack: () => void;
  onBusyChange: (busy: boolean) => void;
 }) {
+ const { t } = useTranslation();
  const cache = useQueryClient();
  const inFlight = useRef(false);
  const [creating, setCreating] = useState<string | null>(null);
@@ -71,9 +73,9 @@ export function PeerMemberPicker({ projectId, selectedCount, existingSessions = 
  return <section aria-label="添加成员" className="p-1">
   <div className="flex items-center gap-1 px-1 pb-1">
    <Button type="button" variant="quiet" size="icon-xs" aria-label="返回添加菜单" disabled={!!creating} onClick={onBack}><ArrowLeft className="size-3.5" /></Button>
-   <span className="text-xs text-muted-foreground">添加 Agent</span>
+   <span className="text-xs text-muted-foreground">{t("peer.addAgent")}</span>
   </div>
-  <label className="mx-1 mb-1 flex items-center gap-2 rounded-md bg-secondary/50 px-2 py-1.5"><Search className="size-3.5 text-muted-foreground"/><input aria-label="搜索 Agent" value={search} onChange={e=>setSearch(e.target.value)} placeholder="搜索 Agent" className="min-w-0 flex-1 bg-transparent text-xs outline-none"/></label>
+  <label className="mx-1 mb-1 flex items-center gap-2 rounded-md bg-secondary/50 px-2 py-1.5"><Search className="size-3.5 text-muted-foreground"/><input aria-label={t("peer.searchAgents")} value={search} onChange={e=>setSearch(e.target.value)} placeholder={t("peer.searchAgents")} className="min-w-0 flex-1 bg-transparent text-xs outline-none"/></label>
   {catalog.isPending && <p className="px-2 py-3 text-xs text-muted-foreground">正在读取客户端…</p>}
   {catalog.isError && <p role="alert" className="px-2 py-3 text-xs">无法读取客户端列表，请关闭后重试。</p>}
   <div className="max-h-60 overflow-y-auto">

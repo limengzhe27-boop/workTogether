@@ -23,6 +23,7 @@ import { PeerTimeline } from "./PeerTimeline";
 import { PeerMemberPicker } from "./PeerMemberPicker";
 import { useEffect, useRef, useState } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import type { components } from "../../api/schema";
 import { apiClient } from "../lib/api-client";
 import type { WorkspaceSession } from "../types/workspace";
@@ -39,6 +40,7 @@ import { PeerTasks, usePeerTasks } from "./PeerTasks";
 
 type Room = components["schemas"]["PeerRoom"];
 type Receipt = components["schemas"]["PeerBroadcastDelivery"];
+const MESSAGE_LIMIT_KB = 256;
 const states: Record<string, string> = {
 	accepted: "已接收，等待回复",
 	pending: "已登记，接收结果待核查（不自动重发）",
@@ -75,6 +77,7 @@ export function PeerRoom({
 	onManageSessions: () => void;
 	onOpenSession?: (id: string) => void;
 }) {
+	const { t } = useTranslation();
 	const roomId = `project-${projectId}`;
 	const files = useFileAttachments({ initialKey: `peer-room:${projectId}` });
 	const filePicker = useRef<HTMLInputElement>(null);
@@ -447,7 +450,7 @@ export function PeerRoom({
 		!uncertain &&
 		(!!text.trim() || files.attachments.length > 0) &&
 		!files.preparing &&
-		new TextEncoder().encode(text).length <= 256 * 1024;
+		new TextEncoder().encode(text).length <= MESSAGE_LIMIT_KB * 1024;
 	return (
 		<section
 			className="flex min-h-0 flex-1 flex-col overflow-hidden"
@@ -610,7 +613,7 @@ export function PeerRoom({
 							</div>
 							{!eligible.length && (
 								<p className="my-2 text-sm">
-									在输入框点击「＋」添加 Agent。
+									{t("peer.addFromComposer")}
 								</p>
 							)}
 
@@ -688,7 +691,7 @@ export function PeerRoom({
 						)}
 						{room.data === null && (
 							<p className="py-12 text-center text-sm text-muted-foreground">
-								用输入框旁的「＋」添加一位 Agent，即可开始对话。
+								{t("peer.startFromComposer")}
 							</p>
 						)}
 						{!deliveries.isPending &&
@@ -889,7 +892,7 @@ export function PeerRoom({
 						/>
 						<div className="flex items-center gap-1 pt-1">
 <Popover open={addMenuOpen} onOpenChange={value => {if (!busy) {setAddMenuOpen(value); if (!value) setAddingMembers(false);}}}>
- <PopoverTrigger asChild><button type="button" aria-label="添加" title="添加文件、图片或 Agent" disabled={busy || settingsBusy} className="inline-flex size-7 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-interactive-hover hover:text-foreground"><Plus className="size-3.5" /></button></PopoverTrigger>
+ <PopoverTrigger asChild><button type="button" aria-label="添加" title={t("peer.addContent")} disabled={busy || settingsBusy} className="inline-flex size-7 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-interactive-hover hover:text-foreground"><Plus className="size-3.5" /></button></PopoverTrigger>
  <PopoverContent side="top" align="start" aria-label="添加" className="w-60 max-w-[calc(100vw-24px)] max-h-[min(420px,var(--radix-popover-content-available-height))] overflow-y-auto p-1" onInteractOutside={e=>{if(busy)e.preventDefault();}} onEscapeKeyDown={e=>{if(busy)e.preventDefault();}}>
  {addingMembers ? (<PeerMemberPicker
 								onBusyChange={setBusy}
@@ -908,7 +911,7 @@ export function PeerRoom({
  <button type="button" role="menuitem" disabled={uncertain || files.preparing} onClick={()=>{setAddMenuOpen(false); if(filePicker.current){filePicker.current.accept="";filePicker.current.click();}}} className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-xs hover:bg-interactive-hover"><Paperclip className="size-4"/>添加文件</button>
  <button type="button" role="menuitem" disabled={uncertain || files.preparing} onClick={()=>{setAddMenuOpen(false); if(filePicker.current){filePicker.current.accept="image/*";filePicker.current.click();}}} className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-xs hover:bg-interactive-hover"><ImageIcon className="size-4"/>添加图片</button>
  <div className="my-1 border-t border-border/50"/>
- <button type="button" role="menuitem" disabled={room.isPending || room.isError || pendingChanges || members.length>=16} onClick={()=>setAddingMembers(true)} className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-xs hover:bg-interactive-hover"><UserPlus className="size-4"/>添加 Agent<ChevronRight className="ml-auto size-3.5 text-muted-foreground"/></button>
+ <button type="button" role="menuitem" disabled={room.isPending || room.isError || pendingChanges || members.length>=16} onClick={()=>setAddingMembers(true)} className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-xs hover:bg-interactive-hover"><UserPlus className="size-4"/>{t("peer.addAgent")}<ChevronRight className="ml-auto size-3.5 text-muted-foreground"/></button>
  </div>}
  </PopoverContent>
  </Popover>
@@ -967,9 +970,9 @@ export function PeerRoom({
 								<ArrowUp className="size-4" />
 							</button>
 						</div>
-						{new TextEncoder().encode(text).length > 256 * 1024 && (
+						{new TextEncoder().encode(text).length > MESSAGE_LIMIT_KB * 1024 && (
 							<p role="alert" className="p-2 text-xs text-destructive">
-								消息超过 256 KB，请将较大的内容作为文件添加。
+								{t("peer.messageTooLarge", { limit: MESSAGE_LIMIT_KB })}
 							</p>
 						)}
 					</form>

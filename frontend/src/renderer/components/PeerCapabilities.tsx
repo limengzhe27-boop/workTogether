@@ -1,4 +1,5 @@
 import type { components } from "../../api/schema";
+import { useTranslation } from "react-i18next";
 type Snapshot = components["schemas"]["ConversationSnapshotResponse"];
 export function imageSupport(snapshot?: Snapshot) {
 	if (
@@ -17,6 +18,7 @@ export function PeerCapabilities({
 	snapshot?: Snapshot;
 	provider?: string;
 }) {
+	const { t } = useTranslation();
 	const harness = snapshot?.harness || provider;
 	const servers = snapshot?.mcpServers?.map((server) => server.name) ?? [];
 	return (
@@ -56,7 +58,7 @@ export function PeerCapabilities({
 			{servers.length > 0 && (
 				<details className="mt-2">
 					<summary className="cursor-pointer">
-						已连接 MCP 服务（{servers.length}）
+						{t("peer.connectedMcpServers", { total: servers.length })}
 					</summary>
 					<p className="mt-1 break-words">{servers.join("、")}</p>
 				</details>

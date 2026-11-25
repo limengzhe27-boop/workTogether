@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import { GeneratedImage } from "./chat/GeneratedImage";
 import { CopyButton } from "./chat/CopyButton";
 import { PeerTaskEvidence } from "./PeerEvidence";
@@ -72,6 +73,7 @@ export function PeerTimeline({
 	steerSupported?: (id: string) => boolean | undefined;
 	status: (d: Delivery) => string;
 }) {
+	const { t } = useTranslation();
 	const tasksByDelivery = new Map<string, Task[]>();
 	const withReplies = new Set(
 		deliveries
@@ -131,9 +133,9 @@ export function PeerTimeline({
 										<li
 											key={`${file.sha256}-${i}`}
 											className="rounded-md border border-border px-2 py-1"
-											title={`SHA256: ${file.sha256}`}
+											title={t("peer.attachmentHash", { digest: file.sha256 })}
 										>
-											{file.name || "附件"} · {Math.ceil(file.size / 1024)} KB
+											{file.name || "附件"} · {t("peer.attachmentSize", { size: Math.ceil(file.size / 1024) })}
 										</li>
 									))}
 								</ul>

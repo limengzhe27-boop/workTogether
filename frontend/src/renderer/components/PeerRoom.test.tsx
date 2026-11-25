@@ -330,7 +330,7 @@ it.each([false, true])("adds a native member without a message or implicit grant
 	));
 	await userEvent.click(screen.getByRole("button", { name: "添加" }));
 	await userEvent.click(
-		await screen.findByRole("menuitem", { name: /添加 Agent/ }),
+		await screen.findByRole("menuitem", { name: /Add agent/ }),
 	);
 	await waitFor(() =>
 		expect(screen.getByRole("button", {name:"添加 Codex"})).toBeEnabled(),
@@ -557,7 +557,7 @@ it("keeps room administration out of the composer and opens the working attachme
 		await screen.findByRole("menuitem", { name: /文件/ }),
 	).not.toHaveAttribute("aria-disabled", "true");
 	expect(
-		screen.getByRole("menuitem", { name: /添加 Agent/ }),
+		screen.getByRole("menuitem", { name: /Add agent/ }),
 	).toBeInTheDocument();
 	expect(api.POST).not.toHaveBeenCalled();
 });
@@ -643,7 +643,7 @@ it("sends long Unicode requirements intact and bounds oversized drafts", async (
 	const input = screen.getByLabelText("群聊消息");
 	fireEvent.change(input, { target: { value: "x".repeat(256 * 1024 + 1) } });
 	expect(screen.getByRole("button", { name: /发送消息/ })).toBeDisabled();
-	expect(screen.getByText(/消息超过 256 KB/)).toBeTruthy();
+	expect(screen.getByText(/Messages are limited to 256 KB/)).toBeTruthy();
 	const text = "需求与代码\n".repeat(2000);
 	fireEvent.change(input, { target: { value: text } });
 	fireEvent.keyDown(input, { key: "Enter" });
@@ -658,7 +658,7 @@ it("uses only the left add menu with inline agent navigation", async () => {
  const panel=await screen.findByRole("dialog",{name:"添加"});
  expect(panel).toHaveAttribute("data-align","start");
  expect(screen.getByRole("menuitem",{name:"添加图片"})).toBeInTheDocument();
- await userEvent.click(screen.getByRole("menuitem",{name:"添加 Agent"}));
+ await userEvent.click(screen.getByRole("menuitem",{name:"Add agent"}));
  await userEvent.click(await screen.findByRole("button",{name:"返回添加菜单"}));
  expect(screen.getByRole("menuitem",{name:"添加文件"})).toBeInTheDocument();
  expect(api.POST).not.toHaveBeenCalled();
@@ -711,7 +711,7 @@ it("removes to one member, sends to that member, and rejoins the same session", 
 	await waitFor(() => expect(screen.getByRole("button", { name: "添加" })).toBeEnabled());
 
 	await userEvent.click(screen.getByRole("button", { name: "添加" }));
-	await userEvent.click(await screen.findByRole("menuitem", { name: "添加 Agent" }));
+	await userEvent.click(await screen.findByRole("menuitem", { name: "Add agent" }));
 	await userEvent.click(await screen.findByRole("button", { name: "加入已有会话 成员 b" }));
 	await waitFor(() => expect(room.members).toEqual(["a", "b"]));
 	expect(api.POST).toHaveBeenCalledTimes(1);
