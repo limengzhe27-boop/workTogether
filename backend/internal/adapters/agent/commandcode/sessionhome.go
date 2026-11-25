@@ -531,6 +531,12 @@ func anchorConfigPattern(pattern, sourceDir, realHome string) (string, bool) {
 		// already mean the same thing from any location.
 		return "", false
 	}
+	// Git resolves the relative pattern's base through symlinks before
+	// matching a gitdir. Once rebased as an absolute pattern, those path
+	// aliases no longer necessarily match (for example, /var on macOS).
+	if realBase, err := filepath.EvalSymlinks(base); err == nil {
+		base = realBase
+	}
 	anchored := filepath.ToSlash(base)
 	if rest == "" {
 		// A directory pattern only matches with its trailing separator.

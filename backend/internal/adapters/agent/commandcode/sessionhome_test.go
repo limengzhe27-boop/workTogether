@@ -1003,7 +1003,11 @@ func TestPrepareSessionHomeAnchorsConditionalIncludeHeaders(t *testing.T) {
 	if err != nil || len(copies) == 0 {
 		t.Fatalf("session git config copies = %v (%v), want the rewritten config", copies, err)
 	}
-	anchored := "gitdir:" + filepath.ToSlash(realHome) + "/"
+	physicalHome, err := filepath.EvalSymlinks(realHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchored := "gitdir:" + filepath.ToSlash(physicalHome) + "/"
 	for _, entry := range copies {
 		contents := readHomeFile(t, filepath.Join(home, sessionGitConfigCopiesDir, entry.Name()))
 		for _, stale := range []string{"~/", "gitdir:./", "gitdir/i:./"} {
@@ -1254,6 +1258,21 @@ func TestGitConditionPatternAnchoring(t *testing.T) {
 		if got != test.want || gotOK != test.ok {
 			t.Fatalf("anchor %q -> (%q, %v), want (%q, %v)", test.condition, got, gotOK, test.want, test.ok)
 		}
+	}
+}
+
+func TestAnchorConfigPatternResolvesBaseSymlink(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "home")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Skipf("cannot create home symlink: %v", err)
+	}
+	got, ok := anchorConfigPattern("~/projects/**", alias, alias)
+	if want := filepath.ToSlash(root) + "/projects/**"; !ok || got != want {
+		t.Fatalf("anchored pattern = (%q, %v), want %q", got, ok, want)
 	}
 }
 
